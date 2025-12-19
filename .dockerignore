@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+venv
+.git
+.gitignore
+frontend/node_modules
+frontend/dist
+
+# 🚨 绝对不要把这些打入镜像
+backend/config.json
+backend/*.db
+backend/data

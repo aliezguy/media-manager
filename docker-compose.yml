@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  media-manager:
+    build: .  # 本地构建使用当前目录
+    image: aliezguy/media-manager:latest # 替换你的名字
+    container_name: media-manager
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 映射数据目录，防止重启丢失配置
+      - ./data:/app/backend/data

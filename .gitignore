@@ -1,0 +1,24 @@
+# === Python 垃圾文件 ===
+__pycache__/
+*.pyc
+venv/
+.env
+
+# === 前端构建文件 ===
+frontend/node_modules/
+frontend/dist/
+
+# === 🚨 核心：忽略敏感配置和数据 ===
+# 忽略配置文件 (让用户自己生成)
+backend/config.json
+
+# 忽略数据库文件 (包含历史记录)
+backend/*.db
+backend/emby_ai.db
+
+# 忽略数据目录
+backend/data/
+data/
+
+# 忽略系统文件
+.DS_Store
