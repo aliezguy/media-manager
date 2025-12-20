@@ -4,7 +4,7 @@ import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, VideoPlay, MagicStick, Check, Close, Plus, Filter, Download, Calendar, Loading } from '@element-plus/icons-vue'
 
-const API_URL = 'http://127.0.0.1:8000'
+const API_URL = ''
 
 const config = reactive({})
 const loading = ref(false)

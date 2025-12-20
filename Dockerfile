@@ -1,7 +1,7 @@
 # ===============================
 # 阶段 1: 构建前端 (Vue)
 # ===============================
-FROM node:18-alpine as frontend-build
+FROM node:20-alpine as frontend-build
 
 WORKDIR /app/frontend
 

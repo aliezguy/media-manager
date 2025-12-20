@@ -4,7 +4,7 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import { Connection, Setting } from '@element-plus/icons-vue'
 
-const API_URL = 'http://127.0.0.1:8000'
+const API_URL = ''
 const loading = ref(false)
 const config = reactive({
   emby_host: '',
