@@ -1,12 +1,13 @@
 <script setup>
 import { ref, shallowRef, onMounted, onUnmounted } from 'vue'
-import { Files, Connection, VideoCameraFilled, Expand, Fold, Timer  } from '@element-plus/icons-vue'
+import { Files, Connection, VideoCameraFilled, Expand, Fold, Timer, Box } from '@element-plus/icons-vue'
 
 // 引入我们的三个子组件 (保持你原有的引用不变)
 import TagManager from './components/TagManager.vue'
 import EmbySettings from './components/EmbySettings.vue'
 import MpConfig from './components/MpConfig.vue'
 import WashHistory from './components/WashHistory.vue'
+import QbManager from './components/QbManager.vue'
 
 // 菜单配置
 const isCollapse = ref(false)
@@ -18,6 +19,7 @@ const currentComponent = shallowRef(TagManager)
 
 const menuItems = [
   { index: 'manager', label: '标签管理', icon: Files, component: TagManager },
+  { index: 'qb', label: '下载管理', icon: Box, component: QbManager },
   { index: 'emby', label: 'Emby 设置', icon: Connection, component: EmbySettings },
   { index: 'mp', label: '订阅配置', icon: VideoCameraFilled, component: MpConfig },
   { index: 'history', label: '订阅记录', icon: Timer, component: WashHistory }

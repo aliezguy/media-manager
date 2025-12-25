@@ -24,7 +24,9 @@ DEFAULT_CONFIG = {
     # 洗版策略 (默认空)
     "wash_schemes": [],
     # 追更配置策略
-    "subscribe_schemes": []
+    "subscribe_schemes": [],
+    # qBittorrent 配置
+    "qb_configs": []
 }
 
 def load_config():
