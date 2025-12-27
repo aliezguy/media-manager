@@ -7,11 +7,12 @@ from config.settings import DATA_DIR
 
 logger = logging.getLogger("uvicorn")
 
-# 确保 DATA_DIR 存在
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-
-RULES_FILE = os.path.join(DATA_DIR, 'category.yaml')
+# 🔥 获取当前脚本所在的绝对目录 (backend/services)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 🔥 回退一层找到 backend 目录
+BACKEND_DIR = os.path.dirname(CURRENT_DIR)
+# 🔥 拼接出准确的 data 路径 (/app/backend/data/category.yaml)
+RULES_FILE = os.path.join(BACKEND_DIR, 'data', 'category.yaml')
 
 def load_rules():
     """

@@ -4,10 +4,14 @@ import os
 
 router = APIRouter()
 
-# 允许编辑的文件路径（相对路径，基于 backend/ 目录）
+# 🔥 动态计算绝对路径
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__)) # /app/backend/routers
+BACKEND_DIR = os.path.dirname(CURRENT_DIR)               # /app/backend
+CATEGORY_PATH = os.path.join(BACKEND_DIR, 'data', 'category.yaml')
+
 ALLOWED_FILES = {
-    "category_yaml": "data/category.yaml",  # 你的分类配置文件
-    # "config": "../config/config.yaml"     # (可选) 如果你也想改主配置，可以保留这个
+    "category_yaml": CATEGORY_PATH,  # 使用计算好的绝对路径
+    # "config": os.path.join(BACKEND_DIR, '..', 'config', 'config.yaml')
 }
 
 class FileContent(BaseModel):
