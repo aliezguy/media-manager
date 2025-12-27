@@ -1,19 +1,31 @@
 import yaml
 import os
 import logging
+# 如果你的 config.settings 没问题，保留这个引入；
+# 如果报错找不到 DATA_DIR，可以用注释掉的那行 os.path 替代
 from config.settings import DATA_DIR
 
 logger = logging.getLogger("uvicorn")
 
+# 确保 DATA_DIR 存在
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
 RULES_FILE = os.path.join(DATA_DIR, 'category.yaml')
 
 def load_rules():
+    """
+    加载规则文件，增加空文件保护
+    """
     if not os.path.exists(RULES_FILE):
-        logger.warning("⚠️ 未找到分类规则文件 category.yaml")
+        # 找不到文件时不报错，只返回空，避免刷屏
         return {}
     try:
         with open(RULES_FILE, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+            data = yaml.safe_load(f)
+            # 🔥 核心修复 1：如果不检查，空文件 safe_load 会返回 None，导致后续报错
+            # 这里强制保证返回的是一个字典
+            return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.error(f"❌ 规则文件解析失败: {e}")
         return {}
@@ -26,10 +38,14 @@ def check_condition(rule_val, data_val):
     """
     if not rule_val: 
         return True # 规则为空则视为通过
+    
+    if not data_val:
+        return False # 规则不为空，但数据为空，视为不通过
         
-    # 将规则转为列表
+    # 将规则转为列表 (字符串转大写，去空格)
     rule_list = [str(x).strip().upper() for x in str(rule_val).split(',')]
-    # 将数据转为字符串列表
+    
+    # 将数据转为字符串列表 (兼容数字ID和字符串)
     data_list = [str(x).strip().upper() for x in data_val]
     
     # 取交集，如果有交集则命中
@@ -38,35 +54,50 @@ def check_condition(rule_val, data_val):
 def determine_category(tmdb_info, media_type_cn):
     """
     根据 TMDB 信息和规则，决定分类
+    :param tmdb_info: TMDB 返回的详情字典
+    :param media_type_cn: '电影' 或 '电视剧' (或其他)
     """
+    # 1. 加载规则 (现在很安全，一定返回字典)
     rules = load_rules()
+    if not rules:
+        return None
     
-    # 确定根节点 (movie 或 tv)
-    root_key = "movie" if media_type_cn == "电影" else "tv"
-    type_rules = rules.get(root_key, {})
+    # 2. 确定根节点 (movie 或 tv)
+    # 兼容 '电影' / 'movie' 两种写法，防止传参不一致
+    is_movie = str(media_type_cn) == "电影" or str(media_type_cn).lower() == "movie"
+    root_key = "movie" if is_movie else "tv"
+    
+    # 🔥 核心修复 2：如果 yaml 里写了 'movie:' 但下面没缩进内容，get 返回 None
+    # 使用 ( ... or {} ) 强制转为字典，防止后续 .items() 报错
+    type_rules = rules.get(root_key) or {}
     
     if not type_rules:
         return None
 
-    # 提取 TMDB 关键特征
-    # 1. 产地
-    origin_countries = tmdb_info.get("origin_country", []) # TV 才有
+    # 3. 提取 TMDB 关键特征 (保留了你优秀的处理逻辑)
+    # --- 产地 ---
+    origin_countries = tmdb_info.get("origin_country", []) # 默认取 TV 的字段
     if root_key == "movie":
-        # 电影通常用 production_countries
+        # 电影通常用 production_countries，结构是 list[dict]
         p_countries = tmdb_info.get("production_countries", [])
-        origin_countries = [c.get("iso_3166_1") for c in p_countries]
+        origin_countries = [c.get("iso_3166_1") for c in p_countries if c.get("iso_3166_1")]
     
-    # 2. 类型 ID
+    # --- 类型 ID ---
     genres = tmdb_info.get("genres", [])
-    genre_ids = [g.get("id") for g in genres]
+    genre_ids = [g.get("id") for g in genres if g.get("id")]
     
-    # 3. 原始语言
+    # --- 原始语言 ---
+    # 放入列表是为了配合 check_condition 的 list 交集逻辑
     original_language = [tmdb_info.get("original_language")]
 
-    # 遍历规则 (按 YAML 里的顺序)
+    # 4. 遍历规则
     for category_name, conditions in type_rules.items():
-        if conditions is None:
-            # 如果条件为空（如"外语电影"、"未分类"），且排在最后，直接命中
+        # 如果条件为 None (yaml里 key 后没写内容)，且不是排在最后的兜底，通常跳过
+        # 但如果你想表达 "只要写了这个分类名就直接命中"，可以保留 return
+        if not conditions:
+            # 这是一个策略选择：如果是空条件，是否直接命中？
+            # 建议：如果只想让它作为兜底（比如 "未分类"），可以放在 yaml 最后
+            logger.info(f"⚠️ 分类 [{category_name}] 没有定义条件，直接命中")
             return category_name
             
         is_match = True
@@ -87,7 +118,7 @@ def determine_category(tmdb_info, media_type_cn):
                 is_match = False
 
         if is_match:
-            logger.info(f"✅ 命中分类规则: [{category_name}]")
+            logger.info(f"✅ 命中分类规则: [{category_name}] | 媒体: {tmdb_info.get('title') or tmdb_info.get('name')}")
             return category_name
 
     return None
