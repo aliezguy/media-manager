@@ -259,19 +259,45 @@ async def handle_new_subscription(sub_info):
         final_payload = {"id": sub_id} if sub_id else {}
         has_changes = False
         
-        # 2. 自动分类
+        # 2. 获取 TMDB 数据 (用于自动分类 + 修复总集数)
         current_category = sub_info.get("category")
-        if tmdb_id and not current_category:
-            logger.info(f"   1️⃣ [自动分类] 查询 TMDB...")
+        current_total_ep = sub_info.get("total_episode") # 获取当前总集数
+        
+        # 判断是否需要请求 TMDB：缺分类 OR (是剧集且缺总集数)
+        need_tmdb = False
+        if tmdb_id:
+            if not current_category: need_tmdb = True
+            if not current_total_ep and media_type in ['tv', '电视剧']: need_tmdb = True
+        
+        if need_tmdb:
+            logger.info(f"   1️⃣ [补充信息] 查询 TMDB (ID: {tmdb_id})...")
             tmdb_data = get_tmdb_info(tmdb_id, media_type)
             if tmdb_data:
-                new_category = determine_category(tmdb_data, media_type)
-                if new_category:
-                    final_payload["category"] = new_category 
-                    current_category = new_category
-                    has_changes = True
-                    logger.info(f"      ✅ 计算出分类: 【{new_category}】")
-
+                # A. 自动分类逻辑
+                if not current_category:
+                    new_category = determine_category(tmdb_data, media_type)
+                    if new_category:
+                        final_payload["category"] = new_category 
+                        current_category = new_category
+                        has_changes = True
+                        logger.info(f"      ✅ 计算出分类: 【{new_category}】")
+                
+                # B. 修复总集数逻辑 (解决 -24/0 显示错误问题)
+                if not current_total_ep and media_type in ['tv', '电视剧']:
+                    try:
+                        target_season = int(season) if season else 1
+                        # TMDB 详情里 seasons 是个列表，需找到对应季
+                        seasons_list = tmdb_data.get("seasons", [])
+                        for s in seasons_list:
+                            if s.get("season_number") == target_season:
+                                ep_count = s.get("episode_count")
+                                if ep_count and ep_count > 0:
+                                    final_payload["total_episode"] = ep_count
+                                    has_changes = True
+                                    logger.info(f"      ✅ 修复总集数: {ep_count}")
+                                    break
+                    except Exception as e:
+                        logger.warning(f"      ⚠️ 修复总集数失败: {e}")
         # 3. 匹配追更策略
         logger.info(f"   2️⃣ [追更策略] 开始匹配...")
         matched_scheme = _find_best_scheme(name, current_category, schemes, "追更策略")

@@ -18,7 +18,7 @@ async def mp_webhook(request: Request, background_tasks: BackgroundTasks):
         data = payload.get("data", {})
         
         logger.info(f"--------------- 📨 收到 Webhook: {event_type} ---------------")
-        logger.info(f"原始报文 {data} ---------------")
+        #logger.info(f"原始报文 {data} ---------------")
         # 标准化提取 info
         mediainfo = data.get("mediainfo", {})
         subscribe_info = data.get("subscribe_info", {})
