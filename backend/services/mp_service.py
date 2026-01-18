@@ -352,7 +352,7 @@ async def delayed_handle_new_subscription(sub_info: dict):
     logger.info(f"⏳ 收到任务 {sub_info['name']}，将在 30 秒后执行添加订阅...")
     await asyncio.sleep(30)  # 异步等待，不阻塞主线程
     logger.info(f"⏰ 延迟结束，开始处理订阅: {sub_info['name']}")
-    handle_new_subscription(sub_info)
+    await handle_new_subscription(sub_info)
 # ===========================
 # 4. 业务流程：订阅完成 (洗版)
 # ===========================
@@ -450,5 +450,5 @@ async def delayed_run_wash_process(sub_info: dict):
     logger.info(f"⏳ 收到任务 {sub_info['name']}，将在 30 秒后执行添加订阅...")
     await asyncio.sleep(30)  # 异步等待，不阻塞主线程
     logger.info(f"⏰ 延迟结束，开始处理订阅: {sub_info['name']}")
-    run_wash_process(sub_info)
+    await run_wash_process(sub_info)
 
