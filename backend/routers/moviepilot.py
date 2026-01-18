@@ -36,6 +36,7 @@ async def mp_webhook(request: Request, background_tasks: BackgroundTasks):
             "type": mediainfo.get("type") or subscribe_info.get("type"), 
             "year": mediainfo.get("year") or subscribe_info.get("year"),
             "category": data.get("category") or subscribe_info.get("category"),
+            "season": data.get("season_number") or subscribe_info.get("season_number"),
             "_raw_data": data
         }
 
