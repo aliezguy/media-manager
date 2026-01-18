@@ -4,7 +4,9 @@ import logging
 from services.mp_service import (
     get_mp_resources, 
     handle_new_subscription, 
-    run_wash_process
+    run_wash_process,
+    delayed_handle_new_subscription,
+    delayed_run_wash_process
 )
 
 router = APIRouter()
@@ -55,11 +57,11 @@ async def mp_webhook(request: Request, background_tasks: BackgroundTasks):
         
         # 分发任务
         if event_type in ["subscribe.added", "subscribe", "subscribe.add"]:
-            background_tasks.add_task(handle_new_subscription, sub_info)
+            background_tasks.add_task(delayed_handle_new_subscription, sub_info)
             return {"status": "processing_new_sub"}
 
         elif event_type == "subscribe.complete":
-            background_tasks.add_task(run_wash_process, sub_info)
+            background_tasks.add_task(delayed_run_wash_process, sub_info)
             return {"status": "processing_wash"}
         
         else:

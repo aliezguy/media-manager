@@ -2,6 +2,7 @@ import requests
 import logging
 import traceback
 import json
+import asyncio
 from config.settings import load_config
 from services.tmdb_service import get_tmdb_info
 from services.category_service import determine_category
@@ -342,6 +343,16 @@ async def handle_new_subscription(sub_info):
         logger.error(f"❌ 新增订阅处理异常: {e}")
         logger.error(traceback.format_exc())
 
+
+
+async def delayed_handle_new_subscription(sub_info: dict):
+    """
+    后台任务包装器：延迟 30 秒后执行订阅添加
+    """
+    logger.info(f"⏳ 收到任务 {sub_info['name']}，将在 30 秒后执行添加订阅...")
+    await asyncio.sleep(30)  # 异步等待，不阻塞主线程
+    logger.info(f"⏰ 延迟结束，开始处理订阅: {sub_info['name']}")
+    handle_new_subscription(sub_info)
 # ===========================
 # 4. 业务流程：订阅完成 (洗版)
 # ===========================
@@ -430,3 +441,14 @@ async def run_wash_process(sub_info):
     except Exception as e:
         logger.error(f"❌ 洗版流程异常: {e}")
         logger.error(traceback.format_exc())
+
+
+async def delayed_run_wash_process(sub_info: dict):
+    """
+    后台任务包装器：延迟 30 秒后执行订阅添加
+    """
+    logger.info(f"⏳ 收到任务 {sub_info['name']}，将在 30 秒后执行添加订阅...")
+    await asyncio.sleep(30)  # 异步等待，不阻塞主线程
+    logger.info(f"⏰ 延迟结束，开始处理订阅: {sub_info['name']}")
+    run_wash_process(sub_info)
+
