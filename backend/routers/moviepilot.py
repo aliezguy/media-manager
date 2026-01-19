@@ -20,27 +20,42 @@ async def mp_webhook(request: Request, background_tasks: BackgroundTasks):
         data = payload.get("data", {})
         
         logger.info(f"--------------- 📨 收到 Webhook: {event_type} ---------------")
-        logger.info(f"原始报文 {data} ---------------")
+        #logger.info(f"原始报文 {data} ---------------")
         # 标准化提取 info
         mediainfo = data.get("mediainfo", {})
         subscribe_info = data.get("subscribe_info", {})
-        
+        #logger.info(f"mediainfo {mediainfo} ---------------")
+        #logger.info(f"subscribe_info {subscribe_info} ---------------")
         # --- 新增：提取判断字段 ---
         # 1. 获取 filter_groups (通常在 subscribe_info 中)
         filter_groups = subscribe_info.get("filter_groups", [])
         # 2. 获取 best_version (通常在 subscribe_info 中, 1 代表已是最佳版本)
         best_version = subscribe_info.get("best_version", 0)
 
+        # 提取各个字段
+        _id = data.get("subscribe_id") or subscribe_info.get("id")
+        _name = mediainfo.get("title") or subscribe_info.get("name") or data.get("name")
+        _tmdb_id = mediainfo.get("tmdb_id") or subscribe_info.get("tmdbid")
+        _year = mediainfo.get("year") or subscribe_info.get("year")
+        _type = mediainfo.get("type") or subscribe_info.get("type")
+        _category = data.get("category") or subscribe_info.get("category")
+        _season = data.get("season_number") or subscribe_info.get("season_number")
+
         sub_info = {
-            "id": data.get("subscribe_id") or subscribe_info.get("id"),
-            "name": mediainfo.get("title") or subscribe_info.get("name") or data.get("name"),
-            "tmdbid": mediainfo.get("tmdb_id") or subscribe_info.get("tmdbid"),
-            "type": mediainfo.get("type") or subscribe_info.get("type"), 
-            "year": mediainfo.get("year") or subscribe_info.get("year"),
-            "category": data.get("category") or subscribe_info.get("category"),
-            "season": data.get("season_number") or subscribe_info.get("season_number"),
-            "_raw_data": data
+            "id": _id,
+            "name": _name,
+            # 关键修改：同时提供 tmdbid 和 tmdb_id，防止 service 取不到值
+            "tmdbid": _tmdb_id,
+            "tmdb_id": _tmdb_id, 
+            "year": _year,
+            "type": _type,
+            "category": _category,
+            "season": _season,
+            # 传递原始数据，供 fallback 使用
+            "_raw_data": data 
         }
+        #logger.info(f"sub_info {data} ---------------")
+
 
         if not sub_info["name"]:
             return {"status": "skipped"}

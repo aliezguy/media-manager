@@ -233,6 +233,7 @@ def _find_best_scheme(title, category, schemes, scheme_type="策略"):
 async def handle_new_subscription(sub_info):
     try:
         name = sub_info.get("name")
+        year = sub_info.get("year")
         tmdb_id = sub_info.get("tmdbid")
         sub_id = sub_info.get("id")
         season = sub_info.get("season", 1)
@@ -256,8 +257,12 @@ async def handle_new_subscription(sub_info):
         if not schemes:
             logger.warning("      ⚠️ 未配置 'subscribe_schemes'")
             return
-
+        
         final_payload = {"id": sub_id} if sub_id else {}
+        exsit_sub = get_subscription(sub_id)
+        final_payload =exsit_sub
+        #logger.info(f"exsit_sub     ==={exsit_sub}")
+        #logger.info(f"sub_info     ==={sub_info}")
         has_changes = False
         
         # 2. 获取 TMDB 数据 (用于自动分类 + 修复总集数)
