@@ -308,8 +308,9 @@ async def emby_webhook(request: Request, background_tasks: BackgroundTasks):
         event = payload.get("Event")
         
         # 监听 item.created (单集入库) 和 library.new (整季入库)
-        if event in ["item.created", "library.new"]:
-            background_tasks.add_task(process_emby_item_added, payload)
+        # TODO: 已注释自动打标签功能，如需恢复请取消注释
+        # if event in ["item.created", "library.new"]:
+        #     background_tasks.add_task(process_emby_item_added, payload)
         
         return {"status": "received"}
         

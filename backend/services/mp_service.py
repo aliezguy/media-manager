@@ -245,7 +245,7 @@ async def handle_new_subscription(sub_info):
             if full_info:
                 data_node = full_info.get("data") if "data" in full_info else full_info
                 is_best = data_node.get("best_version") == 1
-                remark = str(data_node.get("remark", ""))
+                remark = str(data_node.get("remark") or data_node.get("note") or "")
                 if is_best or "AI洗版" in remark:
                     logger.info(f"⚪ [忽略新增] 检测到洗版标记 (BestVersion=1)，跳过追更策略: 《{name}》")
                     return
@@ -260,13 +260,14 @@ async def handle_new_subscription(sub_info):
         
         final_payload = {"id": sub_id} if sub_id else {}
         exsit_sub = get_subscription(sub_id)
-        final_payload =exsit_sub
+        if exsit_sub:
+            final_payload = exsit_sub
         #logger.info(f"exsit_sub     ==={exsit_sub}")
         #logger.info(f"sub_info     ==={sub_info}")
         has_changes = False
         
         # 2. 获取 TMDB 数据 (用于自动分类 + 修复总集数)
-        current_category = sub_info.get("category")
+        current_category = sub_info.get("category") or (exsit_sub.get("media_category") if exsit_sub else None)
         current_total_ep = sub_info.get("total_episode") # 获取当前总集数
         
         # 判断是否需要请求 TMDB：缺分类 OR (是剧集且缺总集数)
@@ -283,7 +284,7 @@ async def handle_new_subscription(sub_info):
                 if not current_category:
                     new_category = determine_category(tmdb_data, media_type)
                     if new_category:
-                        final_payload["category"] = new_category 
+                        final_payload["media_category"] = new_category
                         current_category = new_category
                         has_changes = True
                         logger.info(f"      ✅ 计算出分类: 【{new_category}】")
@@ -400,11 +401,15 @@ async def run_wash_process(sub_info):
                 "type": media_type,
                 "tmdbid": tmdb_id,
                 "season": int(season) if season else 1,
-                "year": year,
-                "best_version": 1, 
+                "year": str(year) if year else None,
+                "best_version": 1,
                 "username": "AI自动洗版",
-                "remark": f"AI洗版策略-[{scheme_name}]"
+                "note": f"AI洗版策略-[{scheme_name}]"
             }
+
+            # 携带分类信息
+            if current_category:
+                new_sub_payload["media_category"] = current_category
 
             f_groups = matched_scheme.get("filter_groups")
             if f_groups:
