@@ -1,6 +1,6 @@
 # backend/models.py
 from database import Base
-from sqlalchemy import Column, Integer, String, JSON, DateTime, func
+from sqlalchemy import Column, Integer, String, JSON, DateTime
 from datetime import datetime
 
 class MediaTag(Base):
@@ -25,4 +25,4 @@ class WashHistory(Base):
     wash_params = Column(JSON)
     # 🔥 新增字段，默认值为 'complete'
     wash_type = Column(String, default="complete") 
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime, default=datetime.now)
