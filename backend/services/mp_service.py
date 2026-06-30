@@ -374,8 +374,21 @@ async def run_wash_process(sub_info):
         season = sub_info.get("season")
         year = sub_info.get("year")
         current_category = sub_info.get("category")
+        sub_id = sub_info.get("id")
 
-        logger.info(f"▶️ [洗版检查] 开始: 《{name}》")
+        # 兜底：如果 webhook 没给出季数，从 MP 订阅查询
+        if not season and sub_id:
+            existing = get_subscription(sub_id)
+            if existing:
+                season = existing.get("season")
+                logger.info(f"   🔍 [季数兜底] 从 MP 订阅查到 season={season}")
+
+        # 如果仍然没有季数，告警并跳过（避免错误地洗错季）
+        if not season:
+            logger.error(f"❌ [洗版阻断] 《{name}》未获取到季数，跳过洗版防止洗错季")
+            return
+
+        logger.info(f"▶️ [洗版检查] 开始: 《{name}》S{season}")
 
         if not schemes:
             logger.info("   ⏹ 未配置洗版策略，跳过")
