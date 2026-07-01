@@ -125,6 +125,9 @@ def save_history(name, season, tmdb_id, status, msg, details, wash_type="complet
     保存历史记录到数据库
     :param wash_type: 'complete'(完结洗版) / 'new_sub'(新增追更) / 'other'
     """
+    # 兜底：确保 season 不为 None，避免前端显示空季数
+    if not season:
+        season = 1
     logger.info(f"📝 [历史-{wash_type}] {name} S{season} | {status}: {msg}")
     try:
         db = SessionLocal()
@@ -236,8 +239,17 @@ async def handle_new_subscription(sub_info):
         year = sub_info.get("year")
         tmdb_id = sub_info.get("tmdbid")
         sub_id = sub_info.get("id")
-        season = sub_info.get("season", 1)
+        season = sub_info.get("season") or None  # None 表示未获取到
         media_type = sub_info.get("type")
+
+        # 兜底：subscribe.added 事件不带 subscribe_info，需从 MP API 查季数
+        if not season and sub_id:
+            existing = get_subscription(sub_id)
+            if existing:
+                season = existing.get("season")
+                logger.info(f"   🔍 [季数兜底] 从 MP 订阅查到 season={season}")
+        if not season:
+            season = 1  # 最终兜底
 
         # 1. 防止循环：检查是否为洗版
         if sub_id:
@@ -416,6 +428,7 @@ async def run_wash_process(sub_info):
                 "season": int(season) if season else 1,
                 "year": str(year) if year else None,
                 "best_version": 1,
+                "best_version_full": 1,  # 全集洗版：只下载整包，不按单集拆包
                 "username": "AI自动洗版",
                 "note": f"AI洗版策略-[{scheme_name}]"
             }

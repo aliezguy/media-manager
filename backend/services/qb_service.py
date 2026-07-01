@@ -76,21 +76,21 @@ def get_qb_data(config_id: str = None):
                 
     return results
 
-def get_torrents(config_id: str, filter_status: str = None, tag: str = None, category: str = None, keyword: str = None):
+def get_torrents(config_id: str, filter_status: str = None, tag: str = None, category: str = None, keyword: str = None, page: int = 1, page_size: int = 50):
     """
-    获取种子列表
+    获取种子列表，支持分页
     """
     cfg = load_config()
     qb_configs = cfg.get("qb_configs", [])
     qb_cfg = next((c for c in qb_configs if c.get("id") == config_id), None)
     logger.info(f"关键字{keyword}")
     if not qb_cfg:
-        return []
-        
+        return {"torrents": [], "total": 0}
+
     client = get_qb_client(qb_cfg)
     if not client:
-        return []
-        
+        return {"torrents": [], "total": 0}
+
     try:
         torrents = client.torrents_info(filter=filter_status, tag=tag, category=category)
         # 简化返回的数据，只返回前端需要的
@@ -117,10 +117,17 @@ def get_torrents(config_id: str, filter_status: str = None, tag: str = None, cat
                 "dlspeed": t.dlspeed,
                 "save_path": t.save_path
             })
-        return result
+
+        total = len(result)
+        # 分页
+        start = (page - 1) * page_size
+        end = start + page_size
+        result = result[start:end]
+
+        return {"torrents": result, "total": total}
     except Exception as e:
         logger.error(f"❌ 获取种子列表失败: {e}")
-        return []
+        return {"torrents": [], "total": 0}
 
 def delete_torrents(config_id: str, hashes: list, delete_files: bool = False):
     """

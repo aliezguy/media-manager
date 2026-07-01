@@ -75,13 +75,15 @@ async def get_all_qb_data():
 
 @router.get("/qb/{config_id}/torrents")
 async def get_qb_torrents(
-    config_id: str, 
-    filter: Optional[str] = None, 
-    tag: Optional[str] = None, 
+    config_id: str,
+    filter: Optional[str] = None,
+    tag: Optional[str] = None,
     category: Optional[str] = None,
-    keyword: Optional[str] = None
+    keyword: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50
 ):
-    return get_torrents(config_id, filter, tag, category,keyword)
+    return get_torrents(config_id, filter, tag, category, keyword, page, page_size)
 
 @router.post("/qb/{config_id}/torrents/delete")
 async def delete_qb_torrents(

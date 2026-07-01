@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Request, BackgroundTasks
 import logging
+import json
 # 引入重构后的 Service
 from services.mp_service import (
     get_mp_resources, 
@@ -20,12 +21,12 @@ async def mp_webhook(request: Request, background_tasks: BackgroundTasks):
         data = payload.get("data", {})
         
         logger.info(f"--------------- 📨 收到 Webhook: {event_type} ---------------")
-        #logger.info(f"原始报文 {data} ---------------")
+        logger.info(f"[DEBUG] 原始报文: {json.dumps(data, ensure_ascii=False, default=str)}")
         # 标准化提取 info
         mediainfo = data.get("mediainfo", {})
         subscribe_info = data.get("subscribe_info", {})
-        #logger.info(f"mediainfo {mediainfo} ---------------")
-        #logger.info(f"subscribe_info {subscribe_info} ---------------")
+        logger.info(f"[DEBUG] mediainfo: {json.dumps(mediainfo, ensure_ascii=False, default=str)}")
+        logger.info(f"[DEBUG] subscribe_info: {json.dumps(subscribe_info, ensure_ascii=False, default=str)}")
         # --- 新增：提取判断字段 ---
         # 1. 获取 filter_groups (通常在 subscribe_info 中)
         filter_groups = subscribe_info.get("filter_groups", [])

@@ -299,4 +299,14 @@ const stopBatch = () => { isBatchRunning.value = false; ElMessage.info('停止�
 .ai-actions { margin-top: 4px; }
 
 .pagination-bar { background: #fff; padding: 10px; border-top: 1px solid #EBEEF5; display: flex; justify-content: flex-end; }
+
+@media screen and (max-width: 768px) {
+  .manager-container { gap: 8px; }
+  .toolbar { padding: 10px; gap: 8px; flex-direction: column; align-items: stretch; }
+  .tool-group { flex-wrap: wrap; }
+  .search-group { margin-left: 0; width: 100%; }
+  .search-group :deep(.el-input) { width: 100% !important; }
+  .batch-content { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .table-card { border-radius: 0; }
+}
 </style>

@@ -40,23 +40,24 @@
           </el-popconfirm>
         </div>
 
-        <el-table 
-          v-loading="loading" 
-          :data="torrents" 
-          style="width: 100%; margin-top: 20px" 
+        <el-table
+          v-loading="loading"
+          :data="torrents"
+          style="width: 100%; margin-top: 8px"
           @selection-change="handleSelectionChange"
-          height="calc(100vh - 280px)"
+          :height="isMobile() ? undefined : 'calc(100vh - 280px)'"
+          size="small"
         >
-          <el-table-column type="selection" width="55" />
-          <el-table-column prop="name" label="名称" min-width="400" sortable show-overflow-tooltip />
-          <el-table-column prop="size" label="大小" width="100">
+          <el-table-column type="selection" width="40" />
+          <el-table-column prop="name" label="名称" min-width="200" show-overflow-tooltip />
+          <el-table-column prop="size" label="大小" width="80" class-name="col-optional">
             <template #default="{ row }">
               {{ formatBytes(row.size) }}
             </template>
           </el-table-column>
           <el-table-column prop="progress" label="进度" width="70">
             <template #default="{ row }">
-              <el-progress :percentage="Math.round(row.progress * 100)" />
+              <span class="progress-text">{{ Math.round(row.progress * 100) }}%</span>
             </template>
           </el-table-column>
           <el-table-column prop="state" label="状态" width="120">
@@ -81,6 +82,20 @@
             </template>
           </el-table-column>
         </el-table>
+
+        <!-- 分页 -->
+        <div class="pagination-bar" v-if="torrentTotal > 0">
+          <el-pagination
+            v-model:current-page="currentPage"
+            v-model:page-size="pageSize"
+            :page-sizes="[20, 50, 100, 200]"
+            :total="torrentTotal"
+            layout="total, sizes, prev, pager, next"
+            small
+            @current-change="handlePageChange"
+            @size-change="handleSizeChange"
+          />
+        </div>
       </el-tab-pane>
 
       <!-- 实例配置标签页 -->
@@ -194,6 +209,9 @@ const qbConfigs = ref([])
 const loading = ref(false)
 const selectedQb = ref('')
 const torrents = ref([])
+const torrentTotal = ref(0)
+const currentPage = ref(1)
+const pageSize = ref(50)
 const selectedHashes = ref([])
 const currentTags = ref([])
 const currentCategories = ref([])
@@ -213,11 +231,13 @@ const currentConfig = ref({
 })
 
 // 加载配置
-const fetchConfigs = async () => {
+const isMobile = () => window.innerWidth < 768
+const fetchConfigs = async (autoLoad = false) => {
   try {
     const res = await axios.get('/api/qb/configs')
     qbConfigs.value = res.data
-    if (qbConfigs.value.length && !selectedQb.value) {
+    // 只在桌面端自动加载种子，手机端需手动刷新（避免卡死）
+    if (autoLoad && qbConfigs.value.length && !selectedQb.value) {
       selectedQb.value = qbConfigs.value[0].id
       fetchQbData()
     }
@@ -280,18 +300,33 @@ const fetchTorrents = async () => {
   if (!selectedQb.value) return
   loading.value = true
   try {
-    const params = {}
+    const params = {
+      page: currentPage.value,
+      page_size: pageSize.value
+    }
     if (filterTag.value) params.tag = filterTag.value
-    if (filterName.value) params.keyword = filterName.value // 传递关键字
+    if (filterName.value) params.keyword = filterName.value
     if (filterCategory.value) params.category = filterCategory.value
-    
+
     const res = await axios.get(`/api/qb/${selectedQb.value}/torrents`, { params })
-    torrents.value = res.data
+    torrents.value = res.data.torrents || res.data
+    torrentTotal.value = res.data.total || 0
   } catch (err) {
     ElMessage.error('获取种子列表失败')
   } finally {
     loading.value = false
   }
+}
+
+const handlePageChange = (page) => {
+  currentPage.value = page
+  fetchTorrents()
+}
+
+const handleSizeChange = (size) => {
+  pageSize.value = size
+  currentPage.value = 1
+  fetchTorrents()
 }
 
 const handleSelectionChange = (val) => {
@@ -389,20 +424,82 @@ const formatBytes = (bytes, decimals = 2) => {
 }
 
 onMounted(() => {
-  fetchConfigs()
+  // 桌面端自动加载种子列表，手机端只加载配置（避免连不上 qB 导致卡死）
+  fetchConfigs(!isMobile())
 })
 </script>
 
 <style scoped>
-.toolbar {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  flex-wrap: wrap;
+.qb-manager {
+  height: 100%;
 }
+
 .qb-tabs {
   background: #fff;
-  padding: 20px;
+  padding: 16px;
   border-radius: 8px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.qb-tabs :deep(.el-tabs__content) {
+  flex: 1;
+  overflow: auto;
+}
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.pagination-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 0 0;
+  border-top: 1px solid #EBEEF5;
+  margin-top: 10px;
+}
+
+/* 移动端适配 */
+@media screen and (max-width: 768px) {
+  .qb-tabs {
+    padding: 4px;
+    border-radius: 0;
+    height: 100%;
+  }
+
+  .qb-tabs :deep(.el-tabs__header) {
+    margin-bottom: 8px;
+  }
+
+  .toolbar {
+    gap: 4px;
+  }
+
+  .toolbar .el-select,
+  .toolbar .el-input {
+    width: calc(50% - 2px) !important;
+    font-size: 12px;
+  }
+
+  .toolbar .el-button {
+    font-size: 11px;
+    padding: 4px 8px;
+  }
+
+  /* 隐藏非关键列，节省手机屏幕宽度 */
+  .col-optional {
+    display: none;
+  }
+
+  .progress-text {
+    font-size: 11px;
+    font-weight: 600;
+    color: #409EFF;
+  }
 }
 </style>
