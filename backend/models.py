@@ -1,7 +1,17 @@
 # backend/models.py
+import enum
 from database import Base
 from sqlalchemy import Column, Integer, String, JSON, DateTime
 from datetime import datetime
+
+
+class TaskStatus(str, enum.Enum):
+    """自动化任务状态枚举"""
+    INIT = "INIT"
+    WAITING_FOR_DELETE_WEBHOOK = "WAITING_FOR_DELETE_WEBHOOK"
+    WAITING_FOR_NEW_WEBHOOK = "WAITING_FOR_NEW_WEBHOOK"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
 
 class MediaTag(Base):
     __tablename__ = "media_tags"
@@ -24,5 +34,60 @@ class WashHistory(Base):
     message = Column(String)
     wash_params = Column(JSON)
     # 🔥 新增字段，默认值为 'complete'
-    wash_type = Column(String, default="complete") 
+    wash_type = Column(String, default="complete")
     created_at = Column(DateTime, default=datetime.now)
+
+
+class TvShowDetail(Base):
+    """电视剧详情表 — 存储 TMDB 元数据"""
+    __tablename__ = "tv_show_details"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tmdb_id = Column(Integer, unique=True, index=True, nullable=False)
+    title = Column(String, nullable=False)
+    year = Column(Integer)
+    category = Column(String)
+    total_episodes = Column(Integer)
+    overview = Column(String)
+    created_at = Column(DateTime, default=datetime.now)
+
+
+class CompletedSeasonRecord(Base):
+    """已完结剧集记录表 — 记录已下载/已整理的季信息"""
+    __tablename__ = "completed_season_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tmdb_id = Column(Integer, nullable=False, index=True)
+    season_number = Column(Integer, nullable=False)
+    downloaded_episodes = Column(Integer, default=0)
+    folder_path = Column(String)
+    size_bytes = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.now)
+
+
+class TorrentRecord(Base):
+    """种子记录表 — 关联种子 hash 与 TMDB ID"""
+    __tablename__ = "torrent_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    hash = Column(String, unique=True, index=True, nullable=False)
+    torrent_name = Column(String, nullable=False)
+    tmdb_id = Column(Integer, index=True)
+    qb_category = Column(String)
+    size = Column(Integer)
+    added_on = Column(DateTime)
+
+
+class AutoTaskFlow(Base):
+    """自动化任务流转表 — 状态机核心"""
+    __tablename__ = "auto_task_flows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tmdb_id = Column(Integer, nullable=False, index=True)
+    task_type = Column(String, nullable=False)
+    status = Column(String, nullable=False, default=TaskStatus.INIT.value)
+    retry_count = Column(Integer, default=0)
+    error_message = Column(String)
+    context = Column(JSON)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)

@@ -1,3 +1,47 @@
+/* ==================== CSS Custom Properties — Dark Theme ==================== */
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #0b1120;
+  --bg-card: #1e293b;
+  --bg-card-hover: #273548;
+  --bg-input: #1e293b;
+  --bg-input-focus: #273548;
+  --bg-overlay: rgba(15, 23, 42, 0.8);
+
+  --text-primary: #f1f5f9;
+  --text-secondary: #94a3b8;
+  --text-tertiary: #64748b;
+  --text-inverse: #0f172a;
+
+  --accent-blue: #3b82f6;
+  --accent-blue-soft: rgba(59, 130, 246, 0.15);
+  --accent-green: #10b981;
+  --accent-green-soft: rgba(16, 185, 129, 0.15);
+  --accent-yellow: #f59e0b;
+  --accent-yellow-soft: rgba(245, 158, 11, 0.15);
+  --accent-red: #ef4444;
+  --accent-red-soft: rgba(239, 68, 68, 0.15);
+  --accent-purple: #8b5cf6;
+  --accent-cyan: #06b6d4;
+  --accent-orange: #f97316;
+
+  --border-color: #334155;
+  --border-light: #1e293b;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-full: 9999px;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-glow-blue: 0 0 12px rgba(59, 130, 246, 0.4);
+  --shadow-glow-green: 0 0 12px rgba(16, 185, 129, 0.4);
+}
+
+/* ==================== Reset & Base ==================== */
 * {
   margin: 0;
   padding: 0;
@@ -11,11 +55,15 @@ html, body {
   -webkit-overflow-scrolling: touch;
 }
 
+html.dark {
+  color-scheme: dark;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   font-size: 14px;
-  color: #303133;
-  background-color: #f5f7fa;
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
 }
 
 #app {
@@ -23,20 +71,272 @@ body {
   height: 100%;
 }
 
-/* 移动端安全区域适配 */
+/* ==================== Custom Scrollbar ==================== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-color) transparent;
+}
+
+/* ==================== Mobile Safe Area ==================== */
 @supports (padding-bottom: env(safe-area-inset-bottom)) {
   .safe-bottom {
     padding-bottom: env(safe-area-inset-bottom);
   }
 }
 
-/* 移动端全局调整 */
+/* ==================== Element Plus Global Dark Overrides ==================== */
+/* Dialog */
+.el-dialog {
+  --el-dialog-bg-color: var(--bg-card);
+  --el-dialog-title-font-size: 16px;
+  border-radius: var(--radius-lg);
+}
+
+.el-dialog__header {
+  border-bottom: 1px solid var(--border-color);
+  padding: 16px 20px;
+  margin-right: 0;
+}
+
+.el-dialog__title {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.el-dialog__body {
+  padding: 20px;
+  color: var(--text-secondary);
+}
+
+.el-dialog__footer {
+  border-top: 1px solid var(--border-color);
+  padding: 12px 20px;
+}
+
+/* Message */
+.el-message {
+  --el-message-bg-color: var(--bg-card);
+  --el-message-text-color: var(--text-primary);
+  --el-message-border-color: var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+/* Popconfirm */
+.el-popconfirm {
+  --el-popconfirm-bg-color: var(--bg-card);
+  --el-popconfirm-border-color: var(--border-color);
+}
+
+.el-popper.is-dark {
+  --el-popper-bg-color: var(--bg-card);
+  --el-popper-border-color: var(--border-color);
+}
+
+/* MessageBox */
+.el-message-box {
+  --el-messagebox-bg-color: var(--bg-card);
+  --el-messagebox-border-color: var(--border-color);
+  --el-messagebox-title-color: var(--text-primary);
+  --el-messagebox-content-color: var(--text-secondary);
+  border-radius: var(--radius-lg);
+}
+
+/* Tag */
+.el-tag {
+  --el-tag-border-radius: 6px;
+}
+
+/* Button overrides */
+.el-button--primary {
+  --el-button-bg-color: var(--accent-blue);
+  --el-button-border-color: var(--accent-blue);
+}
+
+.el-button--danger {
+  --el-button-bg-color: var(--accent-red);
+  --el-button-border-color: var(--accent-red);
+}
+
+/* Input / Select dark pill style */
+.el-input__wrapper {
+  --el-input-bg-color: var(--bg-input);
+  border-radius: var(--radius-full) !important;
+  box-shadow: 0 0 0 1px var(--border-color) !important;
+  transition: box-shadow 0.2s;
+}
+
+.el-input__wrapper:hover {
+  box-shadow: 0 0 0 1px var(--text-tertiary) !important;
+}
+
+.el-input__wrapper.is-focus {
+  box-shadow: 0 0 0 1px var(--accent-blue) !important;
+}
+
+.el-input__inner {
+  color: var(--text-primary);
+}
+
+.el-input__inner::placeholder {
+  color: var(--text-tertiary);
+}
+
+/* Select dropdown */
+.el-select-dropdown {
+  --el-select-dropdown-bg-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.el-select-dropdown__item {
+  color: var(--text-secondary);
+}
+
+.el-select-dropdown__item.hover,
+.el-select-dropdown__item:hover {
+  background-color: var(--accent-blue-soft);
+  color: var(--accent-blue);
+}
+
+.el-select-dropdown__item.selected {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+/* Table (will be removed from QbManager but style it for configs page) */
+.el-table {
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: var(--bg-card);
+  --el-table-border-color: var(--border-color);
+  --el-table-text-color: var(--text-primary);
+  --el-table-header-text-color: var(--text-secondary);
+  --el-table-row-hover-bg-color: var(--bg-card-hover);
+}
+
+.el-table th.el-table__cell {
+  background-color: var(--bg-card);
+}
+
+.el-table__body tr:hover > td {
+  background-color: var(--bg-card-hover) !important;
+}
+
+/* Pagination */
+.el-pagination {
+  --el-pagination-bg-color: transparent;
+  --el-pagination-text-color: var(--text-secondary);
+  --el-pagination-button-bg-color: var(--bg-card);
+  --el-pagination-hover-color: var(--accent-blue);
+}
+
+.el-pagination .el-pager li {
+  color: var(--text-secondary);
+  background-color: transparent;
+  border-radius: var(--radius-sm);
+}
+
+.el-pagination .el-pager li.is-active {
+  background-color: var(--accent-blue);
+  color: #fff;
+}
+
+.el-pagination .el-pager li:hover:not(.is-active) {
+  background-color: var(--accent-blue-soft);
+  color: var(--accent-blue);
+}
+
+.el-pagination button {
+  color: var(--text-secondary);
+  background-color: var(--bg-card);
+  border-radius: var(--radius-sm);
+}
+
+.el-pagination button:hover {
+  color: var(--accent-blue);
+}
+
+.el-pagination button:disabled {
+  color: var(--text-tertiary);
+  background-color: var(--bg-card);
+}
+
+/* Tabs */
+.el-tabs__header {
+  border-bottom-color: var(--border-color);
+}
+
+.el-tabs__item {
+  color: var(--text-secondary);
+}
+
+.el-tabs__item.is-active {
+  color: var(--accent-blue);
+}
+
+.el-tabs__item:hover {
+  color: var(--text-primary);
+}
+
+.el-tabs__active-bar {
+  background-color: var(--accent-blue);
+}
+
+.el-tabs__nav-wrap::after {
+  background-color: var(--border-color);
+}
+
+/* Form */
+.el-form-item__label {
+  color: var(--text-secondary);
+}
+
+/* Switch */
+.el-switch__label {
+  color: var(--text-secondary);
+}
+
+/* Divider */
+.el-divider {
+  border-top-color: var(--border-color);
+}
+
+/* Progress (keep for file dialog) */
+.el-progress-bar__outer {
+  background-color: var(--bg-card-hover);
+}
+
+/* Tooltip */
+.el-tooltip__trigger:focus-visible {
+  outline: none;
+}
+
+/* ==================== Mobile Global Adjustments ==================== */
 @media screen and (max-width: 768px) {
   body {
     font-size: 13px;
   }
 
-  /* Element Plus 移动端微调 */
   .el-message {
     min-width: auto !important;
     max-width: 90vw !important;

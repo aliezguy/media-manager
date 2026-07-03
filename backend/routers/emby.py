@@ -306,12 +306,23 @@ async def emby_webhook(request: Request, background_tasks: BackgroundTasks):
             except: return {"status": "unsupported"}
 
         event = payload.get("Event")
-        
+        logger.info(f"emby webhook: {payload}")
+
+        # --- Auto Task Flow: library.deleted → trigger CD2 move ---
+        if event == "library.deleted":
+            background_tasks.add_task(_handle_library_deleted, payload)
+            # Return immediately; task flow handler runs in background
+
+        # NOTE: library.new is NO LONGER used for task flow seed cleanup.
+        # Seed deletion is now driven by file-system verification (fileCount +
+        # totalSize match) immediately after CD2 move — see
+        # task_flow_service._verify_season_move() and handle_library_deleted_webhook().
+
         # 监听 item.created (单集入库) 和 library.new (整季入库)
         # TODO: 已注释自动打标签功能，如需恢复请取消注释
         # if event in ["item.created", "library.new"]:
         #     background_tasks.add_task(process_emby_item_added, payload)
-        
+
         return {"status": "received"}
         
     except Exception as e:
@@ -566,3 +577,25 @@ def ai_analyze_batch(req: AIBatchRequest, db: Session = Depends(get_db)):
             
     db.commit()
     return {"status": "success", "results": results_map}
+
+
+# ==========================================
+# 🔄 Auto Task Flow: Webhook Background Handlers
+# ==========================================
+
+
+async def _handle_library_deleted(payload: dict):
+    """Background task: process library.deleted for auto task flow."""
+    from services.task_flow_service import handle_library_deleted_webhook
+    db = next(get_db())
+    try:
+        logger.info(f"🔄 [TaskFlow] library.deleted — tmdb={payload.get('Item', {}).get('ProviderIds', {}).get('Tmdb', '?')}")
+        handle_library_deleted_webhook(payload, db)
+    except Exception as e:
+        logger.error(f"❌ [TaskFlow] library.deleted handler error: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        db.close()
+
+# _handle_library_new_for_task_flow REMOVED — seed deletion is now driven by
+# file-system verification in task_flow_service, not by Emby library.new webhook.

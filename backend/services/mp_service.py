@@ -488,3 +488,126 @@ async def delayed_run_wash_process(sub_info: dict):
     logger.info(f"⏰ 延迟结束，开始处理订阅: {sub_info['name']}")
     await run_wash_process(sub_info)
 
+
+# ===========================
+# 5. 媒体识别（种子名称 → 结构化元数据）
+# ===========================
+
+def recognize_torrent_with_mp(torrent_name: str) -> dict | None:
+    """Use MoviePilot's built-in media recognition to parse a torrent name.
+
+    Calls ``GET /api/v1/media/recognize?title=...`` which leverages MP's
+    own TMDB integration and recognition engine — significantly more
+    accurate than regex heuristics for ambiguous titles/years.
+
+    Returns a dict with keys matching the organize_service format, or
+    ``None`` if MP is unavailable or recognition fails.
+    """
+    cfg = load_config()
+    host = cfg.get("mp_host", "").rstrip("/")
+    if not host:
+        logger.debug("MP recognize skipped: mp_host not configured")
+        return None
+
+    token = get_mp_token()
+    if not token:
+        logger.debug("MP recognize skipped: unable to obtain MP token")
+        return None
+
+    try:
+        url = f"{host}/api/v1/media/recognize"
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(
+            url,
+            headers=headers,
+            params={"title": torrent_name},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.debug("MP recognize HTTP %d for '%s'", resp.status_code, torrent_name[:60])
+            return None
+
+        data = resp.json()
+        logger.info("MP recognize raw response for '%s': %s", torrent_name[:60], str(data)[:300])
+
+        # MP wraps recognition result in "meta_info" (v2.x).
+        # Also handle older versions that might use "data" or return a flat object.
+        media = data if isinstance(data, dict) else {}
+        if "meta_info" in media:
+            media = media["meta_info"]
+        elif "data" in media:
+            media = media["data"]
+        if not media or not isinstance(media, dict):
+            return None
+
+        # Title: prefer cn_name (clean show name).
+        # MP's "title" field contains the full original torrent name,
+        # not the extracted show name.
+        title = (
+            media.get("cn_name")
+            or media.get("name")
+            or media.get("title")
+        )
+        if not title:
+            return None
+
+        # Skip when MP can't determine the media type (title alone without
+        # season/episode markers is not enough for reliable recognition).
+        media_type = media.get("type") or "电视剧"
+        if media_type == "未知":
+            logger.debug(
+                "MP recognize: type=未知 for '%s' — skipping (insufficient info)",
+                torrent_name[:60],
+            )
+            return None
+
+        year = media.get("year")
+        if year:
+            try:
+                year = str(int(year))
+            except (ValueError, TypeError):
+                year = None
+
+        # MP uses "begin_season" for the detected season number.
+        season = (
+            media.get("begin_season")
+            or media.get("season")
+            or media.get("season_number")
+        )
+        if season is not None and season != 0:
+            try:
+                season = int(season)
+            except (ValueError, TypeError):
+                season = 1
+        else:
+            season = 1
+
+        # MP's /media/recognize does NOT return tmdb_id.
+        # That requires a separate TMDB search (done later in organize_service).
+        tmdb_id = media.get("tmdbid") or media.get("tmdb_id") or media.get("tmdbId") or None
+        if tmdb_id:
+            try:
+                tmdb_id = int(tmdb_id)
+            except (ValueError, TypeError):
+                tmdb_id = None
+
+        result = {
+            "title": str(title),
+            "year": year,
+            "season": season,
+            "tmdb_id": tmdb_id,
+            "tmdb_name": title,
+            "source": "mp",
+            "media_type": str(media_type),
+            "success": True,
+        }
+        logger.info(
+            "MP recognize: '%s' → title=%s year=%s tmdb=%s season=%s type=%s",
+            torrent_name[:60], title, year, tmdb_id, season, media_type,
+        )
+        return result
+
+    except Exception as e:
+        logger.warning("MP recognize failed for '%s': %s", torrent_name[:60], e)
+        return None
+

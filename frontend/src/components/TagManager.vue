@@ -12,7 +12,6 @@ const libraries = ref([])
 const selectedLib = ref('')
 const searchTerm = ref('')
 const tableData = ref([])
-const tableRef = ref(null)
 
 // 筛选与分页
 const filterStatus = ref('all')
@@ -27,12 +26,11 @@ const isBatchRunning = ref(false)
 const currentBatchAction = ref('')
 const batchProgress = reactive({ total: 0, finished: 0, success: 0, fail: 0 })
 
-// 初始化加载配置
 onMounted(async () => {
   try {
     const res = await axios.get(`${API_URL}/api/config`)
     Object.assign(config, res.data)
-    if(config.emby_api_key) connectEmby(true) // 自动尝试获取库列表
+    if(config.emby_api_key) connectEmby(true)
   } catch(e) {}
 })
 
@@ -67,6 +65,21 @@ const pagedTableData = computed(() => {
   return filteredTableData.value.slice(start, start + pageSize.value)
 })
 
+// === 选择逻辑 ===
+const toggleSelect = (row) => {
+  if (isBatchRunning.value) return
+  const idx = multipleSelection.value.findIndex(i => i.id === row.id)
+  if (idx === -1) {
+    multipleSelection.value.push(row)
+  } else {
+    multipleSelection.value.splice(idx, 1)
+  }
+}
+
+const isSelected = (row) => {
+  return multipleSelection.value.some(i => i.id === row.id)
+}
+
 // === 方法 ===
 const connectEmby = async (silent=false) => {
   try {
@@ -79,25 +92,25 @@ const connectEmby = async (silent=false) => {
 const loadItems = async (loadAll) => {
   if(!selectedLib.value) return ElMessage.warning('请先选择媒体库')
   loading.value = true; tableData.value = []
-  currentPage.value = 1
+  currentPage.value = 1; multipleSelection.value = []
   try {
     const res = await axios.post(`${API_URL}/api/library_items`, {
       ...config, library_id: selectedLib.value, limit: loadAll ? -1 : 50
     })
     processData(res.data.items)
     ElMessage.success(`已加载 ${res.data.items.length} 条数据`)
-  } catch (e) { ElMessage.error(e.message) } 
+  } catch (e) { ElMessage.error(e.message) }
   finally { loading.value = false }
 }
 
 const searchItems = async () => {
   if(!searchTerm.value) return
-  loading.value = true; tableData.value = []; currentPage.value = 1
+  loading.value = true; tableData.value = []; currentPage.value = 1; multipleSelection.value = []
   try {
     const res = await axios.post(`${API_URL}/api/search_items`, { ...config, search_term: searchTerm.value })
     processData(res.data.items)
     if(res.data.items.length === 0) ElMessage.info('未找到相关内容')
-  } catch (e) { ElMessage.error(e.message) } 
+  } catch (e) { ElMessage.error(e.message) }
   finally { loading.value = false }
 }
 
@@ -133,14 +146,13 @@ const saveTags = async (row) => {
   row.saving = true
   try {
     const res = await axios.post(`${API_URL}/api/save_tags`, {
-      ...config, item_id: row.id, tags: row.editing_tags, overwrite: true 
+      ...config, item_id: row.id, tags: row.editing_tags, overwrite: true
     })
     row.current_tags = [...res.data.tags]; row.editing_tags = [...res.data.tags]; row.status = '💾已存'
   } catch (e) { row.status = '❌错误' } finally { row.saving = false }
 }
 
 // 批量逻辑
-const handleSelectionChange = (val) => { multipleSelection.value = val }
 const chunkArray = (arr, size) => Array.from({ length: Math.ceil(arr.length / size) }, (v, i) => arr.slice(i * size, i * size + size))
 
 const runBatchQueue = async (tasks, taskFn, maxConcurrent, actionName) => {
@@ -150,13 +162,13 @@ const runBatchQueue = async (tasks, taskFn, maxConcurrent, actionName) => {
   const next = async () => {
     if (queue.length === 0) return
     const chunk = queue.shift()
-    try { const c = await taskFn(chunk); batchProgress.success += c } catch { batchProgress.fail += chunk.length } 
+    try { const c = await taskFn(chunk); batchProgress.success += c } catch { batchProgress.fail += chunk.length }
     finally { batchProgress.finished += chunk.length; if (isBatchRunning.value) await next() }
   }
   await Promise.all(Array.from({ length: Math.min(tasks.length, maxConcurrent) }, () => next()))
   isBatchRunning.value = false
   ElMessage[batchProgress.fail === 0 ? 'success' : 'warning'](`${actionName} 完成`)
-  if(batchProgress.fail === 0) tableRef.value.clearSelection()
+  if(batchProgress.fail === 0) multipleSelection.value = []
 }
 
 const batchAnalyze = async () => {
@@ -173,9 +185,9 @@ const batchAnalyze = async () => {
 const batchSave = async () => {
   if (!multipleSelection.value.length) return ElMessage.warning('请先勾选')
   await ElMessageBox.confirm(`确定写入 ${multipleSelection.value.length} 部？`, '提示', { confirmButtonText: '写入' })
-  const task = async (row) => { 
+  const task = async (row) => {
     if (row.suggested_tags.length) acceptAllAi(row)
-    await saveTags(row); return 1 
+    await saveTags(row); return 1
   }
   runBatchQueue(multipleSelection.value.map(r=>[r]), async(c)=>await task(c[0]), 2, '批量写入')
 }
@@ -185,128 +197,718 @@ const stopBatch = () => { isBatchRunning.value = false; ElMessage.info('停止�
 
 <template>
   <div class="manager-container">
-    <el-card shadow="never" class="toolbar-card">
-      <div class="toolbar">
-        <div class="tool-group">
-          <span class="label">📚 媒体库:</span>
-          <el-select v-model="selectedLib" placeholder="请选择库" style="width:140px" :disabled="isBatchRunning">
-            <el-option v-for="l in libraries" :key="l.Id" :label="l.Name" :value="l.Id"/>
-          </el-select>
-          <el-button-group>
-            <el-button @click="loadItems(false)" :icon="VideoPlay" :disabled="isBatchRunning">加载50条</el-button>
-            <el-button @click="loadItems(true)" :icon="Check" :loading="loading" :disabled="isBatchRunning">全部</el-button>
-          </el-button-group>
-        </div>
-        
-        <div class="tool-group">
-          <span class="label"><el-icon><Filter/></el-icon> 筛选:</span>
-          <el-select v-model="filterStatus" style="width:100px" :disabled="isBatchRunning"><el-option label="全部" value="all"/><el-option label="无标签" value="no"/><el-option label="有标签" value="yes"/></el-select>
-          <el-select v-model="filterYear" filterable clearable placeholder="年份" style="width:100px" :disabled="isBatchRunning"><template #prefix><el-icon><Calendar/></el-icon></template><el-option v-for="y in uniqueYears" :key="y" :label="y" :value="y"/></el-select>
-          <el-select v-model="filterTag" filterable clearable placeholder="搜标签" style="width:120px" :disabled="isBatchRunning"><el-option v-for="t in uniqueTags" :key="t" :label="t" :value="t"/></el-select>
-        </div>
+    <!-- ==================== Toolbar ==================== -->
+    <div class="toolbar">
+      <div class="tool-group">
+        <span class="tool-label">📚 媒体库</span>
+        <el-select v-model="selectedLib" placeholder="请选择库" style="width:140px" :disabled="isBatchRunning">
+          <el-option v-for="l in libraries" :key="l.Id" :label="l.Name" :value="l.Id"/>
+        </el-select>
+        <button class="btn-pill btn-pill-blue" @click="loadItems(false)" :disabled="isBatchRunning">
+          <el-icon :size="14"><VideoPlay /></el-icon> 加载50条
+        </button>
+        <button class="btn-pill btn-pill-outline" @click="loadItems(true)" :disabled="loading || isBatchRunning">
+          <el-icon v-if="loading" :size="14" class="is-loading"><Loading /></el-icon>
+          <el-icon v-else :size="14"><Check /></el-icon> 全部
+        </button>
+      </div>
 
-        <div class="tool-group search-group">
-          <el-input v-model="searchTerm" placeholder="搜索剧名..." @keyup.enter="searchItems" :disabled="isBatchRunning">
-            <template #append><el-button :icon="Search" @click="searchItems"/></template>
-          </el-input>
+      <div class="tool-group">
+        <span class="tool-label"><el-icon :size="14"><Filter /></el-icon> 筛选</span>
+        <el-select v-model="filterStatus" style="width:100px" :disabled="isBatchRunning">
+          <el-option label="全部" value="all"/><el-option label="无标签" value="no"/><el-option label="有标签" value="yes"/>
+        </el-select>
+        <el-select v-model="filterYear" filterable clearable placeholder="年份" style="width:100px" :disabled="isBatchRunning">
+          <template #prefix><el-icon><Calendar /></el-icon></template>
+          <el-option v-for="y in uniqueYears" :key="y" :label="y" :value="y"/>
+        </el-select>
+        <el-select v-model="filterTag" filterable clearable placeholder="搜标签" style="width:130px" :disabled="isBatchRunning">
+          <el-option v-for="t in uniqueTags" :key="t" :label="t" :value="t"/>
+        </el-select>
+      </div>
+
+      <div class="tool-group search-group">
+        <div class="search-box">
+          <el-icon :size="14" class="search-icon"><Search /></el-icon>
+          <input
+            v-model="searchTerm"
+            type="text"
+            placeholder="搜索剧名..."
+            class="search-input"
+            :disabled="isBatchRunning"
+            @keyup.enter="searchItems"
+          />
         </div>
       </div>
-    </el-card>
+    </div>
 
+    <!-- ==================== Batch Action Bar ==================== -->
     <transition name="el-zoom-in-top">
-      <el-alert v-if="multipleSelection.length > 0 || isBatchRunning" type="success" :closable="false" class="batch-alert">
-        <template #default>
-          <div class="batch-content">
-            <div v-if="!isBatchRunning">已选 <b>{{ multipleSelection.length }}</b> 项</div>
-            <div v-else class="running-info">
-              <el-icon class="is-loading"><Loading /></el-icon> {{ currentBatchAction }}进度: {{ batchProgress.finished }}/{{ batchProgress.total }} (✅{{batchProgress.success}} ❌{{batchProgress.fail}})
-            </div>
-            <div class="batch-btns">
-              <el-button v-if="isBatchRunning" type="danger" size="small" @click="stopBatch">停止</el-button>
-              <template v-else>
-                <el-button type="success" size="small" @click="batchAnalyze" :icon="MagicStick">AI 分析</el-button>
-                <el-button type="primary" size="small" @click="batchSave" :icon="Download">写入 Emby</el-button>
-              </template>
-            </div>
+      <div v-if="multipleSelection.length > 0 || isBatchRunning" class="batch-bar">
+        <div class="batch-bar-inner">
+          <div v-if="!isBatchRunning" class="batch-info">
+            <el-icon :size="16"><Check /></el-icon>
+            已选 <b>{{ multipleSelection.length }}</b> 项
           </div>
-          <el-progress v-if="isBatchRunning" :percentage="Math.round((batchProgress.finished/batchProgress.total)*100) || 0" :stroke-width="6" :show-text="false" class="batch-progress"/>
-        </template>
-      </el-alert>
+          <div v-else class="batch-info running">
+            <el-icon :size="16" class="is-loading"><Loading /></el-icon>
+            {{ currentBatchAction }} — {{ batchProgress.finished }}/{{ batchProgress.total }}
+            (✅{{ batchProgress.success }} ❌{{ batchProgress.fail }})
+          </div>
+          <div class="batch-btns">
+            <button v-if="isBatchRunning" class="btn-pill btn-pill-danger" @click="stopBatch">停止</button>
+            <template v-else>
+              <button class="btn-pill btn-pill-green" @click="batchAnalyze">
+                <el-icon :size="14"><MagicStick /></el-icon> AI 分析
+              </button>
+              <button class="btn-pill btn-pill-blue" @click="batchSave">
+                <el-icon :size="14"><Download /></el-icon> 写入 Emby
+              </button>
+            </template>
+          </div>
+        </div>
+        <div v-if="isBatchRunning" class="batch-progress-track">
+          <div class="batch-progress-fill" :style="{ width: Math.round((batchProgress.finished/batchProgress.total)*100) + '%' }"></div>
+        </div>
+      </div>
     </transition>
 
-    <el-card shadow="hover" class="table-card">
-      <el-table ref="tableRef" :data="pagedTableData" border stripe height="calc(100vh - 240px)" @selection-change="handleSelectionChange">
-        <el-table-column type="selection" width="45" align="center" :selectable="()=>!isBatchRunning"/>
-        <el-table-column label="剧集" width="180">
-          <template #default="{row}">
-            <div class="title">{{ row.name }}</div>
-            <div class="meta">{{ row.year }} <span class="status-tag" :class="{'done': row.status.includes('存')}">{{ row.status }}</span></div>
-          </template>
-        </el-table-column>
-        <el-table-column label="当前标签" min-width="300">
-          <template #default="{row}">
-            <div class="tags-box">
-              <el-tag v-for="tag in row.editing_tags" :key="tag" closable type="info" size="small" @close="removeTag(row, tag)">{{ tag }}</el-tag>
-              <el-input v-if="row.inputVisible" v-model="row.inputValue" size="small" style="width:70px" @blur="addTagInput(row)" @keyup.enter="addTagInput(row)" ref="InputRef"/>
-              <el-button v-else size="small" :icon="Plus" circle class="add-btn" @click="row.inputVisible=true"/>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="AI 建议" min-width="200">
-          <template #default="{row}">
-            <div v-if="row.suggested_tags.length">
-              <el-tag v-for="tag in row.suggested_tags" :key="tag" type="danger" effect="plain" size="small" class="ai-tag" @click="acceptAiTag(row, tag)">+ {{ tag }}</el-tag>
-              <div class="ai-actions"><el-button link type="primary" size="small" @click="acceptAllAi(row)">全收</el-button><el-button link type="warning" size="small" @click="generateAI(row, true)">重算</el-button></div>
-            </div>
-            <el-button v-else size="small" text bg :icon="MagicStick" :loading="row.analyzing" @click="generateAI(row, false)">AI 分析</el-button>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="80" align="center">
-          <template #default="{row}"><el-button type="primary" size="small" :loading="row.saving" @click="saveTags(row)" :disabled="isBatchRunning">保存</el-button></template>
-        </el-table-column>
-      </el-table>
+    <!-- ==================== Card List ==================== -->
+    <div v-loading="loading" class="card-list">
+      <div
+        v-for="row in pagedTableData"
+        :key="row.id"
+        class="tag-card"
+        :class="{ selected: isSelected(row) }"
+      >
+        <!-- Checkbox -->
+        <div
+          class="card-check"
+          :class="{ checked: isSelected(row) }"
+          @click.stop="toggleSelect(row)"
+        >
+          <el-icon v-if="isSelected(row)" :size="14" color="#fff"><Check /></el-icon>
+        </div>
 
-      <div class="pagination-bar">
-        <el-pagination v-model:current-page="currentPage" v-model:page-size="pageSize" :page-sizes="[50, 100, 200]" layout="total, sizes, prev, pager, next" :total="filteredTableData.length"/>
+        <!-- Body -->
+        <div class="card-body">
+          <!-- Title row -->
+          <div class="card-title-row">
+            <span class="card-title">{{ row.name }}</span>
+            <span class="card-year">{{ row.year }}</span>
+            <span
+              v-if="row.status"
+              class="card-status"
+              :class="{ done: row.status.includes('存') || row.status.includes('批量') }"
+            >{{ row.status }}</span>
+          </div>
+
+          <!-- Current tags -->
+          <div class="card-tags-row">
+            <span class="tags-label">标签</span>
+            <span
+              v-for="tag in row.editing_tags"
+              :key="tag"
+              class="tag-chip tag-editing"
+            >
+              {{ tag }}
+              <span class="tag-close" @click.stop="removeTag(row, tag)">&times;</span>
+            </span>
+            <el-input
+              v-if="row.inputVisible"
+              v-model="row.inputValue"
+              size="small"
+              class="tag-inline-input"
+              @blur="addTagInput(row)"
+              @keyup.enter="addTagInput(row)"
+            />
+            <button
+              v-else
+              class="tag-add-btn"
+              @click.stop="row.inputVisible = true"
+              :disabled="isBatchRunning"
+            >+</button>
+          </div>
+
+          <!-- AI suggestions -->
+          <div v-if="row.suggested_tags && row.suggested_tags.length" class="card-ai-row">
+            <span class="ai-label">AI 建议</span>
+            <span
+              v-for="tag in row.suggested_tags"
+              :key="tag"
+              class="tag-chip tag-ai"
+              @click.stop="acceptAiTag(row, tag)"
+            >+ {{ tag }}</span>
+            <button class="ai-link" @click.stop="acceptAllAi(row)">全收</button>
+            <button class="ai-link ai-recalc" @click.stop="generateAI(row, true)">重算</button>
+          </div>
+          <button
+            v-else
+            class="ai-trigger-btn"
+            :disabled="row.analyzing || isBatchRunning"
+            @click.stop="generateAI(row, false)"
+          >
+            <el-icon v-if="row.analyzing" :size="13" class="is-loading"><Loading /></el-icon>
+            <el-icon v-else :size="13"><MagicStick /></el-icon>
+            AI 分析
+          </button>
+        </div>
+
+        <!-- Save action -->
+        <div class="card-save-col">
+          <button
+            class="save-btn"
+            :disabled="row.saving || isBatchRunning"
+            @click.stop="saveTags(row)"
+          >
+            <el-icon v-if="row.saving" :size="14" class="is-loading"><Loading /></el-icon>
+            <template v-else>保存</template>
+          </button>
+        </div>
       </div>
-    </el-card>
+
+      <!-- Empty state -->
+      <div v-if="!loading && !tableData.length" class="empty-state">
+        <div class="empty-icon-circle">
+          <el-icon :size="36"><VideoPlay /></el-icon>
+        </div>
+        <p class="empty-title">{{ selectedLib ? '暂无数据' : '未选择媒体库' }}</p>
+        <p class="empty-desc">{{ selectedLib ? '请加载数据或尝试搜索' : '请先选择媒体库并加载数据' }}</p>
+      </div>
+    </div>
+
+    <!-- ==================== Pagination ==================== -->
+    <div class="pagination-bar" v-if="filteredTableData.length > 0">
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[50, 100, 200]"
+        layout="total, sizes, prev, pager, next"
+        :total="filteredTableData.length"
+        background
+        small
+      />
+    </div>
   </div>
 </template>
 
 <style scoped>
-.manager-container { display: flex; flex-direction: column; gap: 15px; height: 100%; }
-.toolbar-card { border: none; background: transparent; :deep(.el-card__body) { padding: 0; } }
-.toolbar { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 2px 12px 0 rgba(0,0,0,0.05); }
-.tool-group { display: flex; align-items: center; gap: 8px; }
-.label { font-size: 13px; font-weight: 600; color: #606266; }
-.search-group { margin-left: auto; }
+/* ==================== Layout ==================== */
+.manager-container {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  padding: 8px 16px;
+}
 
-.batch-alert { margin-bottom: 0; border-radius: 8px; }
-.batch-content { display: flex; justify-content: space-between; align-items: center; width: 100%; }
-.batch-progress { margin-top: 5px; }
-.running-info { display: flex; align-items: center; gap: 8px; font-weight: 500; }
+/* ==================== Toolbar ==================== */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  background: var(--bg-card);
+  padding: 12px 16px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
 
-.table-card { border: none; flex: 1; display: flex; flex-direction: column; :deep(.el-card__body) { padding: 0; flex: 1; display: flex; flex-direction: column; } }
-.title { font-weight: bold; font-size: 14px; color: #303133; }
-.meta { font-size: 12px; color: #909399; margin-top: 4px; display: flex; justify-content: space-between; }
-.status-tag { font-weight: bold; color: #409EFF; }
-.status-tag.done { color: #67C23A; }
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 
-.tags-box { display: flex; flex-wrap: wrap; gap: 4px; }
-.add-btn { width: 20px; height: 20px; font-size: 12px; }
-.ai-tag { cursor: pointer; transition: all 0.2s; }
-.ai-tag:hover { transform: scale(1.05); }
-.ai-actions { margin-top: 4px; }
+.tool-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
 
-.pagination-bar { background: #fff; padding: 10px; border-top: 1px solid #EBEEF5; display: flex; justify-content: flex-end; }
+.search-group {
+  margin-left: auto;
+}
 
+/* Search box */
+.search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 200px;
+}
+
+.search-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
+.search-input {
+  width: 100%;
+  padding: 7px 12px 7px 30px;
+  background: var(--bg-input);
+  border: none;
+  border-radius: var(--radius-full);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  box-shadow: 0 0 0 1px var(--border-color);
+  transition: box-shadow 0.2s;
+}
+.search-input::placeholder { color: var(--text-tertiary); }
+.search-input:focus { box-shadow: 0 0 0 2px var(--accent-blue); }
+.search-input:disabled { opacity: 0.5; }
+
+/* Pill buttons (component-scoped) */
+.btn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.btn-pill:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-pill-blue {
+  background: var(--accent-blue);
+  color: #fff;
+}
+.btn-pill-blue:hover:not(:disabled) {
+  background: #2563eb;
+}
+
+.btn-pill-outline {
+  background: var(--accent-blue-soft);
+  color: var(--accent-blue);
+}
+.btn-pill-outline:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.3);
+}
+
+.btn-pill-green {
+  background: var(--accent-green-soft);
+  color: var(--accent-green);
+}
+.btn-pill-green:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.3);
+}
+
+.btn-pill-danger {
+  background: var(--accent-red-soft);
+  color: var(--accent-red);
+}
+.btn-pill-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.3);
+}
+
+/* ==================== Batch Bar ==================== */
+.batch-bar {
+  background: var(--bg-card);
+  border: 1px solid var(--accent-blue);
+  border-radius: var(--radius-lg);
+  padding: 12px 16px;
+  flex-shrink: 0;
+}
+
+.batch-bar-inner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.batch-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.batch-info b { color: var(--accent-blue); }
+.batch-info.running { color: var(--accent-yellow); font-weight: 500; }
+
+.batch-btns {
+  display: flex;
+  gap: 6px;
+}
+
+.batch-progress-track {
+  width: 100%;
+  height: 4px;
+  background: var(--border-color);
+  border-radius: 2px;
+  margin-top: 10px;
+  overflow: hidden;
+}
+
+.batch-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-blue), #60a5fa);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+/* ==================== Card List ==================== */
+.card-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* ==================== Tag Card ==================== */
+.tag-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1px solid transparent;
+  transition: all 0.2s;
+}
+.tag-card:hover {
+  border-color: var(--border-color);
+  background: var(--bg-card-hover);
+}
+.tag-card.selected {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 1px var(--accent-blue);
+}
+
+/* Checkbox */
+.card-check {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  border: 2px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.card-check:hover { border-color: var(--accent-blue); }
+.card-check.checked {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+
+/* Body */
+.card-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Title */
+.card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.card-year {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.card-status {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-blue);
+  background: var(--accent-blue-soft);
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+}
+.card-status.done {
+  color: var(--accent-green);
+  background: var(--accent-green-soft);
+}
+
+/* Tags */
+.card-tags-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tags-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-weight: 500;
+  margin-right: 2px;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.tag-editing {
+  background: rgba(100, 116, 139, 0.15);
+  color: var(--text-secondary);
+}
+
+.tag-close {
+  cursor: pointer;
+  margin-left: 2px;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.6;
+  transition: opacity 0.15s;
+}
+.tag-close:hover { opacity: 1; color: var(--accent-red); }
+
+.tag-add-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px dashed var(--border-color);
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+.tag-add-btn:hover {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  background: var(--accent-blue-soft);
+}
+
+.tag-inline-input {
+  width: 80px;
+}
+
+/* AI row */
+.card-ai-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ai-label {
+  font-size: 11px;
+  color: var(--accent-purple);
+  font-weight: 500;
+  margin-right: 2px;
+}
+
+.tag-ai {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--accent-red);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 0.2s;
+}
+.tag-ai:hover {
+  background: rgba(239, 68, 68, 0.25);
+  transform: scale(1.05);
+}
+
+.ai-link {
+  border: none;
+  background: none;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent-blue);
+  cursor: pointer;
+  padding: 0;
+  font-family: inherit;
+  transition: color 0.15s;
+}
+.ai-link:hover { color: #60a5fa; }
+.ai-link.ai-recalc {
+  color: var(--text-tertiary);
+}
+.ai-link.ai-recalc:hover { color: var(--accent-yellow); }
+
+/* AI trigger button */
+.ai-trigger-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px;
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+  width: fit-content;
+}
+.ai-trigger-btn:hover:not(:disabled) {
+  border-color: var(--accent-purple);
+  color: var(--accent-purple);
+  background: rgba(139, 92, 246, 0.08);
+}
+.ai-trigger-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Save column */
+.card-save-col {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  padding-top: 2px;
+}
+
+.save-btn {
+  padding: 7px 18px;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--accent-blue);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.save-btn:hover:not(:disabled) {
+  background: #2563eb;
+  box-shadow: var(--shadow-glow-blue);
+}
+.save-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ==================== Empty State ==================== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.empty-icon-circle {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: var(--bg-card);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  margin-bottom: 16px;
+}
+
+.empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 4px;
+}
+
+.empty-desc {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  margin: 0;
+}
+
+/* ==================== Pagination ==================== */
+.pagination-bar {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 4px;
+  flex-shrink: 0;
+}
+
+/* ==================== Mobile ==================== */
 @media screen and (max-width: 768px) {
-  .manager-container { gap: 8px; }
-  .toolbar { padding: 10px; gap: 8px; flex-direction: column; align-items: stretch; }
-  .tool-group { flex-wrap: wrap; }
-  .search-group { margin-left: 0; width: 100%; }
-  .search-group :deep(.el-input) { width: 100% !important; }
-  .batch-content { flex-direction: column; align-items: flex-start; gap: 8px; }
-  .table-card { border-radius: 0; }
+  .manager-container {
+    padding: 4px;
+    gap: 6px;
+  }
+
+  .toolbar {
+    padding: 10px;
+    gap: 8px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .tool-group {
+    flex-wrap: wrap;
+  }
+
+  .search-group {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .search-box {
+    width: 100%;
+  }
+
+  .tag-card {
+    padding: 10px 12px;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .card-save-col {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .batch-bar-inner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .batch-btns {
+    width: 100%;
+  }
+
+  .batch-btns .btn-pill {
+    flex: 1;
+    justify-content: center;
+  }
 }
 </style>

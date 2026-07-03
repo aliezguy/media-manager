@@ -63,97 +63,97 @@ onMounted(() => {
 
 <template>
   <div class="history-container">
-    <!-- 操作栏 -->
+    <!-- ==================== Toolbar ==================== -->
     <div class="history-toolbar">
-      <span class="history-title"><el-icon><Timer /></el-icon> 订阅任务历史</span>
+      <span class="history-title">
+        <span class="title-icon"><el-icon :size="18"><Timer /></el-icon></span>
+        订阅任务历史
+      </span>
       <div class="btn-group">
-        <el-button :icon="RefreshLeft" circle size="small" @click="fetchHistory" />
-        <el-button type="danger" plain :icon="Delete" size="small" @click="clearHistory">清空</el-button>
+        <button class="btn-icon" @click="fetchHistory" title="刷新">
+          <el-icon :size="16"><RefreshLeft /></el-icon>
+        </button>
+        <button class="btn-pill btn-pill-danger" @click="clearHistory">
+          <el-icon :size="14"><Delete /></el-icon> 清空
+        </button>
       </div>
     </div>
 
-    <!-- ==================== 桌面端：表格 ==================== -->
-    <div class="desktop-only">
-      <el-table :data="historyData" stripe style="width: 100%" v-loading="loading" size="small">
-        <el-table-column label="时间" width="160">
-          <template #default="{row}">
-            <span class="time-text">{{ formatDate(row.created_at) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="剧集信息" min-width="160">
-          <template #default="{row}">
-            <div class="name">{{ row.name }}</div>
-            <div class="season">第 {{ row.season }} 季 (TMDB: {{ row.tmdb_id }})</div>
-          </template>
-        </el-table-column>
-        <el-table-column label="洗版条件" min-width="280">
-          <template #default="{row}">
-            <div v-if="row.wash_params" class="params-box">
-              <el-tag size="small" type="warning" effect="dark" v-if="row.wash_params.scheme">策略: {{ row.wash_params.scheme }}</el-tag>
-              <el-tag size="small" type="info" v-if="row.wash_params.filter_groups">规则: {{ row.wash_params.filter_groups?.join(',') }}</el-tag>
-              <el-tag size="small" type="success" v-if="row.wash_params.downloader">下载器: {{ row.wash_params.downloader }}</el-tag>
-              <el-tag size="small" type="danger" v-if="row.wash_params.quality">画质: {{ row.wash_params.quality }}</el-tag>
-              <el-tag size="small" v-if="row.wash_params.sites?.length" style="color:#909399">站点: {{ formatSiteNames(row.wash_params.sites) }}</el-tag>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="状态" width="80" align="center">
-          <template #default="{row}">
-            <el-tag v-if="row.status === 'success'" type="success" size="small" effect="dark">成功</el-tag>
-            <el-tag v-else type="danger" size="small" effect="dark">失败</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="类型" width="90" align="center">
-          <template #default="{row}">
-            <el-tag v-if="row.wash_type === 'complete'" type="warning" size="small">完结洗版</el-tag>
-            <el-tag v-else-if="row.wash_type === 'new_sub'" type="primary" size="small">新增配置</el-tag>
-            <el-tag v-else type="info" size="small">未知</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="反馈" min-width="180">
-          <template #default="{row}">
-            <span :class="{'err-msg': row.status !== 'success'}">{{ row.message }}</span>
-          </template>
-        </el-table-column>
-      </el-table>
-    </div>
-
-    <!-- ==================== 移动端：卡片列表 ==================== -->
-    <div class="mobile-only card-list">
+    <!-- ==================== Card List (统一桌面端 + 移动端) ==================== -->
+    <div v-loading="loading" class="history-list">
       <div
         v-for="row in historyData"
         :key="row.id"
         class="history-card"
-        :class="{ 'card-failed': row.status !== 'success' }"
+        :class="{ 'card-fail': row.status !== 'success' }"
       >
-        <div class="card-top">
-          <span class="card-name">{{ row.name }} <small>S{{ row.season }}</small></span>
-          <el-tag v-if="row.status === 'success'" type="success" size="small">成功</el-tag>
-          <el-tag v-else type="danger" size="small">失败</el-tag>
+        <!-- Status indicator bar -->
+        <div class="card-status-bar" :class="row.status === 'success' ? 'bar-success' : 'bar-fail'"></div>
+
+        <!-- Card content -->
+        <div class="card-inner">
+          <!-- Top: name + status + type -->
+          <div class="card-header">
+            <div class="card-name-group">
+              <span class="card-name">{{ row.name }}</span>
+              <span class="card-season">S{{ row.season }}</span>
+              <span class="card-tmdb">TMDB: {{ row.tmdb_id }}</span>
+            </div>
+            <div class="card-badges">
+              <span class="badge" :class="row.status === 'success' ? 'badge-success' : 'badge-fail'">
+                {{ row.status === 'success' ? '成功' : '失败' }}
+              </span>
+              <span class="badge" :class="row.wash_type === 'complete' ? 'badge-wash' : row.wash_type === 'new_sub' ? 'badge-sub' : 'badge-unknown'">
+                {{ row.wash_type === 'complete' ? '完结洗版' : row.wash_type === 'new_sub' ? '新增配置' : '未知' }}
+              </span>
+            </div>
+          </div>
+
+          <!-- Meta: time -->
+          <div class="card-meta">
+            <el-icon :size="13"><Timer /></el-icon>
+            <span>{{ formatDate(row.created_at) }}</span>
+          </div>
+
+          <!-- Wash params -->
+          <div v-if="row.wash_params" class="card-params">
+            <span v-if="row.wash_params.scheme" class="param-chip param-scheme">策略: {{ row.wash_params.scheme }}</span>
+            <span v-if="row.wash_params.filter_groups" class="param-chip param-filter">规则: {{ row.wash_params.filter_groups?.join(',') }}</span>
+            <span v-if="row.wash_params.downloader" class="param-chip param-downloader">下载器: {{ row.wash_params.downloader }}</span>
+            <span v-if="row.wash_params.quality" class="param-chip param-quality">画质: {{ row.wash_params.quality }}</span>
+            <span v-if="row.wash_params.sites?.length" class="param-chip param-sites">站点: {{ formatSiteNames(row.wash_params.sites) }}</span>
+          </div>
+
+          <!-- Message -->
+          <div v-if="row.message" class="card-msg" :class="{ 'msg-error': row.status !== 'success' }">
+            {{ row.message }}
+          </div>
         </div>
-        <div class="card-meta">
-          <span>{{ formatDate(row.created_at) }}</span>
-          <el-tag v-if="row.wash_type === 'complete'" type="warning" size="small">完结洗版</el-tag>
-          <el-tag v-else-if="row.wash_type === 'new_sub'" type="primary" size="small">新增配置</el-tag>
-        </div>
-        <div v-if="row.wash_params" class="card-tags">
-          <el-tag size="small" type="warning" v-if="row.wash_params.scheme">{{ row.wash_params.scheme }}</el-tag>
-          <el-tag size="small" type="info" v-if="row.wash_params.filter_groups">{{ row.wash_params.filter_groups?.join(',') }}</el-tag>
-          <el-tag size="small" type="success" v-if="row.wash_params.downloader">{{ row.wash_params.downloader }}</el-tag>
-        </div>
-        <div class="card-msg">{{ row.message }}</div>
       </div>
-      <el-empty v-if="!loading && !historyData.length" description="暂无记录" :image-size="80" />
+
+      <!-- Empty state -->
+      <div v-if="!loading && !historyData.length" class="empty-state">
+        <div class="empty-icon-circle">
+          <el-icon :size="36"><Timer /></el-icon>
+        </div>
+        <p class="empty-title">暂无记录</p>
+        <p class="empty-desc">还没有任何订阅任务历史</p>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
+/* ==================== Layout ==================== */
 .history-container {
-  padding: 12px;
+  padding: 8px 16px;
   max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
 }
 
+/* ==================== Toolbar ==================== */
 .history-toolbar {
   display: flex;
   justify-content: space-between;
@@ -162,89 +162,315 @@ onMounted(() => {
   padding: 0 4px;
   flex-wrap: wrap;
   gap: 8px;
+  flex-shrink: 0;
 }
+
 .history-title {
-  font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 6px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
+
+.title-icon {
+  color: var(--accent-blue);
+}
+
 .btn-group {
-  display: flex; gap: 6px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 
-/* 桌面表格 */
-.time-text { font-size: 12px; color: #606266; }
-.name { font-weight: 600; font-size: 13px; }
-.season { font-size: 12px; color: #909399; }
-.params-box { display: flex; flex-wrap: wrap; gap: 3px; }
-.err-msg { color: #F56C6C; font-size: 12px; }
+/* Icon button */
+.btn-icon {
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.btn-icon:hover {
+  background: var(--accent-blue-soft);
+  color: var(--accent-blue);
+}
 
-/* 显示控制 */
-.desktop-only { display: block; }
-.mobile-only { display: none; }
+/* Pill button */
+.btn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
 
-/* ==================== 移动端卡片 ==================== */
+.btn-pill-danger {
+  background: var(--accent-red-soft);
+  color: var(--accent-red);
+}
+.btn-pill-danger:hover {
+  background: rgba(239, 68, 68, 0.3);
+}
+
+/* ==================== Card List ==================== */
+.history-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ==================== History Card ==================== */
+.history-card {
+  display: flex;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  transition: all 0.2s;
+}
+.history-card:hover {
+  border-color: #475569;
+  box-shadow: var(--shadow-sm);
+}
+
+/* Left status bar */
+.card-status-bar {
+  width: 4px;
+  flex-shrink: 0;
+}
+.card-status-bar.bar-success {
+  background: var(--accent-green);
+}
+.card-status-bar.bar-fail {
+  background: var(--accent-red);
+}
+
+/* Inner content */
+.card-inner {
+  flex: 1;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Header: name + badges */
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.card-name-group {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.card-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.card-season {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.card-tmdb {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Badges */
+.card-badges {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge-success {
+  background: var(--accent-green-soft);
+  color: var(--accent-green);
+}
+
+.badge-fail {
+  background: var(--accent-red-soft);
+  color: var(--accent-red);
+}
+
+.badge-wash {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--accent-yellow);
+}
+
+.badge-sub {
+  background: var(--accent-blue-soft);
+  color: var(--accent-blue);
+}
+
+.badge-unknown {
+  background: rgba(100, 116, 139, 0.15);
+  color: var(--text-tertiary);
+}
+
+/* Meta */
+.card-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* Params chips */
+.card-params {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.param-chip {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.param-scheme {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--accent-yellow);
+}
+
+.param-filter {
+  background: rgba(100, 116, 139, 0.12);
+  color: var(--text-secondary);
+}
+
+.param-downloader {
+  background: rgba(16, 185, 129, 0.12);
+  color: var(--accent-green);
+}
+
+.param-quality {
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--accent-red);
+}
+
+.param-sites {
+  background: rgba(139, 92, 246, 0.12);
+  color: var(--accent-purple);
+}
+
+/* Message */
+.card-msg {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  word-break: break-all;
+}
+.card-msg.msg-error {
+  color: var(--accent-red);
+}
+
+/* ==================== Empty State ==================== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.empty-icon-circle {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: var(--bg-card);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  margin-bottom: 16px;
+}
+
+.empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 4px;
+}
+
+.empty-desc {
+  font-size: 13px;
+  color: var(--text-tertiary);
+  margin: 0;
+}
+
+/* ==================== Mobile ==================== */
 @media screen and (max-width: 768px) {
   .history-container {
-    padding: 0;
+    padding: 4px;
   }
+
   .history-toolbar {
-    padding: 8px 4px;
+    padding: 4px;
     margin-bottom: 8px;
   }
-  .desktop-only { display: none; }
-  .mobile-only { display: block; }
 
-  .card-list {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .history-card {
-    background: #fff;
-    border-radius: 10px;
+  .card-inner {
     padding: 12px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-    border-left: 3px solid #67C23A;
-  }
-  .history-card.card-failed {
-    border-left-color: #F56C6C;
+    gap: 6px;
   }
 
-  .card-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 6px;
-  }
   .card-name {
-    font-weight: 600; font-size: 14px; color: #303133;
-  }
-  .card-name small {
-    font-weight: 400; color: #909399; font-size: 12px;
+    font-size: 13px;
   }
 
-  .card-meta {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 11px;
-    color: #909399;
-    margin-bottom: 6px;
-  }
-
-  .card-tags {
-    display: flex;
-    flex-wrap: wrap;
+  .card-badges {
     gap: 4px;
-    margin-bottom: 4px;
   }
 
-  .card-msg {
-    font-size: 12px;
-    color: #606266;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .badge {
+    font-size: 10px;
+    padding: 2px 8px;
   }
 }
 </style>

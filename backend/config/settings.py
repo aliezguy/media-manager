@@ -26,7 +26,14 @@ DEFAULT_CONFIG = {
     # 追更配置策略
     "subscribe_schemes": [],
     # qBittorrent 配置
-    "qb_configs": []
+    "qb_configs": [],
+    # CloudDrive2 配置
+    "cd2_host": "192.168.31.173",
+    "cd2_port": "19797",
+    "cd2_username": "",
+    "cd2_password": "",
+    "cd2_media_dir": "/80003588/emby库/电视剧/",
+    "cd2_organized_dir": "/80003588/网盘整理/完结整理/电视剧/",
 }
 
 def load_config():
