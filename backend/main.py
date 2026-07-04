@@ -3,8 +3,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 from database import Base, engine
 from config.settings import CONFIG_FILE, save_config
+
+# ---------------------------------------------------------------------------
+# 日志配置 — 同时输出到控制台和文件
+# ---------------------------------------------------------------------------
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+LOG_FORMAT = "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# 文件 handler（10 MB × 5 个备份自动轮转）
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+file_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+file_handler.setLevel(logging.DEBUG)
+
+# 控制台 handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter(LOG_FORMAT, DATE_FORMAT))
+console_handler.setLevel(logging.INFO)
+
+# 配置根 logger，所有模块级 logger 会传播到这里
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# 降低第三方库日志噪音
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("grpc").setLevel(logging.WARNING)
+logging.getLogger("qbittorrentapi").setLevel(logging.WARNING)
+
+logging.getLogger("main").info("=" * 60)
+logging.getLogger("main").info("Emby AI Manager 启动 — 日志文件: %s", LOG_FILE)
+logging.getLogger("main").info("=" * 60)
 
 # 导入路由
 from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router

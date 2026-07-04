@@ -140,26 +140,40 @@ def _ensure_cd2_directory(cd2, target_path: str, known_existing_parent: str) -> 
     return True
 
 
-def _count_files_in_cd2_dir(cd2, path: str, video_only: bool = True) -> int:
-    """统计 CD2 目录中的文件数量。"""
-    try:
-        files = cd2.get_sub_files(path)
-        if video_only:
-            count = 0
-            for f in files:
-                if f.get("isDirectory"):
-                    continue
-                name = f.get("name", "")
-                _, ext = os.path.splitext(name)
-                if ext.lower() in _VIDEO_EXTENSIONS:
-                    count += 1
-            logger.debug("_count_files_in_cd2_dir('%s') = %d (video-only)", path, count)
-            return count
-        else:
-            return sum(1 for f in files if not f.get("isDirectory"))
-    except Exception as e:
-        logger.warning("_count_files_in_cd2_dir('%s') failed: %s", path, e)
-        return 0
+def _count_files_in_cd2_dir(cd2, path: str, video_only: bool = True, retries: int = 3) -> int:
+    """统计 CD2 目录中的文件数量，支持重试以容忍 CD2 缓存延迟。"""
+    for attempt in range(retries):
+        try:
+            files = cd2.get_sub_files(path)
+            if not files and attempt < retries - 1:
+                # 空列表可能是 CD2 缓存未就绪，重试
+                delay = [2, 4, 8][attempt] if attempt < 3 else 8
+                logger.debug("_count_files_in_cd2_dir('%s') 返回空列表 (第%d/%d次), %ds 后重试…",
+                             path, attempt + 1, retries, delay)
+                time.sleep(delay)
+                continue
+            if video_only:
+                count = 0
+                for f in files:
+                    if f.get("isDirectory"):
+                        continue
+                    name = f.get("name", "")
+                    _, ext = os.path.splitext(name)
+                    if ext.lower() in _VIDEO_EXTENSIONS:
+                        count += 1
+                logger.debug("_count_files_in_cd2_dir('%s') = %d (video-only)", path, count)
+                return count
+            else:
+                return sum(1 for f in files if not f.get("isDirectory"))
+        except Exception as e:
+            if attempt < retries - 1:
+                delay = [2, 4, 8][attempt] if attempt < 3 else 8
+                logger.debug("_count_files_in_cd2_dir('%s') 异常 (第%d/%d次): %s, %ds 后重试…",
+                             path, attempt + 1, retries, e, delay)
+                time.sleep(delay)
+            else:
+                logger.warning("_count_files_in_cd2_dir('%s') 失败: %s", path, e)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -544,12 +558,20 @@ def auto_process_show(
     # 媒体库目录可能还不存在（首次导入或之前已清理）。
     # get_sub_files 在 NOT_FOUND 时返回 []（而非抛异常），
     # 因此通过检查父目录列表来区分"不存在"和"空目录"。
+    # 支持重试以容忍 CD2 缓存延迟。
     media_show_files: list[dict] = []
     media_dir_missing = False
-    try:
-        media_show_files = cd2.get_sub_files(media_show_path)
-    except Exception as e:
-        logger.warning("[%s] Failed to list media lib dir '%s': %s", title, media_show_path, e)
+    for _list_attempt in range(3):
+        try:
+            media_show_files = cd2.get_sub_files(media_show_path)
+            if media_show_files:
+                break
+        except Exception as e:
+            logger.warning("[%s] Failed to list media lib dir '%s': %s", title, media_show_path, e)
+        if _list_attempt < 2:
+            delay = [2, 4][_list_attempt]
+            logger.info("[%s] 媒体库目录列表为空 — %ds 后重试…", title, delay)
+            time.sleep(delay)
 
     # ---- 检测媒体库剧集目录是否确实不存在 ----
     # get_sub_files 在"路径不存在"和"空目录"两种情况下都返回 []。
@@ -566,6 +588,12 @@ def auto_process_show(
                     "[%s] Media library show folder NOT found: '%s'",
                     title, media_show_path,
                 )
+            else:
+                # 目录存在但列表为空（可能是 CD2 缓存问题或真的是空目录）
+                logger.info(
+                    "[%s] Media library show folder exists but listing is empty: '%s'",
+                    title, media_show_path,
+                )
         except Exception:
             # 连父目录都列不出来 — 假设不存在
             media_dir_missing = True
@@ -578,8 +606,14 @@ def auto_process_show(
     media_season_dirs = [f for f in media_show_files if f.get("isDirectory")]
 
     # ---- 3a. 评估每个媒体库 Season 的完整性 ----
-    # 构建: {season_num: {"name", "path", "file_count", "expected", "complete"}}
-    media_season_state: dict[int, dict] = {}
+    # 构建: {season_num: [{"name", "path", "file_count", "expected", "complete"}, ...]}
+    # 同一 Season 可能有多个版本目录（例如 "Season 1 -WEB-DL" 和 "Season 1 -DV"），
+    # 使用 list 存储所有版本，避免同季号多目录时后面的覆盖前面的。
+    # 使用 _count_files_in_cd2_dir（仅统计视频文件，与 TMDB episode_count 口径一致），
+    # 配合 3 次重试容忍 CD2 缓存延迟。
+    # 当 TMDB 无 episode_count 数据时（expected_eps=0），若目录中有文件，
+    # 视为"有内容"（files_present=True），不参与残缺判定，避免误删。
+    media_season_state: dict[int, list[dict]] = {}
     for mdir in media_season_dirs:
         media_season_name = mdir.get("name", "")
         media_season_path = _sanitize_cd2_path(
@@ -594,30 +628,82 @@ def auto_process_show(
             expected_eps = int(season_info.get("episode_count", 0)) if season_info else 0
         except (TypeError, ValueError):
             expected_eps = 0
-        actual_files = _count_files_in_cd2_dir(cd2, media_season_path)
-        media_season_state[sn] = {
+        # 统计视频文件数量（与 TMDB episode_count 口径一致），带重试
+        actual_files = _count_files_in_cd2_dir(cd2, media_season_path, video_only=True, retries=3)
+        # 交叉校验：如果视频文件计数为 0，用递归统计确认目录是否确实为空
+        # （防止 CD2 get_sub_files 缓存问题导致误判）
+        if actual_files == 0 and expected_eps > 0:
+            stats = _get_season_stats(cd2, media_season_path, retries=3)
+            if stats["fileCount"] > 0:
+                logger.warning(
+                    "[%s] Media S%d '%s': 视频文件计数为 0 但递归统计有 %d 个文件，"
+                    "可能是 CD2 缓存延迟或文件在子目录中",
+                    title, sn, media_season_name, stats["fileCount"],
+                )
+                # 使用递归统计的文件数作为兜底（可能包含非视频文件，但比 0 准确）
+                actual_files = stats["fileCount"]
+        # 完整性判定：
+        # 1) TMDB 无数据 (expected_eps=0) 但目录有文件 → 保守处理，标记为"有内容"
+        #    （files_present=True），不参与残缺判定，避免因 TMDB 数据缺失误删
+        # 2) 文件数精确匹配 → 完整
+        # 3) 其他情况 → 残缺
+        files_present = (expected_eps == 0 and actual_files > 0)
+        is_complete = (actual_files == expected_eps and actual_files > 0)
+        media_season_state.setdefault(sn, []).append({
             "name": media_season_name,
             "path": media_season_path,
             "file_count": actual_files,
             "expected": expected_eps,
-            "complete": (actual_files == expected_eps and actual_files > 0),
-        }
-        logger.info(
-            "[%s] Media S%d '%s': %d/%d files %s",
-            title, sn, media_season_name, actual_files, expected_eps,
-            "✓ COMPLETE" if media_season_state[sn]["complete"] else "✗ INCOMPLETE",
-        )
+            "complete": is_complete,
+            "files_present": files_present,  # TMDB 无数据但目录非空
+        })
+        if files_present:
+            logger.warning(
+                "[%s] Media S%d '%s': %d files (TMDB episode_count=0, "
+                "保守处理为有内容，不参与残缺判定)",
+                title, sn, media_season_name, actual_files,
+            )
+        else:
+            logger.info(
+                "[%s] Media S%d '%s': %d/%d files %s",
+                title, sn, media_season_name, actual_files, expected_eps,
+                "✓ COMPLETE" if is_complete else "✗ INCOMPLETE",
+            )
 
+    # 同一 Season 可能有多个版本目录（例如 "Season 1 -WEB-DL" 和 "Season 1 -DV"），
+    # 只要某个 Season 的任一版本完整或有文件，该 Season 就不算残缺。
+    def _season_has_complete(versions: list[dict]) -> bool:
+        return any(v["complete"] for v in versions)
+
+    def _season_has_files_present(versions: list[dict]) -> bool:
+        return any(v.get("files_present", False) for v in versions)
+
+    # 判定"所有季均残缺"时，将 TMDB 无数据但目录有文件的季排除
+    # （files_present=True），避免因 TMDB 数据缺失导致误入 Case B 整剧删除
     all_media_incomplete = (
         len(media_season_state) > 0
-        and all(not s["complete"] for s in media_season_state.values())
+        and all(
+            not _season_has_complete(versions) and not _season_has_files_present(versions)
+            for versions in media_season_state.values()
+        )
     )
 
+    # 按目录版本统计（同一 Season 可能有多个版本目录，例如 "Season 1 -WEB-DL" 和 "Season 1 -DV"）
+    total_versions = sum(len(versions) for versions in media_season_state.values())
+    complete_count = sum(
+        sum(1 for v in versions if v["complete"])
+        for versions in media_season_state.values()
+    )
+    files_present_count = sum(
+        sum(1 for v in versions if v.get("files_present"))
+        for versions in media_season_state.values()
+    )
+    incomplete_count = total_versions - complete_count - files_present_count
+
     logger.info(
-        "[%s] 媒体库评估: %d 个 Season — %d 完整, %d 残缺",
-        title, len(media_season_state),
-        sum(1 for s in media_season_state.values() if s["complete"]),
-        sum(1 for s in media_season_state.values() if not s["complete"]),
+        "[%s] 媒体库评估: %d 个目录 — %d 完整, %d 残缺, %d 有文件(TMDB无数据)",
+        title, total_versions,
+        complete_count, incomplete_count, files_present_count,
     )
 
     # =====================================================================
@@ -760,9 +846,9 @@ def auto_process_show(
     # =====================================================================
     if all_media_incomplete:
         logger.info(
-            "[%s] 情况 B: 全部 %d 个媒体库 Season 均残缺 — "
+            "[%s] 情况 B: 全部 %d 个可判定媒体库 Season 均残缺（%d 个有文件但 TMDB 无数据）— "
             "删除整个剧集目录，等待 Emby 删除 webhook",
-            title, len(media_season_state),
+            title, incomplete_count, files_present_count,
         )
 
         # 通过 CD2 删除整个剧集目录
@@ -820,7 +906,9 @@ def auto_process_show(
         result["task_id"] = task.id
         result["stage"] = "waiting_for_delete_webhook"
         result["message"] = (
-            f"已删除媒体库整剧目录（{len(media_season_state)} 个残缺季），"
+            f"已删除媒体库整剧目录（{incomplete_count} 个残缺季"
+            + (f"，{files_present_count} 个有文件但 TMDB 无数据" if files_present_count else "")
+            + f"），"
             f"等待 Emby library.deleted 确认后自动移入 "
             f"{len(organized_seasons_to_move)} 个完整 Season 候选"
         )
@@ -853,10 +941,9 @@ def auto_process_show(
     #   情况 D: 全部完整 + organized 完全相同 → 仅去重
     # =====================================================================
     logger.info(
-        "[%s] 媒体库共 %d 个 Season: %d 残缺, %d 完整 — 执行逐季对比",
+        "[%s] 媒体库共 %d 个 Season: %d 残缺, %d 完整, %d 有文件(TMDB无数据) — 执行逐季对比",
         title, len(media_season_state),
-        sum(1 for s in media_season_state.values() if not s["complete"]),
-        sum(1 for s in media_season_state.values() if s["complete"]),
+        incomplete_count, complete_count, files_present_count,
     )
 
     deleted_media_seasons = []
@@ -889,127 +976,130 @@ def auto_process_show(
         return True
 
     # ---- 4a. 删除媒体库中残缺的 Season ----
-    for sn, state in media_season_state.items():
-        if state["complete"]:
-            continue
-        logger.info(
-            "[%s] S%d: %d/%d 文件 — 残缺，从媒体库删除",
-            title, sn, state["file_count"], state["expected"],
-        )
-        del_result = cd2.delete_files([state["path"]])
-        if del_result.get("success"):
-            deleted_media_seasons.append(sn)
-            comparison_results.append({
-                "season": sn,
-                "action": "deleted_media_incomplete",
-                "deleted_path": state["path"],
-            })
-        else:
-            comparison_results.append({
-                "season": sn,
-                "action": "delete_media_failed",
-                "error": del_result.get("errorMessage", "unknown"),
-            })
+    # 跳过完整季和有文件但 TMDB 无数据的季（files_present），仅删除确认残缺的
+    for sn, versions in media_season_state.items():
+        for state in versions:
+            if state["complete"] or state.get("files_present", False):
+                continue
+            logger.info(
+                "[%s] S%d '%s': %d/%d 文件 — 残缺，从媒体库删除",
+                title, sn, state["name"], state["file_count"], state["expected"],
+            )
+            del_result = cd2.delete_files([state["path"]])
+            if del_result.get("success"):
+                deleted_media_seasons.append(sn)
+                comparison_results.append({
+                    "season": sn,
+                    "action": "deleted_media_incomplete",
+                    "deleted_path": state["path"],
+                })
+            else:
+                comparison_results.append({
+                    "season": sn,
+                    "action": "delete_media_failed",
+                    "error": del_result.get("errorMessage", "unknown"),
+                })
 
     # ---- 4b. 对比媒体库完整季与已完结目录 ----
-    for sn, state in media_season_state.items():
-        if not state["complete"]:
-            continue
-
-        comp = {
-            "season": sn,
-            "expected_episodes": state["expected"],
-            "media_actual_files": state["file_count"],
-            "action": "keep_media_complete",
-            "media_path": state["path"],
-        }
-
-        org_candidates = season_dir_map.get(sn, [])
-        if not org_candidates:
-            comp["org_status"] = "organized_season_not_found"
-            logger.info(
-                "[%s] S%d: 媒体库中完整，已完结目录中无对应 Season 可对比",
-                title, sn,
-            )
-            comparison_results.append(comp)
-            continue
-
-        media_show_actual_name = media_show_path.rstrip("/").rsplit("/", 1)[-1]
-        organized_show_name = folder_name
-        org_comparisons = []
-
-        for org_dir in org_candidates:
-            org_season_path = org_dir.get("fullPathName") or _sanitize_cd2_path(
-                f"{organized_show_path}/{org_dir['name']}"
-            )
-            oc = {"dir_name": org_dir.get("name", ""), "path": org_season_path}
-
-            org_files = cd2.get_sub_files(org_season_path)
-            if not org_files or not any(not f.get("isDirectory") for f in org_files):
-                oc["status"] = "organized_empty"
-                logger.info(
-                    "[%s] S%d organized '%s': empty, skipping",
-                    title, sn, org_dir.get("name", ""),
-                )
-                org_comparisons.append(oc)
+    for sn, versions in media_season_state.items():
+        for state in versions:
+            if not state["complete"]:
                 continue
 
-            names_match = (organized_show_name == media_show_actual_name)
-            org_file_count = _count_files_in_cd2_dir(cd2, org_season_path)
-            counts_match = (state["file_count"] == org_file_count)
-            media_stats = _get_season_stats(cd2, state["path"])
-            org_stats = _get_season_stats(cd2, org_season_path)
-            sizes_match = (
-                media_stats["totalSize"] == org_stats["totalSize"]
-                and media_stats["totalSize"] > 0
-            )
-            media_file_list = _get_file_list(state["path"])
-            org_file_list = _get_file_list(org_season_path)
-            files_identical = _files_identical(media_file_list, org_file_list)
-            all_match = names_match and counts_match and sizes_match and files_identical
+            comp = {
+                "season": sn,
+                "expected_episodes": state["expected"],
+                "media_actual_files": state["file_count"],
+                "action": "keep_media_complete",
+                "media_path": state["path"],
+            }
 
-            oc["names_match"] = names_match
-            oc["file_counts_match"] = counts_match
-            oc["total_sizes_match"] = sizes_match
-            oc["single_files_match"] = files_identical
-            oc["all_conditions_match"] = all_match
-
-            if all_match:
-                # ---- 完全重复 → 删除已完结目录中的副本 ----
+            org_candidates = season_dir_map.get(sn, [])
+            if not org_candidates:
+                comp["org_status"] = "organized_season_not_found"
                 logger.info(
-                    "[%s] S%d '%s': 所有严格条件均满足 — 删除已完结目录中的重复季",
-                    title, sn, org_dir.get("name", ""),
+                    "[%s] S%d: 媒体库中完整，已完结目录中无对应 Season 可对比",
+                    title, sn,
                 )
-                del_result = cd2.delete_files([org_season_path])
-                if del_result.get("success"):
-                    oc["status"] = "deleted_duplicate"
-                    deleted_organized_seasons.append({
-                        "season": sn,
-                        "dir_name": org_dir.get("name", ""),
-                        "path": org_season_path,
-                    })
+                comparison_results.append(comp)
+                continue
+
+            media_show_actual_name = media_show_path.rstrip("/").rsplit("/", 1)[-1]
+            organized_show_name = folder_name
+            org_comparisons = []
+
+            for org_dir in org_candidates:
+                org_season_path = org_dir.get("fullPathName") or _sanitize_cd2_path(
+                    f"{organized_show_path}/{org_dir['name']}"
+                )
+                oc = {"dir_name": org_dir.get("name", ""), "path": org_season_path}
+
+                org_files = cd2.get_sub_files(org_season_path)
+                if not org_files or not any(not f.get("isDirectory") for f in org_files):
+                    oc["status"] = "organized_empty"
+                    logger.info(
+                        "[%s] S%d organized '%s': empty, skipping",
+                        title, sn, org_dir.get("name", ""),
+                    )
+                    org_comparisons.append(oc)
+                    continue
+
+                names_match = (organized_show_name == media_show_actual_name)
+                org_file_count = _count_files_in_cd2_dir(cd2, org_season_path)
+                counts_match = (state["file_count"] == org_file_count)
+                media_stats = _get_season_stats(cd2, state["path"])
+                org_stats = _get_season_stats(cd2, org_season_path)
+                sizes_match = (
+                    media_stats["totalSize"] == org_stats["totalSize"]
+                    and media_stats["totalSize"] > 0
+                )
+                media_file_list = _get_file_list(state["path"])
+                org_file_list = _get_file_list(org_season_path)
+                files_identical = _files_identical(media_file_list, org_file_list)
+                all_match = names_match and counts_match and sizes_match and files_identical
+
+                oc["names_match"] = names_match
+                oc["file_counts_match"] = counts_match
+                oc["total_sizes_match"] = sizes_match
+                oc["single_files_match"] = files_identical
+                oc["all_conditions_match"] = all_match
+
+                if all_match:
+                    # ---- 完全重复 → 删除已完结目录中的副本 ----
+                    logger.info(
+                        "[%s] S%d '%s': 所有严格条件均满足 — 删除已完结目录中的重复季",
+                        title, sn, org_dir.get("name", ""),
+                    )
+                    del_result = cd2.delete_files([org_season_path])
+                    if del_result.get("success"):
+                        oc["status"] = "deleted_duplicate"
+                        deleted_organized_seasons.append({
+                            "season": sn,
+                            "dir_name": org_dir.get("name", ""),
+                            "path": org_season_path,
+                        })
+                    else:
+                        oc["status"] = "delete_failed"
+                        oc["error"] = del_result.get("errorMessage", "unknown")
                 else:
-                    oc["status"] = "delete_failed"
-                    oc["error"] = del_result.get("errorMessage", "unknown")
-            else:
-                # ---- 不同版本 → 保留以移动 ----
-                reasons = []
-                if not names_match: reasons.append("名称")
-                if not counts_match: reasons.append("文件数")
-                if not sizes_match: reasons.append("大小")
-                if not files_identical: reasons.append("具体文件")
-                oc["status"] = "keep_for_move"
-                oc["mismatch_reasons"] = reasons
-                logger.info(
-                    "[%s] S%d '%s': 与媒体库版本不同 (%s) — 保留以移动",
-                    title, sn, org_dir.get("name", ""),
-                    "; ".join(reasons),
-                )
+                    # ---- 不同版本 → 保留以移动 ----
+                    reasons = []
+                    if not names_match: reasons.append("名称")
+                    if not counts_match: reasons.append("文件数")
+                    if not sizes_match: reasons.append("大小")
+                    if not files_identical: reasons.append("具体文件")
+                    oc["status"] = "keep_for_move"
+                    oc["mismatch_reasons"] = reasons
+                    logger.info(
+                        "[%s] S%d '%s': 与媒体库版本不同 (%s) — 保留以移动",
+                        title, sn, org_dir.get("name", ""),
+                        "; ".join(reasons),
+                    )
 
-            org_comparisons.append(oc)
+                org_comparisons.append(oc)
 
-        comp["org_comparisons"] = org_comparisons
-        comparison_results.append(comp)
+            comp["org_comparisons"] = org_comparisons
+            comparison_results.append(comp)
 
     result["details"]["comparison_results"] = comparison_results
 
@@ -1072,7 +1162,34 @@ def auto_process_show(
         except Exception as e:
             logger.warning("[%s] Error ensuring target folder: %s", title, e)
 
+        # 去重：同一源路径可能出现在多个 comparison 结果中，只处理一次
+        seen_paths = set()
+        deduped_candidates = []
         for c in candidates_to_move:
+            if c["path"] not in seen_paths:
+                seen_paths.add(c["path"])
+                deduped_candidates.append(c)
+            else:
+                logger.debug(
+                    "[%s] S%d '%s': 候选路径重复，跳过 '%s'",
+                    title, c["season"], c["dir_name"], c["path"],
+                )
+
+        for c in deduped_candidates:
+            if not _cd2_dir_exists(cd2, c["path"]):
+                # 区分原因：检查目标是否已有同名目录
+                dest_path = _sanitize_cd2_path(f"{media_show_path}/{c['dir_name']}")
+                if _cd2_dir_exists(cd2, dest_path):
+                    logger.info(
+                        "[%s] S%d '%s': 源目录已被前序候选移动至目标，跳过",
+                        title, c["season"], c["dir_name"],
+                    )
+                else:
+                    logger.warning(
+                        "[%s] S%d '%s': 源目录已不存在 '%s'（可能已被去重删除），跳过移动",
+                        title, c["season"], c["dir_name"], c["path"],
+                    )
+                continue
             vr = _verify_season_move(
                 cd2, c["path"], media_show_path,
                 c["dir_name"], title, c["season"],
