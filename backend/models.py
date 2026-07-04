@@ -1,7 +1,7 @@
 # backend/models.py
 import enum
 from database import Base
-from sqlalchemy import Column, Integer, String, JSON, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime
 from datetime import datetime
 
 
@@ -12,6 +12,34 @@ class TaskStatus(str, enum.Enum):
     WAITING_FOR_NEW_WEBHOOK = "WAITING_FOR_NEW_WEBHOOK"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+
+
+class ActionType(str, enum.Enum):
+    """任务操作日志 — 动作类型枚举"""
+    DELETE_TORRENT = "DELETE_TORRENT"
+    DELETE_MEDIA = "DELETE_MEDIA"
+    DELETE_ORGANIZED = "DELETE_ORGANIZED"
+    MOVE_FOLDER = "MOVE_FOLDER"
+    SKIP_FOLDER = "SKIP_FOLDER"
+    KEEP_MEDIA = "KEEP_MEDIA"
+    KEEP_ORGANIZED = "KEEP_ORGANIZED"
+    KEEP_TORRENT = "KEEP_TORRENT"
+
+
+class TaskActionLog(Base):
+    """任务操作日志表 — 记录洗版流程中每个决策动作"""
+    __tablename__ = "task_action_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, index=True)
+    tmdb_id = Column(Integer, index=True)
+    title = Column(String)
+    action_type = Column(String, nullable=False)
+    target_name = Column(String, nullable=False)
+    target_path = Column(String)
+    reason = Column(String)
+    detail = Column(JSON)
+    created_at = Column(DateTime, default=datetime.now)
 
 class MediaTag(Base):
     __tablename__ = "media_tags"
@@ -91,3 +119,29 @@ class AutoTaskFlow(Base):
     context = Column(JSON)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ScheduledTask(Base):
+    """定时扫描任务表 — 按 Cron 表达式定期扫描 CD2 目录并触发洗版"""
+    __tablename__ = "scheduled_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    directory_path = Column(String, nullable=False)
+    cron_expression = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    last_run_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.now)
+
+
+class ScanRunLog(Base):
+    """扫描运行日志表 — 记录每次定时/手动扫描的宏观结果"""
+    __tablename__ = "scan_run_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, nullable=False, index=True)
+    status = Column(String, nullable=False)  # SUCCESS / FAILED
+    trigger_type = Column(String, nullable=False)  # CRON / MANUAL
+    scanned_count = Column(Integer, default=0)
+    processed_count = Column(Integer, default=0)
+    details = Column(JSON)
+    created_at = Column(DateTime, default=datetime.now)

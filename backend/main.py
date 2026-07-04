@@ -47,7 +47,7 @@ logging.getLogger("main").info("Emby AI Manager 启动 — 日志文件: %s", LO
 logging.getLogger("main").info("=" * 60)
 
 # 导入路由
-from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router
+from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router
 
 # 初始化数据库表
 Base.metadata.create_all(bind=engine)
@@ -70,6 +70,29 @@ app.include_router(file_editor.router, prefix="/api", tags=["Editor"])
 app.include_router(cd2_router.router, prefix="/api", tags=["CloudDrive2"])
 app.include_router(organize_router.router, prefix="/api", tags=["Organize"])
 app.include_router(task_flow_router.router, prefix="/api", tags=["TaskFlow"])
+app.include_router(task_dashboard_router.router, prefix="/api", tags=["Dashboard"])
+app.include_router(scheduler_router.router, prefix="/api", tags=["Scheduler"])
+# ---------------------------------------------------------------------------
+# APScheduler 生命周期管理
+# ---------------------------------------------------------------------------
+from services.scheduler_service import scheduler, load_all_tasks
+
+
+@app.on_event("startup")
+async def startup_scheduler():
+    """FastAPI 启动时：启动 APScheduler 并加载所有活跃任务。"""
+    load_all_tasks()
+    scheduler.start()
+    logging.getLogger("main").info("[Scheduler] APScheduler 已启动")
+
+
+@app.on_event("shutdown")
+async def shutdown_scheduler():
+    """FastAPI 关闭时：优雅关闭 APScheduler。"""
+    scheduler.shutdown(wait=False)
+    logging.getLogger("main").info("[Scheduler] APScheduler 已关闭")
+
+
 # 注意：你需要确保前端调用 emby 接口时路径是否匹配，如果前端是 /api/libraries，这里 prefix="/api" 就对了
 if os.path.exists("backend/static"):
     app.mount("/", StaticFiles(directory="backend/static", html=True), name="static")

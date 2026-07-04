@@ -30,6 +30,8 @@ from models import (
     TorrentRecord,
     AutoTaskFlow,
     TaskStatus,
+    ActionType,
+    TaskActionLog,
 )
 from services.cd2_service import get_client as get_cd2_client
 from services.qb_service import delete_torrents as qb_delete_torrents
@@ -180,14 +182,17 @@ def _count_files_in_cd2_dir(cd2, path: str, video_only: bool = True, retries: in
 # 移动+校验辅助函数（移动后的文件系统校验替代 Emby library.new webhook）
 # ---------------------------------------------------------------------------
 
-def _get_season_stats(cd2, path: str, retries: int = 3) -> dict:
+def _get_season_stats(cd2, path: str, retries: int = 3, force_refresh: bool = False) -> dict:
     """获取 CD2 目录的递归 fileCount 和 totalSize，支持重试。
 
     使用 ``GetFileDetailProperties`` RPC 获取递归统计信息。
     在结果为空时以 2s/4s/8s 指数退避重试，容忍 CD2 缓存传播延迟。
+
+    当 *force_refresh* 为 True 时，CD2 服务端绕过目录缓存直接查询云端，
+    适用于移动/复制/删除操作后需要获取最新统计信息的场景。
     """
     for attempt in range(retries):
-        props = cd2.get_file_detail_properties(path)
+        props = cd2.get_file_detail_properties(path, force_refresh=force_refresh)
         if props and props.get("fileCount", 0) > 0:
             return {"fileCount": props["fileCount"], "totalSize": props.get("totalSize", 0)}
         if attempt < retries - 1:
@@ -195,7 +200,7 @@ def _get_season_stats(cd2, path: str, retries: int = 3) -> dict:
             logger.debug("_get_season_stats('%s') 结果为空 (第%d/%d次), %ds 后重试…",
                          path, attempt + 1, retries, delay)
             time.sleep(delay)
-    props = cd2.get_file_detail_properties(path)
+    props = cd2.get_file_detail_properties(path, force_refresh=force_refresh)
     if props:
         return {"fileCount": props.get("fileCount", 0), "totalSize": props.get("totalSize", 0)}
     return {"fileCount": 0, "totalSize": 0}
@@ -209,16 +214,20 @@ def _verify_season_move(cd2, source_path: str, dest_parent_path: str,
     2. 移动源路径 → 目标父目录
     3. 等待 CD2 缓存 (2s) + 重试统计查询最多 3 次
     4. 对比源与目标的 fileCount + totalSize
+    5. 校验失败时追加长间隔重试（容忍 CD2 服务端缓存延迟）
 
     返回::
 
         {
           "success": bool,       # 移动是否成功？
           "verified": bool,      # fileCount & totalSize 是否匹配？
+          "season": int,         # Season 编号
+          "dir_name": str,       # Season 目录名
           "source_stats": {"fileCount": int, "totalSize": int},
           "dest_stats":   {"fileCount": int, "totalSize": int},
           "dest_path": str,
           "error": str,
+          "retry_count": int,    # 校验重试次数（0 = 首次即通过）
         }
     """
     source_stats = _get_season_stats(cd2, source_path)
@@ -226,68 +235,312 @@ def _verify_season_move(cd2, source_path: str, dest_parent_path: str,
                 title, season_num, season_dir_name,
                 source_stats["fileCount"], source_stats["totalSize"])
     if source_stats["fileCount"] == 0:
-        return {"success": False, "verified": False, "source_stats": source_stats,
+        return {"success": False, "verified": False,
+                "season": season_num, "dir_name": season_dir_name,
+                "source_stats": source_stats,
                 "dest_stats": {"fileCount": 0, "totalSize": 0}, "dest_path": "",
-                "error": "源目录文件数为 0 — 无法校验移动"}
+                "error": "源目录文件数为 0 — 无法校验移动",
+                "retry_count": 0}
     move_result = cd2.move_files([source_path], dest_parent_path, conflict_policy=1)
     if not move_result.get("success"):
         error = move_result.get("errorMessage", "unknown")
         logger.error("[%s] S%d '%s' 移动失败: %s", title, season_num, season_dir_name, error)
-        return {"success": False, "verified": False, "source_stats": source_stats,
+        return {"success": False, "verified": False,
+                "season": season_num, "dir_name": season_dir_name,
+                "source_stats": source_stats,
                 "dest_stats": {"fileCount": 0, "totalSize": 0}, "dest_path": "",
-                "error": f"移动失败: {error}"}
+                "error": f"移动失败: {error}",
+                "retry_count": 0}
     dest_path = _sanitize_cd2_path(f"{dest_parent_path}/{season_dir_name}")
     logger.info("[%s] S%d 等待 2s 以便 CD2 缓存刷新…", title, season_num)
     time.sleep(2)
-    dest_stats = _get_season_stats(cd2, dest_path, retries=3)
-    logger.info("[%s] S%d '%s' 移动后统计: %d 文件, %d 字节",
+    # 使用 force_refresh=True 通知 CD2 服务端绕过目录缓存，直接查询云端最新数据
+    dest_stats = _get_season_stats(cd2, dest_path, retries=3, force_refresh=True)
+    logger.info("[%s] S%d '%s' 移动后统计 (force_refresh): %d 文件, %d 字节",
                 title, season_num, season_dir_name,
                 dest_stats["fileCount"], dest_stats["totalSize"])
     verified = (source_stats["fileCount"] == dest_stats["fileCount"]
                 and source_stats["totalSize"] == dest_stats["totalSize"]
                 and source_stats["fileCount"] > 0)
+    retry_count = 0
+
     if verified:
         logger.info("[%s] S%d '%s' ✓ 校验通过 — %d 文件, %d 字节一致",
                     title, season_num, season_dir_name,
                     source_stats["fileCount"], source_stats["totalSize"])
     else:
-        logger.critical("[%s] S%d '%s' ✗ 校验失败 — "
-                        "源: %d 文件/%d 字节, 目标: %d 文件/%d 字节. "
-                        "种子文件将保留，请人工排查！",
+        # CD2 force_refresh 可能仍需一点时间才能完全生效。
+        # 追加 force_refresh 重试，最大程度绕过服务端缓存。
+        logger.warning("[%s] S%d '%s' 首次 force_refresh 校验不匹配 — "
+                       "源: %d 文件/%d 字节, 目标: %d 文件/%d 字节. "
+                       "开始 CD2 缓存容错重试 (force_refresh)…",
+                       title, season_num, season_dir_name,
+                       source_stats["fileCount"], source_stats["totalSize"],
+                       dest_stats["fileCount"], dest_stats["totalSize"])
+        cache_retry_delays = [5, 10, 15, 20]
+        for attempt, delay in enumerate(cache_retry_delays, 1):
+            time.sleep(delay)
+            dest_stats = _get_season_stats(cd2, dest_path, retries=1, force_refresh=True)
+            retry_count = attempt
+            logger.info("[%s] S%d '%s' force_refresh 重试 #%d (%ds): %d 文件, %d 字节",
                         title, season_num, season_dir_name,
-                        source_stats["fileCount"], source_stats["totalSize"],
+                        attempt, delay,
                         dest_stats["fileCount"], dest_stats["totalSize"])
-    return {"success": True, "verified": verified, "source_stats": source_stats,
+            if (source_stats["fileCount"] == dest_stats["fileCount"]
+                    and source_stats["totalSize"] == dest_stats["totalSize"]):
+                verified = True
+                logger.warning("[%s] S%d '%s' ✓ force_refresh 重试 #%d 后校验通过 "
+                               "— CD2 缓存延迟约 %ds",
+                               title, season_num, season_dir_name,
+                               attempt, 2 + sum(cache_retry_delays[:attempt]))
+                break
+
+        if not verified:
+            logger.critical("[%s] S%d '%s' ✗ 校验失败（含 %d 次 force_refresh 重试）— "
+                            "源: %d 文件/%d 字节, 目标: %d 文件/%d 字节. "
+                            "种子文件将保留，请人工排查！",
+                            title, season_num, season_dir_name, retry_count,
+                            source_stats["fileCount"], source_stats["totalSize"],
+                            dest_stats["fileCount"], dest_stats["totalSize"])
+
+    return {"success": True, "verified": verified,
+            "season": season_num, "dir_name": season_dir_name,
+            "source_stats": source_stats,
             "dest_stats": dest_stats, "dest_path": dest_path,
-            "error": "" if verified else "移动后文件数量或总大小不匹配"}
+            "error": "" if verified else "移动后文件数量或总大小不匹配",
+            "retry_count": retry_count}
 
 
-def _delete_qb_torrents_by_title(qb_config_id: str, title: str) -> dict:
-    """按标题删除 qBittorrent 种子，包含文件。
+def _extract_version_keyword_sets(season_dir_names: list) -> list:
+    """从每个 Season 目录名中独立提取版本关键词集合。
+
+    每个目录名返回一个独立的 set，不做跨 Season 合并。
+    例如 ["Season 1 -2160p-WEB-DL DV-HDSWEB", "Season 1 -2160p-WEB-DL-Pure@HDSWEB"] →
+         [{"2160p", "web-dl", "dv", "hdsweb"}, {"2160p", "web-dl", "pure@hdsweb"}]
+
+    种子只需匹配任意一个 set 的全部关键词即可被删除。
+    """
+    skip_words = {"season", "s01", "s1", "-", ""}
+    result = []
+    for name in season_dir_names:
+        keywords = set()
+        rest = _SEASON_RE.sub("", name).strip()
+        rest = rest.lstrip("- ")
+        if not rest:
+            continue
+        parts = re.split(r'[\s\-]+', rest)
+        for p in parts:
+            p_lower = p.lower().strip("()[]")
+            if p_lower and p_lower not in skip_words and len(p_lower) >= 2:
+                keywords.add(p_lower)
+        if keywords:
+            result.append(keywords)
+    return result
+
+
+def _is_port_8089(config_id: str) -> bool:
+    """检查指定 qB 实例是否运行在 8089 端口。"""
+    cfg = load_config()
+    qb_configs = cfg.get("qb_configs", [])
+    qb_cfg = next((c for c in qb_configs if c.get("id") == config_id), None)
+    if not qb_cfg:
+        return False
+    host = qb_cfg.get("host", "")
+    return ":8089" in host or host.endswith(":8089") or host.rstrip("/").endswith("8089")
+
+
+def _delete_qb_torrents_by_title(
+    qb_config_id: str,
+    title: str,
+    version_keywords: list = None,
+    season_dir_names: list = None,
+) -> dict:
+    """按标题 + 版本关键词删除 qBittorrent 种子，包含文件。
+
+    规则：
+    1. 只删除下载完成的种子（progress >= 1.0）
+    2. 端口 8089 的实例例外：无论是否完成，全部删除
+    3. 有版本关键词时，种子名必须至少包含一个关键词，防止错删不同版本的种子
+    4. 当 qb_config_id 为空时，自动遍历所有已配置的 qB 实例
 
     返回::
 
-        {"success": bool, "deleted_count": int, "error": str}
+        {
+            "success": bool,
+            "deleted_count": int,
+            "deleted_names": list[str],
+            "skipped_incomplete": list[str],
+            "skipped_version_mismatch": list[str],
+            "error": str,
+        }
     """
-    if not qb_config_id or not title:
-        return {"success": False, "deleted_count": 0, "error": "缺少 qb_config_id 或 title"}
+    if not title:
+        return {"success": False, "deleted_count": 0, "deleted_names": [],
+                "skipped_incomplete": [], "skipped_version_mismatch": [],
+                "error": "缺少 title"}
+
+    # 每个 Season 目录独立提取关键词集合（不做跨 Season 合并）
+    keyword_sets = []
+    if season_dir_names:
+        keyword_sets = _extract_version_keyword_sets(season_dir_names)
+    if version_keywords:
+        keyword_sets.append(set(k.lower() for k in version_keywords))
+
     try:
-        qb_result = qb_get_torrents(config_id=qb_config_id, keyword=title, page=1, page_size=100)
-        matched = qb_result.get("torrents", [])
-        if not matched:
-            logger.info("_delete_qb_torrents_by_title: 未找到匹配 '%s' 的 qB 种子", title)
-            return {"success": True, "deleted_count": 0, "error": ""}
-        hashes = [t["hash"] for t in matched]
-        logger.info("_delete_qb_torrents_by_title: 正在删除 %d 个匹配 '%s' 的种子（含文件）",
-                    len(hashes), title)
-        ok = qb_delete_torrents(qb_config_id, hashes, delete_files=True)
-        if ok:
-            return {"success": True, "deleted_count": len(hashes), "error": ""}
+        # 确定要查询的实例 ID 列表
+        if qb_config_id:
+            config_ids = [qb_config_id]
         else:
-            return {"success": False, "deleted_count": 0, "error": "qB 删除返回失败"}
+            logger.info(
+                "_delete_qb_torrents_by_title: qb_config_id 为空，遍历所有 qB 实例查找 '%s'",
+                title,
+            )
+            cfg = load_config()
+            qb_configs = cfg.get("qb_configs", [])
+            config_ids = [c.get("id") for c in qb_configs if c.get("id")]
+            if not config_ids:
+                logger.warning("_delete_qb_torrents_by_title: 没有可用的 qB 实例")
+                return {"success": False, "deleted_count": 0, "deleted_names": [],
+                        "skipped_incomplete": [], "skipped_version_mismatch": [],
+                        "error": "没有可用的 qB 实例"}
+
+        # 按实例分组 (cid → [(hash, name), ...])
+        instance_torrents = {}
+        skipped_incomplete = []
+        skipped_version_mismatch = []
+
+        for cid in config_ids:
+            qb_result = qb_get_torrents(config_id=cid, keyword=title, page=1, page_size=200)
+            matched = qb_result.get("torrents", [])
+            if not matched:
+                continue
+
+            is_8089 = _is_port_8089(cid)
+            filtered = []
+            for t in matched:
+                tname = t.get("name", "")
+                # 版本关键词过滤：种子必须匹配至少一个 Season 的全部关键词
+                if keyword_sets:
+                    tname_lower = tname.lower()
+                    if not any(all(kw in tname_lower for kw in kw_set) for kw_set in keyword_sets):
+                        skipped_version_mismatch.append(tname)
+                        continue
+                # 完成状态过滤：只删已完成的（8089 端口除外）
+                progress = t.get("progress", 0)
+                if not is_8089 and progress < 1.0:
+                    skipped_incomplete.append(tname)
+                    continue
+                filtered.append((t["hash"], tname))
+
+            if filtered:
+                instance_torrents[cid] = filtered
+                logger.info(
+                    "_delete_qb_torrents_by_title: 实例 '%s' 找到 %d 个匹配 '%s' 的种子"
+                    "（已过滤 %d 个未完成, %d 个版本不匹配, 8089=%s）",
+                    cid, len(filtered), title,
+                    sum(1 for t in matched if t.get("progress", 0) < 1.0 and not is_8089),
+                    sum(1 for t in matched
+                        if keyword_sets and
+                        not any(all(kw in t.get("name", "").lower() for kw in kw_set)
+                                for kw_set in keyword_sets)),
+                    is_8089,
+                )
+
+        if skipped_incomplete:
+            logger.info(
+                "_delete_qb_torrents_by_title: 跳过 %d 个未完成种子: %s",
+                len(skipped_incomplete),
+                [n[:60] for n in skipped_incomplete[:5]],
+            )
+        if skipped_version_mismatch:
+            logger.info(
+                "_delete_qb_torrents_by_title: 跳过 %d 个版本不匹配种子: %s",
+                len(skipped_version_mismatch),
+                [n[:60] for n in skipped_version_mismatch[:5]],
+            )
+
+        if not instance_torrents:
+            logger.info(
+                "_delete_qb_torrents_by_title: 未找到可删除的匹配 '%s' 的 qB 种子"
+                "（搜索了 %d 个实例, 版本关键词=%s）",
+                title, len(config_ids),
+                [sorted(ks) for ks in keyword_sets] if keyword_sets else "(无)",
+            )
+            return {"success": True, "deleted_count": 0, "deleted_names": [],
+                    "skipped_incomplete": skipped_incomplete,
+                    "skipped_version_mismatch": skipped_version_mismatch,
+                    "error": ""}
+
+        # 按实例分别删除
+        total_deleted = 0
+        all_deleted_names = []
+        for cid, torrents in instance_torrents.items():
+            hashes = [h for h, _ in torrents]
+            names = [n for _, n in torrents]
+            logger.info(
+                "_delete_qb_torrents_by_title: 正在实例 '%s' 删除 %d 个种子（含文件）",
+                cid, len(hashes),
+            )
+            ok = qb_delete_torrents(cid, hashes, delete_files=True)
+            if ok:
+                total_deleted += len(hashes)
+                all_deleted_names.extend(names)
+            else:
+                logger.error("_delete_qb_torrents_by_title: 实例 '%s' 删除失败", cid)
+
+        if total_deleted > 0:
+            return {"success": True, "deleted_count": total_deleted,
+                    "deleted_names": all_deleted_names,
+                    "skipped_incomplete": skipped_incomplete,
+                    "skipped_version_mismatch": skipped_version_mismatch,
+                    "error": ""}
+        else:
+            return {"success": False, "deleted_count": 0, "deleted_names": [],
+                    "skipped_incomplete": skipped_incomplete,
+                    "skipped_version_mismatch": skipped_version_mismatch,
+                    "error": "所有实例的 qB 删除均返回失败"}
     except Exception as e:
         logger.exception("_delete_qb_torrents_by_title 对 '%s' 执行失败", title)
-        return {"success": False, "deleted_count": 0, "error": str(e)}
+        return {"success": False, "deleted_count": 0, "deleted_names": [],
+                "skipped_incomplete": [], "skipped_version_mismatch": [],
+                "error": str(e)}
+
+def _write_action_log(
+    db: Session,
+    task_id: Optional[int],
+    tmdb_id: int,
+    title: str,
+    action_type: str,
+    target_name: str,
+    target_path: str = "",
+    reason: str = "",
+    detail: dict = None,
+):
+    """写入一条任务操作日志并立即提交。
+
+    每次调用独立 commit，不影响主流程的 AutoTaskFlow 事务。
+    日志记录的是 CD2 侧已实际发生的操作（删除/移动），
+    即使后续 AutoTaskFlow 创建失败，已发生的操作也应被记录。
+    """
+    if db is None:
+        return
+    try:
+        log_entry = TaskActionLog(
+            task_id=task_id,
+            tmdb_id=tmdb_id,
+            title=title,
+            action_type=action_type,
+            target_name=target_name,
+            target_path=target_path,
+            reason=reason,
+            detail=detail or {},
+        )
+        db.add(log_entry)
+        db.commit()
+    except Exception as e:
+        logger.error("_write_action_log: 写入日志失败 (%s → %s): %s",
+                     action_type, target_name, e)
+
 
 # ---------------------------------------------------------------------------
 # 阶段一：自动处理 — 完整性验证 + 智能对比 + 前置删除
@@ -503,6 +756,20 @@ def auto_process_show(
                     title, season_num, sd.get("name", ""),
                     count, expected_eps,
                 )
+                _write_action_log(
+                    db, None, tmdb_id, title,
+                    ActionType.SKIP_FOLDER.value,
+                    target_name=sd.get("name", ""),
+                    target_path=sd_path,
+                    reason=f"已完结目录文件不足: {count}/{expected_eps} 文件",
+                )
+                _write_action_log(
+                    db, None, tmdb_id, title,
+                    ActionType.KEEP_ORGANIZED.value,
+                    target_name=sd.get("name", ""),
+                    target_path=sd_path,
+                    reason=f"已完结 S{season_num} 文件不完整 ({count}/{expected_eps})，保留在已完结目录等待补全",
+                )
 
         if complete_candidates:
             sv = {
@@ -663,6 +930,20 @@ def auto_process_show(
                 "保守处理为有内容，不参与残缺判定)",
                 title, sn, media_season_name, actual_files,
             )
+            _write_action_log(
+                db, None, tmdb_id, title,
+                ActionType.SKIP_FOLDER.value,
+                target_name=media_season_name,
+                target_path=media_season_path,
+                reason=f"TMDB episode_count=0，目录有 {actual_files} 个文件，保守跳过",
+            )
+            _write_action_log(
+                db, None, tmdb_id, title,
+                ActionType.KEEP_MEDIA.value,
+                target_name=media_season_name,
+                target_path=media_season_path,
+                reason=f"TMDB 无 Season {sn} 集数数据，但目录有 {actual_files} 个文件，保留在媒体库",
+            )
         else:
             logger.info(
                 "[%s] Media S%d '%s': %d/%d files %s",
@@ -748,6 +1029,23 @@ def auto_process_show(
         except Exception as e:
             logger.warning("[%s] Error ensuring target folder: %s", title, e)
 
+        # ---- 预创建 AutoTaskFlow 记录（确保后续所有 action log 都有 task_id） ----
+        auto_task = AutoTaskFlow(
+            tmdb_id=tmdb_id,
+            task_type="AUTO_PROCESS",
+            status=TaskStatus.INIT.value,
+            context={
+                "qb_config_id": qb_config_id,
+                "title": title, "year": year, "category": category,
+                "media_show_path": target_show_path,
+                "organized_show_path": organized_show_path,
+                "tmdb_id": tmdb_id, "total_seasons": total_seasons,
+            },
+        )
+        db.add(auto_task)
+        db.commit()
+        db.refresh(auto_task)
+
         # 移动 + 校验每个完整 Season 候选
         verify_results = []
         for sn in sorted(season_dir_map.keys()):
@@ -761,40 +1059,68 @@ def auto_process_show(
                     season_dir.get("name", ""), title, sn,
                 )
                 verify_results.append(vr)
+                if vr["verified"]:
+                    _write_action_log(
+                        db, auto_task.id, tmdb_id, title,
+                        ActionType.MOVE_FOLDER.value,
+                        target_name=season_dir.get("name", ""),
+                        target_path=vr.get("dest_path", ""),
+                        reason=f"Case A 首次导入: Season {sn} 移动并校验通过",
+                        detail={
+                            "season": sn,
+                            "source_stats": vr["source_stats"],
+                            "dest_stats": vr["dest_stats"],
+                        },
+                    )
 
         all_verified = all(vr["verified"] for vr in verify_results)
         failed = [vr for vr in verify_results if not vr["verified"]]
 
         # ---- 情况 A: 最终处理 ----
         if all_verified:
-            qb_result = _delete_qb_torrents_by_title(qb_config_id, title)
+            season_dirs = [sd["name"] for sds in season_dir_map.values() for sd in sds]
+            qb_result = _delete_qb_torrents_by_title(qb_config_id, title, season_dir_names=season_dirs)
             logger.info(
                 "[%s] 情况 A 完成: %d 个 Season 已移动并校验, %d 个种子已删除",
                 title, len(verify_results), qb_result["deleted_count"],
             )
 
-            # 创建 COMPLETED 任务记录
-            context = {
-                "qb_config_id": qb_config_id,
-                "title": title, "year": year, "category": category,
-                "media_show_path": target_show_path,
-                "organized_show_path": organized_show_path,
-                "tmdb_id": tmdb_id, "total_seasons": total_seasons,
+            # 更新 AutoTaskFlow → COMPLETED
+            auto_task.status = TaskStatus.COMPLETED.value
+            auto_task.context = {
+                **auto_task.context,
                 "deleted_media_seasons": [],
                 "deleted_organized_seasons": [],
                 "verify_results": verify_results,
             }
-            task = AutoTaskFlow(
-                tmdb_id=tmdb_id,
-                task_type="AUTO_PROCESS",
-                status=TaskStatus.COMPLETED.value,
-                context=context,
-            )
-            db.add(task)
             db.commit()
-            db.refresh(task)
+            db.refresh(auto_task)
 
-            result["task_id"] = task.id
+            # ---- 记录 DELETE_TORRENT 日志: 每个被删除的种子 ----
+            for tname in qb_result.get("deleted_names", []) or []:
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.DELETE_TORRENT.value,
+                    target_name=tname,
+                    reason=f"Case A 首次导入完成，清理种子",
+                )
+            # ---- 记录 KEEP_TORRENT 日志: 每个被跳过的种子 ----
+            for tname in qb_result.get("skipped_incomplete", []) or []:
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.KEEP_TORRENT.value,
+                    target_name=tname,
+                    reason="种子未下载完成，保留",
+                )
+            for tname in qb_result.get("skipped_version_mismatch", []) or []:
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.KEEP_TORRENT.value,
+                    target_name=tname,
+                    reason="版本关键词不匹配，保留（可能对应其他 Season 版本）",
+                )
+
+            result["task_id"] = auto_task.id
             result["stage"] = "completed"
             result["message"] = (
                 f"首次导入完成：{len(verify_results)} 个 Season 候选已校验并移至媒体库"
@@ -803,18 +1129,58 @@ def auto_process_show(
             )
             result["success"] = True
         else:
+            # 更新 AutoTaskFlow → FAILED
+            auto_task.status = TaskStatus.FAILED.value
+            auto_task.context = {
+                **auto_task.context,
+                "verify_results": verify_results,
+                "failed_count": len(failed),
+            }
+            db.commit()
+            db.refresh(auto_task)
+
             logger.critical(
                 "[%s] 情况 A 校验失败: %d/%d 个 Season 不匹配 — "
                 "种子文件保留，目标目录可能存在不完整数据，请人工排查！",
                 title, len(failed), len(verify_results),
             )
+            for fv in failed:
+                logger.critical(
+                    "  S%s '%s': 源 %d 文件/%d 字节 → 目标 %d 文件/%d 字节 — %s"
+                    "（重试 %d 次）",
+                    str(fv.get("season", "?")), str(fv.get("dir_name", "?")),
+                    fv["source_stats"]["fileCount"], fv["source_stats"]["totalSize"],
+                    fv["dest_stats"]["fileCount"], fv["dest_stats"]["totalSize"],
+                    fv.get("error", "unknown"),
+                    fv.get("retry_count", 0),
+                )
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.KEEP_TORRENT.value,
+                    target_name=str(fv.get("dir_name", "未知目录")),
+                    reason=(
+                        f"Case A 首次导入: Season {fv.get('season', '?')} 移动后校验不一致"
+                        f"（源 {fv['source_stats']['fileCount']} 文件"
+                        f" → 目标 {fv['dest_stats']['fileCount']} 文件"
+                        f"，含 {fv.get('retry_count', 0)} 次缓存重试），"
+                        f"种子保留待人工排查"
+                    ),
+                    detail={
+                        "season": fv.get("season"),
+                        "dir_name": fv.get("dir_name"),
+                        "source_stats": fv["source_stats"],
+                        "dest_stats": fv["dest_stats"],
+                        "retry_count": fv.get("retry_count", 0),
+                    },
+                )
             result["stage"] = "verify_failed"
             result["message"] = (
                 f"移动后校验失败：{len(failed)}/{len(verify_results)} 个 Season "
-                f"文件数量或大小不匹配，种子已保留，请人工排查"
+                f"文件数量或大小不匹配（含 CD2 缓存容错重试），种子已保留，请人工排查"
             )
             result["details"]["verify_results"] = verify_results
             result["success"] = False
+            result["task_id"] = auto_task.id
 
         result["details"]["verify_results"] = verify_results
 
@@ -903,6 +1269,19 @@ def auto_process_show(
         db.commit()
         db.refresh(task)
 
+        # ---- 记录 DELETE_MEDIA 日志: 每个残缺季 ----
+        for sn, versions in media_season_state.items():
+            for state in versions:
+                if state.get("files_present"):
+                    continue  # 有文件但 TMDB 无数据的季不记录为删除
+                _write_action_log(
+                    db, task.id, tmdb_id, title,
+                    ActionType.DELETE_MEDIA.value,
+                    target_name=state["name"],
+                    target_path=state["path"],
+                    reason=f"Case B 整剧删除: Season {sn} 残缺 {state['file_count']}/{state['expected']} 文件",
+                )
+
         result["task_id"] = task.id
         result["stage"] = "waiting_for_delete_webhook"
         result["message"] = (
@@ -975,6 +1354,23 @@ def auto_process_show(
                 return False
         return True
 
+    # ---- 预创建 AutoTaskFlow 记录（确保后续所有 action log 都有 task_id） ----
+    auto_task = AutoTaskFlow(
+        tmdb_id=tmdb_id,
+        task_type="AUTO_PROCESS",
+        status=TaskStatus.INIT.value,
+        context={
+            "qb_config_id": qb_config_id,
+            "title": title, "year": year, "category": category,
+            "media_show_path": media_show_path,
+            "organized_show_path": organized_show_path,
+            "tmdb_id": tmdb_id, "total_seasons": total_seasons,
+        },
+    )
+    db.add(auto_task)
+    db.commit()
+    db.refresh(auto_task)
+
     # ---- 4a. 删除媒体库中残缺的 Season ----
     # 跳过完整季和有文件但 TMDB 无数据的季（files_present），仅删除确认残缺的
     for sn, versions in media_season_state.items():
@@ -993,6 +1389,13 @@ def auto_process_show(
                     "action": "deleted_media_incomplete",
                     "deleted_path": state["path"],
                 })
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.DELETE_MEDIA.value,
+                    target_name=state["name"],
+                    target_path=state["path"],
+                    reason=f"Case C 残缺季删除: Season {sn} {state['file_count']}/{state['expected']} 文件",
+                )
             else:
                 comparison_results.append({
                     "season": sn,
@@ -1020,6 +1423,14 @@ def auto_process_show(
                 logger.info(
                     "[%s] S%d: 媒体库中完整，已完结目录中无对应 Season 可对比",
                     title, sn,
+                )
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.KEEP_MEDIA.value,
+                    target_name=state["name"],
+                    target_path=state["path"],
+                    reason=(f"Case C S{sn} 完整 ({state['file_count']}/{state['expected']} 文件)，"
+                            "已完结目录无对应 Season，保留在媒体库"),
                 )
                 comparison_results.append(comp)
                 continue
@@ -1078,6 +1489,13 @@ def auto_process_show(
                             "dir_name": org_dir.get("name", ""),
                             "path": org_season_path,
                         })
+                        _write_action_log(
+                            db, auto_task.id, tmdb_id, title,
+                            ActionType.DELETE_ORGANIZED.value,
+                            target_name=org_dir.get("name", ""),
+                            target_path=org_season_path,
+                            reason=f"与媒体库版本完全重复 (名称/文件数/大小/单文件均匹配)",
+                        )
                     else:
                         oc["status"] = "delete_failed"
                         oc["error"] = del_result.get("errorMessage", "unknown")
@@ -1095,11 +1513,29 @@ def auto_process_show(
                         title, sn, org_dir.get("name", ""),
                         "; ".join(reasons),
                     )
+                    _write_action_log(
+                        db, auto_task.id, tmdb_id, title,
+                        ActionType.KEEP_ORGANIZED.value,
+                        target_name=org_dir.get("name", ""),
+                        target_path=org_season_path,
+                        reason=(f"Case C S{sn} 与媒体库版本不同 ({'; '.join(reasons)})，"
+                                "非重复版本不删除，后续将移入媒体库"),
+                    )
 
                 org_comparisons.append(oc)
 
             comp["org_comparisons"] = org_comparisons
             comparison_results.append(comp)
+
+            # 记录 KEEP_MEDIA: 媒体库完整季保留原因
+            _write_action_log(
+                db, auto_task.id, tmdb_id, title,
+                ActionType.KEEP_MEDIA.value,
+                target_name=state["name"],
+                target_path=state["path"],
+                reason=(f"Case C S{sn} 完整 ({state['file_count']}/{state['expected']} 文件)，"
+                        f"已完结 {len(org_candidates)} 个候选已对比，保留在媒体库"),
+            )
 
     result["details"]["comparison_results"] = comparison_results
 
@@ -1195,6 +1631,19 @@ def auto_process_show(
                 c["dir_name"], title, c["season"],
             )
             verify_results.append(vr)
+            if vr["verified"]:
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.MOVE_FOLDER.value,
+                    target_name=c["dir_name"],
+                    target_path=vr.get("dest_path", ""),
+                    reason=f"Case C 版本替换: Season {c['season']} 移动并校验通过",
+                    detail={
+                        "season": c["season"],
+                        "source_stats": vr["source_stats"],
+                        "dest_stats": vr["dest_stats"],
+                    },
+                )
 
     result["details"]["candidates_moved"] = len(verify_results)
     result["details"]["candidates_total"] = len(candidates_to_move)
@@ -1227,7 +1676,18 @@ def auto_process_show(
 
     if not has_actions:
         # ---- 情况 D: 无需操作（全部完整且相同）----
+        auto_task.status = TaskStatus.COMPLETED.value
+        auto_task.context = {
+            **auto_task.context,
+            "deleted_media_seasons": deleted_media_seasons,
+            "deleted_organized_seasons": deleted_organized_seasons,
+            "comparison_results": comparison_results,
+        }
+        db.commit()
+        db.refresh(auto_task)
+
         result["stage"] = "no_action_needed"
+        result["task_id"] = auto_task.id
         result["message"] = "媒体库所有季均完整，已完结与媒体库版本相同，无需处理"
         result["success"] = True
     elif verify_results and not all_moves_verified:
@@ -1238,10 +1698,52 @@ def auto_process_show(
             "种子文件保留，请人工排查！",
             title, len(failed), len(verify_results),
         )
+        for fv in failed:
+            logger.critical(
+                "  S%s '%s': 源 %d 文件/%d 字节 → 目标 %d 文件/%d 字节 — %s"
+                "（重试 %d 次）",
+                str(fv.get("season", "?")), str(fv.get("dir_name", "?")),
+                fv["source_stats"]["fileCount"], fv["source_stats"]["totalSize"],
+                fv["dest_stats"]["fileCount"], fv["dest_stats"]["totalSize"],
+                fv.get("error", "unknown"),
+                fv.get("retry_count", 0),
+            )
+            _write_action_log(
+                db, auto_task.id, tmdb_id, title,
+                ActionType.KEEP_TORRENT.value,
+                target_name=str(fv.get("dir_name", "未知目录")),
+                reason=(
+                    f"Case C 洗版: Season {fv.get('season', '?')} 移动后校验不一致"
+                    f"（源 {fv['source_stats']['fileCount']} 文件"
+                    f" → 目标 {fv['dest_stats']['fileCount']} 文件"
+                    f"，含 {fv.get('retry_count', 0)} 次缓存重试），"
+                    f"种子保留待人工排查"
+                ),
+                detail={
+                    "season": fv.get("season"),
+                    "dir_name": fv.get("dir_name"),
+                    "source_stats": fv["source_stats"],
+                    "dest_stats": fv["dest_stats"],
+                    "retry_count": fv.get("retry_count", 0),
+                },
+            )
+        # 更新 AutoTaskFlow → FAILED
+        auto_task.status = TaskStatus.FAILED.value
+        auto_task.context = {
+            **auto_task.context,
+            "deleted_media_seasons": deleted_media_seasons,
+            "deleted_organized_seasons": deleted_organized_seasons,
+            "comparison_results": comparison_results,
+            "verify_results": verify_results,
+        }
+        db.commit()
+        db.refresh(auto_task)
+
         result["stage"] = "verify_failed"
+        result["task_id"] = auto_task.id
         result["message"] = (
             f"移动后校验失败：{len(failed)}/{len(verify_results)} 个 Season "
-            f"文件数量或大小不匹配，种子已保留，请人工排查"
+            f"文件数量或大小不匹配（含 CD2 缓存容错重试），种子已保留，请人工排查"
         )
         result["details"]["verify_results"] = verify_results
         result["success"] = False
@@ -1249,35 +1751,50 @@ def auto_process_show(
         # ---- 全部校验通过 → 删除 qB 种子 ----
         qb_result = {"success": True, "deleted_count": 0}
         if all_moves_verified:
-            qb_result = _delete_qb_torrents_by_title(qb_config_id, title)
+            season_dirs = [sd["name"] for sds in season_dir_map.values() for sd in sds]
+            qb_result = _delete_qb_torrents_by_title(qb_config_id, title, season_dir_names=season_dirs)
             logger.info(
                 "[%s] 情况 C 完成: %d 个 Season 校验通过, %d 个种子已删除",
                 title, len(verify_results), qb_result["deleted_count"],
             )
 
-        # 创建 COMPLETED 任务记录
-        context = {
-            "qb_config_id": qb_config_id,
-            "title": title, "year": year, "category": category,
-            "media_show_path": media_show_path,
-            "organized_show_path": organized_show_path,
-            "tmdb_id": tmdb_id, "total_seasons": total_seasons,
+        # 更新 AutoTaskFlow → COMPLETED
+        auto_task.status = TaskStatus.COMPLETED.value
+        auto_task.context = {
+            **auto_task.context,
             "deleted_media_seasons": deleted_media_seasons,
             "deleted_organized_seasons": deleted_organized_seasons,
             "comparison_results": comparison_results,
             "verify_results": verify_results,
         }
-        task = AutoTaskFlow(
-            tmdb_id=tmdb_id,
-            task_type="AUTO_PROCESS",
-            status=TaskStatus.COMPLETED.value,
-            context=context,
-        )
-        db.add(task)
         db.commit()
-        db.refresh(task)
+        db.refresh(auto_task)
 
-        result["task_id"] = task.id
+        # ---- 记录 DELETE_TORRENT 日志: 每个被删除的种子 ----
+        for tname in qb_result.get("deleted_names", []) or []:
+            _write_action_log(
+                db, auto_task.id, tmdb_id, title,
+                ActionType.DELETE_TORRENT.value,
+                target_name=tname,
+                reason=f"Case C 洗版完成，清理种子",
+            )
+        # ---- 记录 KEEP_TORRENT 日志: 每个被跳过的种子 ----
+        for tname in qb_result.get("skipped_incomplete", []) or []:
+            _write_action_log(
+                db, auto_task.id, tmdb_id, title,
+                ActionType.KEEP_TORRENT.value,
+                target_name=tname,
+                reason="种子未下载完成，保留",
+            )
+        for tname in qb_result.get("skipped_version_mismatch", []) or []:
+            _write_action_log(
+                db, auto_task.id, tmdb_id, title,
+                ActionType.KEEP_TORRENT.value,
+                target_name=tname,
+                reason="版本关键词不匹配，保留（可能对应其他 Season 版本）",
+            )
+
+        result["task_id"] = auto_task.id
         result["stage"] = "completed"
 
         msg_parts = []
@@ -1493,6 +2010,19 @@ def handle_library_deleted_webhook(payload: dict, db: Session) -> bool:
                 dir_name, ctx_title, sn,
             )
             verify_results.append(vr)
+            if vr["verified"]:
+                _write_action_log(
+                    db, task.id, tmdb_id, ctx_title,
+                    ActionType.MOVE_FOLDER.value,
+                    target_name=dir_name,
+                    target_path=vr.get("dest_path", ""),
+                    reason=f"Case B 阶段二: Season {sn} 移动并校验通过",
+                    detail={
+                        "season": sn,
+                        "source_stats": vr["source_stats"],
+                        "dest_stats": vr["dest_stats"],
+                    },
+                )
 
         # ---- 步骤五: 种子清理（由校验结果决定）----
         all_verified = (
@@ -1516,11 +2046,36 @@ def handle_library_deleted_webhook(payload: dict, db: Session) -> bool:
 
         if all_verified:
             # 全部通过 → 删除 qB 种子
-            qb_result = _delete_qb_torrents_by_title(qb_config_id, ctx_title)
+            season_dirs = [s.get("dir_name", "") for s in organized_seasons_to_move]
+            qb_result = _delete_qb_torrents_by_title(qb_config_id, ctx_title, season_dir_names=season_dirs)
             logger.info(
                 "[%s] ✓ 全部 %d 个 Season 校验通过 — %d 个种子已删除",
                 ctx_title, len(verify_results), qb_result["deleted_count"],
             )
+
+            # ---- 记录 DELETE_TORRENT 日志: 每个被删除的种子 ----
+            for tname in qb_result.get("deleted_names", []) or []:
+                _write_action_log(
+                    db, task.id, tmdb_id, ctx_title,
+                    ActionType.DELETE_TORRENT.value,
+                    target_name=tname,
+                    reason=f"Case B 阶段二完成，清理种子",
+                )
+            # ---- 记录 KEEP_TORRENT 日志: 每个被跳过的种子 ----
+            for tname in qb_result.get("skipped_incomplete", []) or []:
+                _write_action_log(
+                    db, task.id, tmdb_id, ctx_title,
+                    ActionType.KEEP_TORRENT.value,
+                    target_name=tname,
+                    reason="种子未下载完成，保留",
+                )
+            for tname in qb_result.get("skipped_version_mismatch", []) or []:
+                _write_action_log(
+                    db, task.id, tmdb_id, ctx_title,
+                    ActionType.KEEP_TORRENT.value,
+                    target_name=tname,
+                    reason="版本关键词不匹配，保留（可能对应其他 Season 版本）",
+                )
 
             task.status = TaskStatus.COMPLETED.value
             task.error_message = None
@@ -1547,17 +2102,39 @@ def handle_library_deleted_webhook(payload: dict, db: Session) -> bool:
             )
             for fv in failed:
                 logger.critical(
-                    "  S%d '%s': 源 %d 文件/%d 字节 → 目标 %d 文件/%d 字节 — %s",
-                    fv.get("season", "?"), fv.get("dir_name", "?"),
+                    "  S%s '%s': 源 %d 文件/%d 字节 → 目标 %d 文件/%d 字节 — %s"
+                    "（重试 %d 次）",
+                    str(fv.get("season", "?")), str(fv.get("dir_name", "?")),
                     fv["source_stats"]["fileCount"], fv["source_stats"]["totalSize"],
                     fv["dest_stats"]["fileCount"], fv["dest_stats"]["totalSize"],
                     fv.get("error", "unknown"),
+                    fv.get("retry_count", 0),
+                )
+                # ---- 记录 KEEP_TORRENT 日志: 校验失败导致种子保留 ----
+                _write_action_log(
+                    db, task.id, tmdb_id, ctx_title,
+                    ActionType.KEEP_TORRENT.value,
+                    target_name=str(fv.get("dir_name", "未知目录")),
+                    reason=(
+                        f"Season {fv.get('season', '?')} 移动后校验不一致"
+                        f"（源 {fv['source_stats']['fileCount']} 文件"
+                        f" → 目标 {fv['dest_stats']['fileCount']} 文件"
+                        f"，含 {fv.get('retry_count', 0)} 次缓存重试），"
+                        f"种子保留待人工排查"
+                    ),
+                    detail={
+                        "season": fv.get("season"),
+                        "dir_name": fv.get("dir_name"),
+                        "source_stats": fv["source_stats"],
+                        "dest_stats": fv["dest_stats"],
+                        "retry_count": fv.get("retry_count", 0),
+                    },
                 )
 
             task.status = TaskStatus.FAILED.value
             task.error_message = (
                 f"移动后校验失败：{len(failed)}/{len(verify_results)} 个 Season "
-                f"文件数量或大小不匹配，种子已保留"
+                f"文件数量或大小不匹配（含 CD2 缓存容错重试），种子已保留"
             )
             task.context = {**context, "verify_results": verify_results}
             task.updated_at = datetime.now()

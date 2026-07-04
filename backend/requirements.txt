@@ -28,3 +28,5 @@ qbittorrent-api
 grpcio>=1.60.0
 grpcio-tools>=1.60.0
 protobuf>=5.0
+APScheduler>=3.11.0
+croniter>=6.2.0

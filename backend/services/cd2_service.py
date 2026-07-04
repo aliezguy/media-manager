@@ -249,18 +249,22 @@ class CD2Client:
         logger.info("CD2 GetSubFiles('%s') → %d entries", path, len(files))
         return files
 
-    def get_file_detail_properties(self, path: str) -> Optional[dict]:
+    def get_file_detail_properties(self, path: str, force_refresh: bool = False) -> Optional[dict]:
         """Fetch detail properties for a single file/folder.
 
         Calls ``GetFileDetailProperties`` which returns ``totalFileCount``,
         ``totalFolderCount`` and ``totalSize`` for directories.
+
+        When *force_refresh* is True, the CD2 server bypasses its directory
+        cache and queries the cloud storage directly.  Use this after move/
+        copy/delete operations where the cache may be stale.
         Returns None on failure.
         """
         if self._stub is None:
             self.connect()
             self.login()
 
-        request = clouddrive_pb2.FileRequest(path=path)
+        request = clouddrive_pb2.FileRequest(path=path, forceRefresh=force_refresh)
         try:
             resp: clouddrive_pb2.FileDetailProperties = (
                 self._stub.GetFileDetailProperties(

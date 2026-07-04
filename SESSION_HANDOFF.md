@@ -1,145 +1,105 @@
-# Session Handoff — Emby AI Manager 全自动洗版工作流
+# Session Handoff — 2026-07-04 (Session 2)
 
-> **日期**: 2026-07-03
-> **分支**: main
-> **状态**: 第八会话 — 轧戏(tmdb=279136) Case B 端到端测试通过，全部注释中文化完成
+## 当前目标 (Current Goal)
 
----
+1. **修复 CD2 移动后校验失败问题**：CD2 服务端目录缓存导致移动后 `GetFileDetailProperties` 返回过期数据（如 29/40 文件），时间等待重试无效
+2. **修复日志格式 TypeError**：校验失败日志中 `%d` 格式符收到字符串 `"?"`，导致日志系统崩溃
+3. **完善校验失败处理**：校验失败时记录 KEEP_TORRENT 时间线日志，含重试次数和 detail 信息
+4. **CD2 已完结侧增加删除功能**：Season 文件夹级别 + 剧集目录级别的删除按钮
 
-## 一、当前目标 (Current Goal)
+## 已完成工作 (What's Done)
 
-**废弃 Emby library.new webhook 依赖**，将洗版流程从三阶段状态机重构为两阶段。种子删除不再等待 Emby 的"新增/刮削 Webhook"，改为**移动后立即通过文件系统强校验**（fileCount + totalSize 对比）来决定是否删除种子。提高流程可靠性，消除 library.new 不稳定导致的种子残留问题。
+### 1. CD2 缓存绕过 — `backend/services/cd2_service.py`
 
-核心原则：**不删数据、不静默失败、校验不过就不删种子**。
+- `get_file_detail_properties` 新增 `force_refresh: bool = False` 参数
+- 使用 proto `FileRequest.forceRefresh` 字段通知 CD2 服务端绕过目录缓存，直接查询云端最新数据
 
----
+### 2. 移动后校验重构 — `backend/services/task_flow_service.py`
 
-## 二、已完成工作 (What's Done)
+#### 2a. `_get_season_stats` 新增 `force_refresh` 参数
+透传给 `cd2.get_file_detail_properties`，移动后查询目标统计时使用 `force_refresh=True`
 
-### 2.1 状态机重构：三阶段 → 两阶段
+#### 2b. `_verify_season_move` 核心修复
+- **返回 dict 新增字段**：`season`、`dir_name`、`retry_count`（修复下游日志 `fv.get("season", "?")` 返回 `"?"` 的问题）
+- **移动后第一次查询**：使用 `force_refresh=True`（绕过 CD2 缓存）
+- **校验不匹配时**：追加 4 轮 `force_refresh=True` 重试（5s/10s/15s/20s），累计最长 50s+
+- **重试后仍不匹配**：CRITICAL 日志含重试次数信息
+- **重试后匹配成功**：WARNING 日志记录 CD2 缓存延迟量
 
-| 旧状态机 | 新状态机 |
-|---------|---------|
-| INIT → WAITING_FOR_DELETE_WEBHOOK → **WAITING_FOR_NEW_WEBHOOK** → COMPLETED | INIT → WAITING_FOR_DELETE_WEBHOOK → COMPLETED / FAILED |
+#### 2c. 三处校验失败处理 — 格式修复 + KEEP_TORRENT 时间线
 
-- `WAITING_FOR_NEW_WEBHOOK` 枚举值保留在 `models.py` 中（兼容旧 DB 记录），但不再创建新的该状态任务
-- 所有移动+校验+种子删除现在要么在 `auto_process_show` 内联完成，要么在 `handle_library_deleted_webhook` 中内联完成
+| 位置 | 修复内容 |
+|------|----------|
+| Case A 首次导入 (line ~1120) | `%d`→`%s` + per-item 日志 + KEEP_TORRENT |
+| Case C 洗版完成 (line ~1614) | `%d`→`%s` + per-item 日志 + KEEP_TORRENT |
+| Case B webhook 阶段二 (line ~1985) | `%d`→`%s` + per-item 日志 + KEEP_TORRENT |
 
-### 2.2 新增 3 个模块级辅助函数
+每个 KEEP_TORRENT 日志含：Season 编号、源/目标文件数差异、重试次数 detail
 
-| 函数 | 文件位置 | 用途 |
-|------|---------|------|
-| `_get_season_stats(cd2, path, retries=3)` | `task_flow_service.py:170` | 获取 CD2 目录的递归 fileCount + totalSize，支持 2s/4s/8s 指数退避重试 |
-| `_verify_season_move(cd2, source, dest, ...)` | `task_flow_service.py:187` | 单季完整流程：pre-move stats → move → 等 2s → post-move stats → 对比 → 返回 verified |
-| `_delete_qb_torrents_by_title(qb_config_id, title)` | `task_flow_service.py:231` | 按剧名搜索 qB 种子并删除（含文件），返回删除数量 |
+### 3. CD2 已完结侧删除按钮 — `frontend/src/components/TorrentCleanup.vue`
 
-### 2.3 auto_process_show 重构为 4 条决策路径
+#### 3a. 新增函数
+- `handleDeleteOrganizedItem(file)` — 删除已完结侧单个 Season 文件夹 → `/api/cd2/delete` → 刷新
+- `handleDeleteCurrentOrganizedDirectory()` — 删除已完结侧当前剧集目录 → 确认弹窗 → 返回上一级
 
-原来的"逐季对比 → 部分移动 → 等待 webhook"被替换为明确的 4 种情况：
+#### 3b. Organized 列 Season 文件夹条目 — 新增删除按钮
+在每个目录条目的 "移至左侧" 按钮前增加红色删除图标按钮（复用 `.cd2-item-delete-btn` 样式，hover 时显示）
 
-| 情况 | 条件 | 行为 | 终点 |
-|------|------|------|------|
-| **Case A** | 媒体库目录不存在（首次导入）| 创建目录 → 逐季 move+verify → 通过则删种子 | COMPLETED（内联） |
-| **Case B** | 所有媒体库 Season 均残缺 | 删除整剧目录 → 保存 organized 候选列表 | WAITING_FOR_DELETE_WEBHOOK |
-| **Case C** | 部分完整 / 版本不同 | 删除残缺季 → 去重 → 逐季 move+verify → 通过则删种子 | COMPLETED（内联） |
-| **Case D** | 全部完整且完全相同 | 仅删除 organized 中的重复季 | 无需操作 |
-
-### 2.4 handle_library_deleted_webhook 重写
-
-Webhook handler 现在是**最终阶段**（不再是中间阶段），收到 Emby 整剧删除确认后：
-
-1. **重建目录** — 通过 `_cd2_dir_exists` + `create_folder` 重建目标剧集空目录
-2. **逐季移动+校验** — 从 context 中的 `organized_seasons_to_move` 列表遍历每个 Season：
-   - 确认源目录存在 → `_verify_season_move()` → 记录校验结果
-3. **种子清理** — 所有 Season 校验通过 → `_delete_qb_torrents_by_title()` → COMPLETED
-4. **失败处理** — 任一 Season 校验失败 → CRITICAL 日志 → 保留种子 → FAILED
-
-### 2.5 handle_library_new_webhook 标记为 DEPRECATED
-
-- 函数体保留为空操作（向后兼容），但不再执行任何逻辑
-- docstring 明确说明：种子删除已迁移至文件系统校验
-
-### 2.6 emby.py 清理
-
-- 移除 `_handle_library_new_for_task_flow` 函数
-- 移除 webhook handler 中 `if event == "library.new"` → task flow 的分支
-- 新增注释说明 library.new 不再用于种子清理
-
-### 2.7 注释中文化
-
-- 所有新增代码的注释、docstring、日志消息均已翻译为中文
-
-### 修改文件清单
-
-| 文件 | 改动 |
-|------|------|
-| `backend/services/task_flow_service.py` | **核心重构** — 约 1500 行 |
-| `backend/routers/emby.py` | 移除 library.new → task flow 注册 |
-
----
-
-## 三、避坑记录 (Failed Approaches)
-
-| 尝试 | 问题 | 教训 |
-|------|------|------|
-| 用 Write 工具替换大段代码 | Write 直接覆盖了整个文件（而非 Append），丢失了文件头部的 imports 和 helpers | **对大文件做局部替换必须用 Edit 工具**，Write 是全量覆盖。如 Edit 的 old_string 太长（500+行），应先用 Bash 写临时文件再 cat 拼接 |
-| Bash heredoc 写大段 Python 代码 | Classifier 因 deepseek-v4-pro 不可用而拒绝执行大型脚本 | 小文件用 Write 工具创建，再用简单 Bash（如 `cat`）拼接。复杂脚本用 Python 单行命令替代 |
-| 依赖 WAITING_FOR_NEW_WEBHOOK 触发种子删除 | library.new 可能延迟、不触发或多次触发，导致种子残留 | 改为文件系统强校验驱动，移动后立即验证，不依赖外部事件 |
-
----
-
-## 四、当前状态 (Current State)
-
-### 整体状态：✅ 后端编译通过，端到端测试（轧戏 Case B）已验证通过
-
-### 编译验证结果
-- ✅ Python 语法检查通过 (`py_compile`)
-- ✅ 所有关键函数可成功导入（`auto_process_show`, `handle_library_deleted_webhook`, `handle_library_new_webhook`, `_verify_season_move`, `_get_season_stats`, `_delete_qb_torrents_by_title`）
-- ✅ 无残留 `WAITING_FOR_NEW_WEBHOOK` 创建路径
-- ✅ `handle_library_new_webhook` 标记为 DEPRECATED，空操作
-- ✅ `TaskStatus` 枚举值完整：INIT, WAITING_FOR_DELETE_WEBHOOK, WAITING_FOR_NEW_WEBHOOK (保留), COMPLETED, FAILED
-
-### 端到端测试结果
-
-| 测试项 | 剧集 | 场景 | 结果 |
-|--------|------|------|------|
-| Case B 全链路 | 轧戏 (tmdb=279136) | 媒体库残缺 → 整剧删除 → Emby webhook → 重建+移动+校验+删种子 | ✅ 通过 |
-| Case A | 成何体统 (tmdb=280632) | 媒体库无此剧集 → 直接移动+校验+删种子（内联完成） | ⏳ 待测 |
-| Case C | — | 媒体库部分完整 → 逐季对比+移动+校验+删种子（内联完成） | ⏳ 待测 |
-| 校验失败场景 | — | 模拟移动后文件不完整 → 种子保留 + CRITICAL 日志 | ⏳ 待测 |
-| CD2 缓存延迟 | — | 验证 _verify_season_move 中的 2s 等待 + 3 次重试是否足够 | ⏳ 待测 |
-
-### 第八会话新增
-
-- **注释中文化**: `task_flow_service.py` 所有英文注释、docstring 已翻译为中文
-
-### 关键配置 (config.json)
-
-```json
-{
-  "cd2_media_dir": "/80003588/emby库/电视剧/",
-  "cd2_organized_dir": "/80003588/网盘整理/完结整理/电视剧/",
-  "mp_host": "http://192.168.31.173:3006"
-}
+#### 3c. Organized 导航栏 — 新增"删除目录"按钮
+在"移动整剧"按钮左边增加：
 ```
+[识别] [执行自动化洗版] [删除目录] [移动整剧]
+                         ↑ 新增
+```
+复用 `.cd2-delete-dir-btn` 样式
 
----
+## 避坑记录 (Failed Approaches)
 
-## 五、下一步 (Next Steps)
+1. **纯时间等待重试无法解决 CD2 缓存问题**
+   - 现象：逐玉 Season 1 移动后目标统计 29/40 文件，4 轮时间重试（5s/10s/15s/20s）全部返回相同的 29 文件，没有任何变化
+   - 根因：CD2 服务端 `GetFileDetailProperties` 有目录缓存，时间等待不会让缓存失效，TTL 可能很长
+   - 解决：查看 `clouddrive.proto`，发现 `FileRequest` 支持 `forceRefresh` 字段 → 在 `get_file_detail_properties` 中启用 `forceRefresh=True`，通知 CD2 绕过缓存直接查询云端
 
-### 优先级 1：剩余端到端测试
+2. **日志格式 `%d` 收到字符串导致 TypeError 崩溃**
+   - 现象：`TypeError: %d format: a real number is required, not str`，日志系统报 `--- Logging error ---`
+   - 根因：`_verify_season_move` 返回的 dict 不含 `season`/`dir_name` 键 → `fv.get("season", "?")` 返回 `"?"` 字符串 → `%d` 格式化失败
+   - 解决：① 在 `_verify_season_move` 返回 dict 中增加 `season`/`dir_name` 字段；② 格式字符串 `S%d` 改为 `S%s` 作为防御
 
-1. 用成何体统（tmdb=280632）验证 Case A 逻辑：媒体库无此剧集 → 直接移动+校验+删种子
-2. 用金关（tmdb=272476）验证 Case B 逻辑
-3. 寻找合适剧集验证 Case C 逻辑：媒体库部分完整 → 逐季对比+移动+校验+删种子
+## 当前状态 (Current State)
 
-### 优先级 2：校验失败场景测试
+- ✅ `forceRefresh` 已集成到 CD2 移动后校验流程（含重试），从根源解决缓存导致的校验失败
+- ✅ 日志格式 TypeError 已修复，三处校验失败处理均已更新
+- ✅ KEEP_TORRENT 时间线日志覆盖所有校验失败场景
+- ✅ 已完结侧 Season/剧集删除按钮已添加，前端构建通过
+- ✅ 后端语法检查通过
+- 🔲 尚未联调验证 `forceRefresh` 的实际效果（需触发一次完整洗版流程观察日志）
+- 🔲 尚未 Git 提交
 
-4. 模拟 CD2 移动后文件不完整 → 确认 CRITICAL 日志输出 + 种子保留 + task → FAILED
-5. 验证 `_get_season_stats` 的重试机制对 CD2 缓存延迟的处理
+## 下一步 (Next Steps)
 
-### 优先级 3：前端与后续功能
+1. **联调验证 forceRefresh**：
+   ```bash
+   # 启动后端
+   cd backend && python main.py
+   # 启动前端
+   cd frontend && npm run dev
+   ```
+   - 触发一次完整的自动洗版流程（Case A 或 Case C）
+   - 观察日志中移动后统计是否直接准确，或 `force_refresh` 重试是否有效
+   - 对比之前「逐玉」29/40 那种情况是否还存在
 
-6. 前端任务面板：可视化 `auto_task_flows` 表的状态流转（INIT → WAITING_FOR_DELETE_WEBHOOK → COMPLETED/FAILED）
-7. 自动对比扫描：基于 CD2 两侧目录差异自动标记待整理/可清理项目
-8. 版本选择逻辑：当前所有完整版本都移动到媒体库，后续需要版本选择/清理机制
+2. **Git 提交**：
+   ```bash
+   git add -A
+   git commit -m "fix: CD2 forceRefresh绕过缓存 + 校验日志修复 + 已完结侧删除按钮
+
+   - CD2 get_file_detail_properties 新增 forceRefresh 参数，移动后绕过缓存查询
+   - _verify_season_move 增加 4 轮 force_refresh 重试，容忍缓存延迟
+   - 修复校验失败日志 %d 格式符收到字符串导致的 TypeError
+   - 校验失败时记录 KEEP_TORRENT 时间线日志（含重试次数 detail）
+   - CD2 已完结侧新增 Season/剧集目录删除按钮"
+   ```
+
+3. **可选增强**：
+   - 如果 `forceRefresh` 仍偶尔需要重试，可考虑在移动完成后调用 `ForceExpireDirCache` RPC 主动过期父目录缓存
+   - 已完结侧增加批量删除（勾选 + 批量操作栏，类似媒体库侧）

@@ -535,6 +535,38 @@ const getStateColor = (state) => {
 const CD2_MEDIA_BASE = '/80003588/emby库/电视剧/'
 const CD2_ORGANIZED_BASE = '/80003588/网盘整理/完结整理/电视剧/'
 
+// --- CD2 区域拖拽调整大小 ---
+const cd2SectionHeight = ref(null)  // null = 自动高度, number = 固定 px
+const isDraggingCD2 = ref(false)
+let dragStartY = 0
+let dragStartHeight = 0
+
+const onDragStart = (e) => {
+  isDraggingCD2.value = true
+  dragStartY = e.clientY
+  const el = document.querySelector('.cd2-section')
+  dragStartHeight = el ? el.offsetHeight : 300
+  document.addEventListener('mousemove', onDragMove)
+  document.addEventListener('mouseup', onDragEnd)
+  document.body.style.cursor = 'row-resize'
+  document.body.style.userSelect = 'none'
+}
+
+const onDragMove = (e) => {
+  if (!isDraggingCD2.value) return
+  const dy = dragStartY - e.clientY  // 向上拖 = 增大 CD2 区域
+  const newHeight = Math.max(120, Math.min(800, dragStartHeight + dy))
+  cd2SectionHeight.value = newHeight
+}
+
+const onDragEnd = () => {
+  isDraggingCD2.value = false
+  document.removeEventListener('mousemove', onDragMove)
+  document.removeEventListener('mouseup', onDragEnd)
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+}
+
 // --- 每列独立导航状态 ---
 const cd2Loading = ref(false)
 const cd2Error = ref('')
@@ -735,6 +767,62 @@ watch(selectedCategory, () => {
   cd2OrganizedPath.value = cd2OrganizedRoot.value
   loadCD2Data()
 })
+
+// ==================== CD2 目录识别功能 ====================
+const cd2Identifying = ref(false)
+
+const identifyCD2Directory = async (side) => {
+  const path = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
+  const segments = path.replace(/\/+$/, '').split('/').filter(s => s.length > 0)
+  const dirName = segments[segments.length - 1] || ''
+
+  if (!dirName) {
+    ElMessage.warning('无法获取当前目录名')
+    return
+  }
+
+  cd2Identifying.value = true
+  orgResult.value = null
+  orgError.value = ''
+  orgCD2Status.value = ''
+
+  try {
+    const res = await axios.post('/api/organize/analyze', {
+      torrent_name: dirName,
+    })
+    orgResult.value = res.data
+
+    // 同步搜索框
+    searchQuery.value = res.data.title || ''
+
+    // 自动切换分类（保存当前 CD2 路径，防止 watcher 重置导致跳转）
+    const category = res.data.resolved_category
+    if (category && selectedCategory.value !== category) {
+      const savedMediaPath = cd2MediaPath.value
+      const savedOrganizedPath = cd2OrganizedPath.value
+      selectedCategory.value = category
+      await nextTick()
+      cd2MediaPath.value = savedMediaPath
+      cd2OrganizedPath.value = savedOrganizedPath
+      loadCD2Data()
+    }
+
+    // 构建状态信息
+    const parts = []
+    if (res.data.title) parts.push(`《${res.data.title}》`)
+    if (res.data.year) parts.push(res.data.year)
+    if (res.data.season) parts.push(`第${res.data.season}季`)
+    if (res.data.total_episodes) parts.push(`${res.data.total_episodes}集`)
+    if (res.data.tmdb_id) parts.push(`TMDB:${res.data.tmdb_id}`)
+    if (res.data.resolved_category) parts.push(`分类:${res.data.resolved_category}`)
+    orgCD2Status.value = parts.join(' · ')
+  } catch (e) {
+    orgError.value = e.response?.data?.detail || e.message || '识别失败'
+    ElMessage.error(orgError.value)
+  } finally {
+    cd2Identifying.value = false
+  }
+}
 
 // ==================== CD2 左侧（媒体库）删除功能 ====================
 const selectedCd2MediaItems = ref([])
@@ -1128,6 +1216,63 @@ const handleFallbackCancel = () => {
 }
 
 // 删除当前 CD2 媒体库目录
+// ==================== CD2 右侧（已完结）目录删除 ====================
+
+// 删除已完结侧单个 Season 文件夹
+const handleDeleteOrganizedItem = async (file) => {
+  const key = file.fullPathName || file.name
+  const confirmed = await confirmCd2Delete(1)
+  if (!confirmed) return
+
+  cd2Deleting.value = true
+  try {
+    await axios.delete('/api/cd2/delete', {
+      data: { paths: [key] },
+    })
+    ElMessage.success(`已删除: ${file.name}`)
+    loadCD2Data()
+    setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
+  } catch (e) {
+    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+  } finally {
+    cd2Deleting.value = false
+  }
+}
+
+// 删除已完结侧当前整个剧集目录
+const handleDeleteCurrentOrganizedDirectory = async () => {
+  const segments = cd2OrganizedPath.value.replace(/\/+$/, '').split('/').filter(s => s.length > 0)
+  const dirName = segments[segments.length - 1] || '当前目录'
+
+  try {
+    await ElMessageBox.confirm(
+      `确定要删除整个【${dirName}】及其内部所有文件吗？此操作不可恢复！`,
+      '删除整个目录',
+      {
+        type: 'error',
+        confirmButtonText: '确认删除',
+        cancelButtonText: '取消',
+      }
+    )
+  } catch {
+    return
+  }
+
+  cd2Deleting.value = true
+  try {
+    await axios.delete('/api/cd2/delete', {
+      data: { paths: [cd2OrganizedPath.value] },
+    })
+    ElMessage.success(`已删除: ${dirName}`)
+    goBack('organized')
+    setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
+  } catch (e) {
+    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+  } finally {
+    cd2Deleting.value = false
+  }
+}
+
 const handleDeleteCurrentCd2Directory = async () => {
   const segments = cd2MediaPath.value.replace(/\/+$/, '').split('/').filter(s => s.length > 0)
   const dirName = segments[segments.length - 1] || '当前目录'
@@ -1691,8 +1836,16 @@ onMounted(() => {
       </div>
     </div>
 
+    <!-- ==================== CD2 区域拖拽手柄 ==================== -->
+    <div
+      class="cd2-resize-handle"
+      @mousedown="onDragStart"
+    >
+      <div class="cd2-resize-handle-bar"></div>
+    </div>
+
     <!-- ==================== CD2 网盘目录浏览 (导航版) ==================== -->
-    <div class="cd2-section">
+    <div class="cd2-section" :style="cd2SectionHeight ? { height: cd2SectionHeight + 'px', flexShrink: '0', flex: 'none' } : {}">
       <!-- Section Header -->
       <div class="cd2-section-header">
         <div class="cd2-section-title">
@@ -1762,6 +1915,17 @@ onMounted(() => {
               <span v-if="cd2MediaRelative" class="cd2-crumb-rel">/{{ cd2MediaRelative }}</span>
               <span v-else class="cd2-crumb-rel is-root">/ (根目录)</span>
             </div>
+            <button
+              v-if="cd2MediaDepth >= 2"
+              class="cd2-identify-btn"
+              :disabled="cd2Identifying || orgLoading"
+              @click="identifyCD2Directory('media')"
+              title="识别当前剧集（TMDB、集数等）"
+            >
+              <el-icon v-if="cd2Identifying" :size="13" class="is-loading"><Loading /></el-icon>
+              <span v-else class="cd2-identify-icon">🔍</span>
+              识别
+            </button>
             <button
               v-if="cd2MediaDepth >= 2"
               class="cd2-delete-dir-btn"
@@ -1882,6 +2046,17 @@ onMounted(() => {
             </div>
             <button
               v-if="cd2OrganizedDepth >= 2"
+              class="cd2-identify-btn"
+              :disabled="cd2Identifying || orgLoading"
+              @click="identifyCD2Directory('organized')"
+              title="识别当前剧集（TMDB、集数等）"
+            >
+              <el-icon v-if="cd2Identifying" :size="13" class="is-loading"><Loading /></el-icon>
+              <span v-else class="cd2-identify-icon">🔍</span>
+              识别
+            </button>
+            <button
+              v-if="cd2OrganizedDepth >= 2"
               class="cd2-auto-process-btn"
               :disabled="autoProcessing || cd2Moving"
               @click="handleAutoProcessFromCD2"
@@ -1890,6 +2065,17 @@ onMounted(() => {
               <el-icon v-if="autoProcessing" :size="13" class="is-loading"><Loading /></el-icon>
               <el-icon v-else :size="13"><CircleCheck /></el-icon>
               执行自动化洗版
+            </button>
+            <button
+              v-if="cd2OrganizedDepth >= 2"
+              class="cd2-delete-dir-btn"
+              :disabled="cd2Deleting"
+              @click="handleDeleteCurrentOrganizedDirectory"
+              title="删除当前剧集目录"
+            >
+              <el-icon v-if="cd2Deleting" :size="13" class="is-loading"><Loading /></el-icon>
+              <el-icon v-else :size="13"><Delete /></el-icon>
+              删除目录
             </button>
             <button
               v-if="cd2OrganizedDepth >= 2"
@@ -1929,6 +2115,16 @@ onMounted(() => {
                 </span>
                 <span v-else-if="!file.isDirectory" class="cd2-file-size">{{ formatBytes(file.size) }}</span>
                 <span v-if="file.isDirectory" class="cd2-file-arrow">›</span>
+                <!-- 删除 Season 文件夹按钮（仅目录） -->
+                <button
+                  v-if="file.isDirectory"
+                  class="cd2-item-delete-btn"
+                  :disabled="cd2Deleting"
+                  @click.stop="handleDeleteOrganizedItem(file)"
+                  title="删除此目录"
+                >
+                  <el-icon :size="14"><Delete /></el-icon>
+                </button>
                 <!-- 移至左侧按钮（仅目录） -->
                 <button
                   v-if="file.isDirectory"
@@ -2762,14 +2958,38 @@ onMounted(() => {
 }
 
 /* ==================== CD2 网盘目录浏览 (导航版) ==================== */
+
+/* --- 拖拽手柄 --- */
+.cd2-resize-handle {
+  flex-shrink: 0;
+  height: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: row-resize;
+  margin-top: 4px;
+}
+.cd2-resize-handle:hover .cd2-resize-handle-bar,
+.cd2-resize-handle:active .cd2-resize-handle-bar {
+  background: var(--accent-blue);
+  opacity: 0.8;
+}
+.cd2-resize-handle-bar {
+  width: 50px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-color);
+  transition: background 0.2s, opacity 0.2s;
+}
+
 .cd2-section {
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin-top: 4px;
-  border-top: 1px solid var(--border-color);
-  padding-top: 14px;
+  padding-top: 4px;
+  overflow: auto;
+  min-height: 0;
 }
 
 .cd2-section-header {
@@ -2868,6 +3088,8 @@ onMounted(() => {
 
 /* split grid */
 .cd2-split {
+  flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
@@ -3024,6 +3246,38 @@ onMounted(() => {
 }
 .cd2-crumb-rel.is-root { color: var(--text-tertiary); font-weight: 400; font-style: italic; }
 
+/* 识别按钮（CD2 导航栏） */
+.cd2-identify-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: var(--radius-full);
+  background: rgba(139, 92, 246, 0.1);
+  color: var(--accent-purple, #8b5cf6);
+  font-size: 11px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.cd2-identify-btn:hover:not(:disabled) {
+  background: var(--accent-purple, #8b5cf6);
+  color: #fff;
+  box-shadow: 0 0 10px rgba(139, 92, 246, 0.4);
+}
+.cd2-identify-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.cd2-identify-icon {
+  font-size: 12px;
+  line-height: 1;
+}
+
 /* 删除当前目录按钮 */
 .cd2-delete-dir-btn {
   display: inline-flex;
@@ -3142,7 +3396,6 @@ onMounted(() => {
 .cd2-col-body {
   flex: 1;
   overflow-y: auto;
-  max-height: 280px;
   min-height: 0;
   background: var(--bg-card);
   border: 1px solid var(--border-color);
@@ -3471,10 +3724,6 @@ onMounted(() => {
   .cd2-split {
     grid-template-columns: 1fr;
     gap: 10px;
-  }
-
-  .cd2-col-body {
-    max-height: 200px;
   }
 
   .cd2-col-header {
