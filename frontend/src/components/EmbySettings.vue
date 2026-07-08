@@ -10,7 +10,11 @@ const config = reactive({
   emby_host: '',
   emby_api_key: '',
   emby_user_id: '',
-  sf_api_key: ''
+  sf_api_key: '',
+  cd2_media_dir: '',
+  cd2_organized_dir: '',
+  emby_prefix: '',
+  cd2_media_prefix: ''
 })
 
 onMounted(async () => {
@@ -84,6 +88,53 @@ const testConnection = async () => {
               <el-form-item label="Emby 用户 ID">
                 <el-input v-model="config.emby_user_id" />
                 <div class="tip">打开用户详情页，浏览器地址栏最后的 ID</div>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <!-- Divider -->
+          <div class="section-divider">
+            <span class="divider-label">CD2 网盘设置</span>
+          </div>
+
+          <el-row :gutter="40">
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="媒体库根路径（左侧）">
+                <el-input
+                  v-model="config.cd2_media_dir"
+                  placeholder="/80003588/emby库/电视剧/"
+                />
+                <div class="tip">CD2 文件概览左侧「媒体库（待整理）」的根路径</div>
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="已完结根路径（右侧）">
+                <el-input
+                  v-model="config.cd2_organized_dir"
+                  placeholder="/80003588/网盘整理/完结整理/电视剧/"
+                />
+                <div class="tip">CD2 文件概览右侧「已完结（已整理）」的根路径</div>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="40">
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="Emby 路径前缀">
+                <el-input
+                  v-model="config.emby_prefix"
+                  placeholder="/volume3/emby影院/115网盘_3588/"
+                />
+                <div class="tip">Emby 服务器上挂载的云端存储根路径（用于 CD2 ↔ Emby 路径互转）</div>
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="CD2 路径前缀">
+                <el-input
+                  v-model="config.cd2_media_prefix"
+                  placeholder="/80003588/emby库/"
+                />
+                <div class="tip">CD2 中挂载的媒体库根路径（与 Emby 前缀对应）</div>
               </el-form-item>
             </el-col>
           </el-row>

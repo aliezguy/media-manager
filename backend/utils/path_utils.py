@@ -5,10 +5,26 @@ Path utility functions for Emby ↔ CD2 conversion and webhook data extraction.
 import re
 from typing import Optional
 
-# Emby mounts the 115 cloud storage at this path
-EMBY_PREFIX = "/volume3/emby影院/115网盘_3588/"
-# CD2 sees the same cloud storage at this path
-CD2_MEDIA_PREFIX = "/80003588/emby库/"
+
+def _get_prefixes() -> tuple[str, str]:
+    """读取配置中的 Emby/CD2 路径前缀。
+
+    Returns:
+        (emby_prefix, cd2_media_prefix) — 末尾带斜杠。
+    """
+    try:
+        from config.settings import load_config
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+    emby = cfg.get("emby_prefix", "/volume3/emby影院/115网盘_3588/")
+    cd2 = cfg.get("cd2_media_prefix", "/80003588/emby库/")
+    # 确保末尾有斜杠
+    if not emby.endswith("/"):
+        emby += "/"
+    if not cd2.endswith("/"):
+        cd2 += "/"
+    return emby, cd2
 
 # Regex to extract TMDB ID from paths like "剧名(2026) {tmdb=289271}"
 _TMDB_ID_RE = re.compile(r"\{tmdb=(\d+)\}")
@@ -80,10 +96,29 @@ def emby_path_to_cd2_path(emby_path: str) -> str:
 
     /volume3/emby影院/115网盘_3588/电视剧/国产剧/2026/翘楚(2026) {tmdb=289271}
         → /80003588/emby库/电视剧/国产剧/2026/翘楚(2026) {tmdb=289271}
+
+    Prefixes are read from config (``emby_prefix`` / ``cd2_media_prefix``),
+    with the above values as fallback defaults.
     """
-    if emby_path.startswith(EMBY_PREFIX):
-        return emby_path.replace(EMBY_PREFIX, CD2_MEDIA_PREFIX, 1)
+    emby_prefix, cd2_prefix = _get_prefixes()
+    if emby_path.startswith(emby_prefix):
+        return emby_path.replace(emby_prefix, cd2_prefix, 1)
     return emby_path
+
+
+def cd2_path_to_emby_path(cd2_path: str) -> str:
+    """Convert a CD2 media library path to the corresponding Emby path.
+
+    /80003588/emby库/电视剧/国产剧/2026/翘楚(2026) {tmdb=289271}
+        → /volume3/emby影院/115网盘_3588/电视剧/国产剧/2026/翘楚(2026) {tmdb=289271}
+
+    Prefixes are read from config (``emby_prefix`` / ``cd2_media_prefix``),
+    with the above values as fallback defaults.
+    """
+    emby_prefix, cd2_prefix = _get_prefixes()
+    if cd2_path.startswith(cd2_prefix):
+        return cd2_path.replace(cd2_prefix, emby_prefix, 1)
+    return cd2_path
 
 
 def extract_season_episodes_from_description(description: str) -> Optional[dict]:

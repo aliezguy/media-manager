@@ -133,11 +133,31 @@ async def delete_cd2_items(
                 detail=f"CD2 删除失败: {result.get('errorMessage', '未知错误')}",
             )
 
-        deleted_count = len(result.get("resultFilePaths", []))
+        deleted_paths = result.get("resultFilePaths", [])
+        deleted_count = len(deleted_paths)
         logger.info(
             "CD2 delete completed — %d items deleted (permanent=%s)",
             deleted_count, permanent,
         )
+
+        # CD2 删除成功后，启动延迟清理线程（3 分钟后尝试清理 Emby 残留僵尸记录）
+        # 延迟 3 分钟是为了让 symedia 的 webhook 通知流程有机会正常完成；
+        # 如果 symedia 已成功清理，此处的 search 将返回空（无需操作）。
+        if deleted_paths:
+            import threading
+            import time as _time
+            from services.emby_service import cleanup_emby_zombie
+
+            def _delayed_cleanup():
+                _time.sleep(180)  # 3 分钟
+                for p in deleted_paths:
+                    try:
+                        cleanup_emby_zombie(p)
+                    except Exception:
+                        pass  # 清理失败不抛异常
+
+            threading.Thread(target=_delayed_cleanup, daemon=True).start()
+            logger.info("Emby zombie cleanup scheduled in 3 min for %d path(s)", deleted_count)
 
         return {
             "success": True,
@@ -358,4 +378,90 @@ async def move_show_seasons(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.exception("Unexpected error in move_show_seasons")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# 残缺季雷达
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel
+
+
+class CheckIncompleteRequest(BaseModel):
+    path: str = Body(..., description="CD2 目录路径，例如 /80003588/emby库/电视剧/国产剧/2026/")
+
+
+@router.post("/directories/check-incomplete")
+async def check_incomplete_seasons(req: CheckIncompleteRequest):
+    """扫描指定目录下所有剧集，检测残缺 Season 文件夹。
+
+    **Request Body**::
+
+        { "path": "/80003588/emby库/电视剧/国产剧/2026/" }
+
+    **Response**::
+
+        {
+          "total_shows_scanned": 15,
+          "total_seasons_checked": 42,
+          "incomplete_seasons": [
+            {
+              "show_name": "某剧名称 (2026)",
+              "tmdb_id": 12345,
+              "season_num": 1,
+              "folder_name": "Season 1 - 4K版本",
+              "folder_path": "/.../Season 1 - 4K版本",
+              "actual_count": 8,
+              "expected_count": 10
+            }
+          ],
+          "empty_folders": [...],
+          "unrecognized_folders": ["未命名乱码文件夹"]
+        }
+    """
+    from services.checker_service import check_incomplete_seasons as do_check
+
+    try:
+        result = do_check(base_path=req.path)
+        return result
+    except Exception as e:
+        logger.exception("残缺季核查失败: path=%s", req.path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CheckSingleShowRequest(BaseModel):
+    path: str = Body(..., description="单个剧集目录路径，例如 /80003588/emby库/电视剧/国产剧/2026/主角(2026) {tmdb=284110}/")
+
+
+@router.post("/directories/check-show-incomplete")
+async def check_single_show_incomplete(req: CheckSingleShowRequest):
+    """检查单个剧集目录下所有 Season 的文件完整性。
+
+    与 ``POST /directories/check-incomplete``（批量扫描整个年份目录）不同，
+    此端点仅扫描一个剧集目录，适用于在列表中快速核查某部剧。
+
+    **Request Body**::
+
+        { "path": "/80003588/emby库/电视剧/国产剧/2026/主角(2026) {tmdb=284110}/" }
+
+    **Response**::
+
+        {
+          "show_name": "主角(2026) {tmdb=284110}",
+          "show_path": "/80003588/.../",
+          "tmdb_id": 284110,
+          "total_seasons_checked": 3,
+          "incomplete_seasons": [...],
+          "empty_folders": [...],
+          "complete_seasons": [...]
+        }
+    """
+    from services.checker_service import check_single_show as do_check_single
+
+    try:
+        result = do_check_single(show_path=req.path)
+        return result
+    except Exception as e:
+        logger.exception("单剧残缺季核查失败: path=%s", req.path)
         raise HTTPException(status_code=500, detail=str(e))

@@ -220,7 +220,12 @@ def parse_torrent_name(name: str) -> dict:
 # TMDB helpers
 # ---------------------------------------------------------------------------
 
-TMDB_BASE = "https://api.themoviedb.org/3"
+import time as _time
+
+# 从配置读取 TMDB base URL，默认 api.tmdb.org（国内访问相对稳定）
+def _tmdb_base() -> str:
+    cfg = load_config()
+    return cfg.get("tmdb_base_url", "") or "https://api.tmdb.org/3"
 
 
 def _tmdb_key() -> str:
@@ -229,6 +234,34 @@ def _tmdb_key() -> str:
     if not key:
         raise RuntimeError("tmdb_api_key not configured")
     return key
+
+
+def _tmdb_get(url: str, params: dict, timeout: int = 10, max_retries: int = 2) -> "requests.Response | None":
+    """TMDB HTTP GET with retry + exponential backoff.
+
+    应对国内网络环境下间歇性的 SSL/连接错误。
+    - 第 1 次重试：等待 1.5s
+    - 第 2 次重试：等待 3s
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            return resp
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout, requests.exceptions.ChunkedEncodingError) as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = 1.5 * (2 ** attempt)
+                logger.warning("TMDB 请求失败 (attempt %d/%d)，%ss 后重试: %s",
+                               attempt + 1, max_retries + 1, wait, e)
+                _time.sleep(wait)
+        except Exception as e:
+            last_error = e
+            break  # 非网络错误不重试
+
+    logger.error("TMDB 请求最终失败: %s", last_error)
+    return None
 
 
 def search_tmdb_tv(title: str, year: Optional[str] = None) -> Optional[dict]:
@@ -242,9 +275,10 @@ def search_tmdb_tv(title: str, year: Optional[str] = None) -> Optional[dict]:
         params["first_air_date_year"] = year
 
     try:
-        resp = requests.get(f"{TMDB_BASE}/search/tv", params=params, timeout=10)
-        if resp.status_code != 200:
-            logger.warning("TMDB search failed: %s", resp.status_code)
+        resp = _tmdb_get(f"{_tmdb_base()}/search/tv", params=params)
+        if resp is None or resp.status_code != 200:
+            if resp:
+                logger.warning("TMDB search failed: %s", resp.status_code)
             return None
         data = resp.json()
         results = data.get("results", [])
@@ -269,13 +303,14 @@ def get_tv_details(tmdb_id: int) -> Optional[dict]:
     These fields are required by ``determine_category``.
     """
     key = _tmdb_key()
-    url = f"{TMDB_BASE}/tv/{tmdb_id}"
+    url = f"{_tmdb_base()}/tv/{tmdb_id}"
     params = {"api_key": key, "language": "zh-CN"}
 
     try:
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code != 200:
-            logger.warning("TMDB tv/%d failed: %s", tmdb_id, resp.status_code)
+        resp = _tmdb_get(url, params=params)
+        if resp is None or resp.status_code != 200:
+            if resp:
+                logger.warning("TMDB tv/%d failed: %s", tmdb_id, resp.status_code)
             return None
         return resp.json()
     except Exception as e:
@@ -295,13 +330,14 @@ def resolve_category(tmdb_id: int) -> Optional[str]:
 def get_tv_season_info(tmdb_id: int, season: int = 1) -> Optional[dict]:
     """Fetch season details from TMDB, including ``episode_count``."""
     key = _tmdb_key()
-    url = f"{TMDB_BASE}/tv/{tmdb_id}/season/{season}"
+    url = f"{_tmdb_base()}/tv/{tmdb_id}/season/{season}"
     params = {"api_key": key, "language": "zh-CN"}
 
     try:
-        resp = requests.get(url, params=params, timeout=10)
-        if resp.status_code != 200:
-            logger.warning("TMDB season %d for tv/%d failed: %s", season, tmdb_id, resp.status_code)
+        resp = _tmdb_get(url, params=params)
+        if resp is None or resp.status_code != 200:
+            if resp:
+                logger.warning("TMDB season %d for tv/%d failed: %s", season, tmdb_id, resp.status_code)
             return None
         data = resp.json()
         # Use `or []` to guarantee len() always receives a list,

@@ -25,13 +25,19 @@ const fetchInstances = async () => {
 const searchQuery = ref('')
 const selectedCategory = ref('')
 
+// 预设分类（从后端 category.yaml 获取）
+const presetCategories = ref([])
+
 // 分类数据 — 从 qB 实例动态获取
 const leftCategories = ref([])
 const rightCategories = ref([])
 
-// 分类选项（合并左右实例的分类 + 全部分类）
+// CD2 独立分类（与顶部 torrent 筛选解耦）
+const cd2Category = ref('国产剧')
+
+// 分类选项（预设 + qB 实例合并）
 const categoryOptions = computed(() => {
-  const all = new Set([...leftCategories.value, ...rightCategories.value])
+  const all = new Set([...presetCategories.value, ...leftCategories.value, ...rightCategories.value])
   return [
     { label: '全部分类', value: '' },
     ...[...all].sort().map(cat => ({ label: cat, value: cat }))
@@ -531,9 +537,9 @@ const getStateColor = (state) => {
 }
 
 // ==================== CD2 网盘目录浏览 (导航版) ====================
-// 基础路径（固定常量，末尾带斜杠）
-const CD2_MEDIA_BASE = '/80003588/emby库/电视剧/'
-const CD2_ORGANIZED_BASE = '/80003588/网盘整理/完结整理/电视剧/'
+// 基础路径（从配置中读取，带 fallback 默认值）
+const CD2_MEDIA_BASE = ref('/80003588/emby库/电视剧/')
+const CD2_ORGANIZED_BASE = ref('/80003588/网盘整理/完结整理/电视剧/')
 
 // --- CD2 区域拖拽调整大小 ---
 const cd2SectionHeight = ref(null)  // null = 自动高度, number = 固定 px
@@ -580,16 +586,221 @@ const cd2MediaYearInput = ref('')   // 年份快捷跳转输入
 const cd2OrganizedPath = ref('')
 const cd2OrganizedFiles = ref([])
 
-// 计算各列的分类根路径（基础路径 + qb分类 + /）
-// 当全局分类筛选为"全部分类"时，强制默认展示 '国产剧' 下的年份文件夹
+// --- 残缺季雷达（内联标注版）---
+// seasonCheckData: { [showPath]: { status: 'complete'|'incomplete', incompleteCount, totalSeasons, seasons: { [seasonPath]: { actual, expected } } } }
+const seasonCheckData = ref({})
+const seasonCheckLoading = ref(false)
+const seasonCheckError = ref('')
+
+// 从扫描结果构建内联标注数据
+const buildSeasonCheckMap = (result, currentPath) => {
+  const map = {}
+  // result.incomplete_seasons: [{ show_name, tmdb_id, season_num, folder_name, folder_path, actual_count, expected_count }]
+  for (const item of (result.incomplete_seasons || [])) {
+    const showPath = (currentPath + item.show_name).replace(/\/+$/, '')
+    if (!map[showPath]) {
+      map[showPath] = { status: 'incomplete', incompleteCount: 0, totalSeasons: 0, seasons: {} }
+    }
+    map[showPath].incompleteCount++
+    map[showPath].seasons[item.folder_path] = {
+      actual: item.actual_count,
+      expected: item.expected_count,
+      season_num: item.season_num,
+      folder_name: item.folder_name,
+    }
+  }
+  // Mark empty folders too (from empty_folders)
+  for (const item of (result.empty_folders || [])) {
+    const showPath = (currentPath + item.show_name).replace(/\/+$/, '')
+    if (!map[showPath]) {
+      map[showPath] = { status: 'incomplete', incompleteCount: 0, totalSeasons: 0, seasons: {} }
+    }
+    map[showPath].seasons[item.folder_path] = {
+      actual: 0,
+      expected: item.expected_count,
+      season_num: item.season_num,
+      folder_name: item.folder_name,
+    }
+  }
+  // Mark complete shows: any show dir listed that's not in the map is complete
+  // We'll check this at render time — if a show dir has no entry in map, it might be complete or not scanned
+  // For now, we also store a "scanned" flag
+  return map
+}
+
+const runSeasonCheck = async (side = 'media') => {
+  const scanPath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
+  if (!scanPath) {
+    ElMessage.warning('请先导航到年份目录（如 2026/）')
+    return
+  }
+  seasonCheckLoading.value = true
+  seasonCheckError.value = ''
+  seasonCheckData.value = {}
+  try {
+    const res = await axios.post('/api/directories/check-incomplete', { path: scanPath })
+    const data = res.data
+    if (data.error) {
+      seasonCheckError.value = data.error
+      return
+    }
+    // 构建两份标注数据：左侧（media）和右侧（organized）
+    // 用当前扫描的路径构建 map
+    const map = buildSeasonCheckMap(data, scanPath)
+    seasonCheckData.value = map
+    const incompleteCount = data.incomplete_seasons?.length || 0
+    const emptyCount = data.empty_folders?.length || 0
+    if (incompleteCount === 0 && emptyCount === 0) {
+      ElMessage.success(`扫描完成：${data.total_shows_scanned} 部剧集，所有 Season 文件完整 🎉`)
+    } else {
+      ElMessage.warning(
+        `发现 ${incompleteCount} 个残缺季 + ${emptyCount} 个空目录（共扫描 ${data.total_shows_scanned} 部剧集）`
+      )
+    }
+  } catch (e) {
+    seasonCheckError.value = e.response?.data?.detail || e.message
+    ElMessage.error('残缺季核查失败: ' + seasonCheckError.value)
+  } finally {
+    seasonCheckLoading.value = false
+  }
+}
+
+// 单剧集核查状态（记录正在核查中的 show path）
+const checkingShows = ref(new Set())
+
+// 单剧集残缺季核查
+const runSingleShowCheck = async (side, file) => {
+  if (!file.isDirectory) return
+  const basePath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
+  const showPath = (basePath + file.name).replace(/\/+$/, '') + '/'
+
+  // 标记为核查中
+  const newSet = new Set(checkingShows.value)
+  newSet.add(showPath)
+  checkingShows.value = newSet
+
+  try {
+    const res = await axios.post('/api/directories/check-show-incomplete', { path: showPath })
+    const data = res.data
+
+    if (data.error) {
+      ElMessage.error(`核查失败: ${data.error}`)
+      return
+    }
+
+    // 将单剧核查结果合并到 seasonCheckData
+    const map = { ...seasonCheckData.value }
+    const incompleteCount = (data.incomplete_seasons?.length || 0) + (data.empty_folders?.length || 0)
+    const totalSeasons = data.total_seasons_checked || 0
+
+    const entry = {
+      status: incompleteCount > 0 ? 'incomplete' : 'complete',
+      incompleteCount,
+      totalSeasons,
+      seasons: {},
+    }
+
+    // 合并所有 season 信息
+    for (const item of (data.incomplete_seasons || [])) {
+      entry.seasons[item.folder_path] = {
+        actual: item.actual_count,
+        expected: item.expected_count,
+        season_num: item.season_num,
+        folder_name: item.folder_name,
+      }
+    }
+    for (const item of (data.empty_folders || [])) {
+      entry.seasons[item.folder_path] = {
+        actual: 0,
+        expected: item.expected_count,
+        season_num: item.season_num,
+        folder_name: item.folder_name,
+      }
+    }
+    for (const item of (data.complete_seasons || [])) {
+      entry.seasons[item.folder_path] = {
+        actual: item.actual_count,
+        expected: item.expected_count,
+        season_num: item.season_num,
+        folder_name: item.folder_name,
+      }
+    }
+
+    map[showPath.replace(/\/+$/, '')] = entry
+    seasonCheckData.value = map
+
+    if (incompleteCount === 0) {
+      ElMessage.success(`「${file.name}」所有 ${totalSeasons} 个 Season 文件完整 ✅`)
+    } else {
+      ElMessage.warning(`「${file.name}」: ${incompleteCount} 个残缺季 / 空目录（共 ${totalSeasons} 个 Season）`)
+    }
+  } catch (e) {
+    ElMessage.error(`核查失败: ${e.response?.data?.detail || e.message}`)
+  } finally {
+    const newSet2 = new Set(checkingShows.value)
+    newSet2.delete(showPath)
+    checkingShows.value = newSet2
+  }
+}
+
+// 清除当前标注
+const clearSeasonCheck = () => {
+  seasonCheckData.value = {}
+  seasonCheckError.value = ''
+}
+
+// 获取单个文件/目录的内联标注信息（用于列表渲染）
+const getShowCheckStatus = (file) => {
+  if (!file.isDirectory) return null
+  const key = (cd2MediaPath.value + file.name).replace(/\/+$/, '')
+  const entry = seasonCheckData.value[key]
+  if (!entry) return null
+  return entry
+}
+
+const getOrganizedShowCheckStatus = (file) => {
+  if (!file.isDirectory) return null
+  const key = (cd2OrganizedPath.value + file.name).replace(/\/+$/, '')
+  const entry = seasonCheckData.value[key]
+  if (!entry) return null
+  return entry
+}
+
+// 检查某个 show 是否正在被单剧核查
+const isShowChecking = (side, file) => {
+  if (!file.isDirectory) return false
+  const basePath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
+  const showPath = (basePath + file.name).replace(/\/+$/, '') + '/'
+  return checkingShows.value.has(showPath)
+}
+
+const getSeasonCheckDetail = (file, side) => {
+  if (!file.isDirectory) return null
+  const basePath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
+  // 构建 season 文件夹的完整路径
+  const seasonPath = (basePath + file.name).replace(/\/+$/, '')
+  // 遍历所有 show 的 seasons 查找匹配
+  for (const showEntry of Object.values(seasonCheckData.value)) {
+    if (showEntry.seasons && showEntry.seasons[seasonPath]) {
+      return showEntry.seasons[seasonPath]
+    }
+  }
+  return null
+}
+
+// 计算当前目录下有多少个 show 被标记
+const checkedShowCount = computed(() => Object.keys(seasonCheckData.value).length)
+
+// 计算各列的分类根路径（基础路径 + CD2分类 + /）
+// CD2 使用独立的 cd2Category，与顶部 torrent 筛选解耦
 const cd2MediaRoot = computed(() => {
-  const cat = selectedCategory.value || '国产剧'
-  return CD2_MEDIA_BASE + cat + '/'
+  const cat = cd2Category.value || '国产剧'
+  return CD2_MEDIA_BASE.value + cat + '/'
 })
 
 const cd2OrganizedRoot = computed(() => {
-  const cat = selectedCategory.value || '国产剧'
-  return CD2_ORGANIZED_BASE + cat + '/'
+  const cat = cd2Category.value || '国产剧'
+  return CD2_ORGANIZED_BASE.value + cat + '/'
 })
 
 // 从完整路径中剥离根路径，得到可读的相对路径
@@ -754,7 +965,7 @@ const goBack = (side) => {
 
 // --- 年份快捷跳转（媒体库） ---
 const jumpToYear = () => {
-  const year = cd2MediaYearInput.value.trim()
+  const year = String(cd2MediaYearInput.value || '').trim()
   if (!year) return
   cd2MediaPath.value = cd2MediaRoot.value + year + '/'
   cd2MediaYearInput.value = ''
@@ -762,7 +973,15 @@ const jumpToYear = () => {
 }
 
 // --- 分类变更时重置导航到新根路径 ---
-watch(selectedCategory, () => {
+// 顶部 torrent 筛选分类变更 → 同步到 CD2 分类
+watch(selectedCategory, (newCat) => {
+  if (newCat) {
+    cd2Category.value = newCat
+  }
+})
+
+// CD2 分类变更 → 重置导航并重新加载
+watch(cd2Category, () => {
   cd2MediaPath.value = cd2MediaRoot.value
   cd2OrganizedPath.value = cd2OrganizedRoot.value
   loadCD2Data()
@@ -1388,8 +1607,8 @@ const startOrganize = async (torrent) => {
     }
 
     // Construct year-level paths for both sides
-    const mediaYearPath = CD2_MEDIA_BASE + cat + '/' + year + '/'
-    const organizedYearPath = CD2_ORGANIZED_BASE + cat + '/' + year + '/'
+    const mediaYearPath = CD2_MEDIA_BASE.value + cat + '/' + year + '/'
+    const organizedYearPath = CD2_ORGANIZED_BASE.value + cat + '/' + year + '/'
 
     // Jump both sides in parallel
     const [mediaResult, organizedResult] = await Promise.all([
@@ -1428,7 +1647,39 @@ const clearOrganize = () => {
 }
 
 // --- 初始化 ---
-onMounted(() => {
+onMounted(async () => {
+  // 并行加载：配置、分类、实例
+  await Promise.all([
+    // 从配置 API 加载 CD2 根路径
+    (async () => {
+      try {
+        const configRes = await axios.get('/api/config')
+        if (configRes.data?.cd2_media_dir) {
+          CD2_MEDIA_BASE.value = configRes.data.cd2_media_dir
+        }
+        if (configRes.data?.cd2_organized_dir) {
+          CD2_ORGANIZED_BASE.value = configRes.data.cd2_organized_dir
+        }
+      } catch (e) {
+        console.warn('[CD2] 加载配置失败，使用默认路径', e)
+      }
+    })(),
+    // 从后端 category.yaml 加载预设分类
+    (async () => {
+      try {
+        const catRes = await axios.get('/api/categories')
+        if (catRes.data?.all?.length) {
+          presetCategories.value = catRes.data.all
+          // 如果当前 cd2Category 不在预设列表中，使用第一个
+          if (!presetCategories.value.includes(cd2Category.value)) {
+            cd2Category.value = presetCategories.value[0]
+          }
+        }
+      } catch (e) {
+        console.warn('[CD2] 加载分类列表失败', e)
+      }
+    })(),
+  ])
   fetchInstances()
   cd2MediaPath.value = cd2MediaRoot.value
   cd2OrganizedPath.value = cd2OrganizedRoot.value
@@ -1852,8 +2103,19 @@ onMounted(() => {
           <span class="col-dot dot-cd2"></span>
           <span>CD2 网盘文件概览</span>
           <span class="cd2-cat-sep">›</span>
-            <span class="cd2-cat-tag">{{ selectedCategory || '国产剧' }}</span>
-            <span v-if="!selectedCategory" class="cd2-default-hint">（默认）</span>
+          <el-select
+            v-model="cd2Category"
+            class="cd2-cat-select"
+            size="small"
+            :teleported="false"
+          >
+            <el-option
+              v-for="cat in presetCategories"
+              :key="cat"
+              :label="cat"
+              :value="cat"
+            />
+          </el-select>
           <span v-if="!cd2Loading && !cd2Error" class="col-count">
             {{ cd2MediaFiles.length + cd2OrganizedFiles.length }} 项
           </span>
@@ -1889,13 +2151,15 @@ onMounted(() => {
             <div class="cd2-year-jump" v-if="isAtMediaRoot">
               <input
                 v-model="cd2MediaYearInput"
-                type="number"
+                type="text"
+                inputmode="numeric"
+                pattern="[0-9]*"
                 placeholder="年份..."
                 class="cd2-year-input"
                 @keyup.enter="jumpToYear"
                 @keydown.escape="cd2MediaYearInput = ''"
               />
-              <button class="cd2-year-btn" :disabled="!cd2MediaYearInput.trim()" @click="jumpToYear">跳转</button>
+              <button class="cd2-year-btn" :disabled="!String(cd2MediaYearInput).trim()" @click="jumpToYear">跳转</button>
             </div>
             <span class="cd2-col-badge media-badge">{{ cd2MediaFiles.length }} 项</span>
           </div>
@@ -1915,6 +2179,26 @@ onMounted(() => {
               <span v-if="cd2MediaRelative" class="cd2-crumb-rel">/{{ cd2MediaRelative }}</span>
               <span v-else class="cd2-crumb-rel is-root">/ (根目录)</span>
             </div>
+            <!-- 残缺季核查（仅年份层级 depth=1） -->
+            <button
+              v-if="cd2MediaDepth === 1"
+              class="cd2-season-check-btn"
+              :disabled="seasonCheckLoading || cd2Loading"
+              @click="runSeasonCheck('media')"
+              title="扫描当前年份目录下所有剧集，找出集数残缺的 Season 文件夹"
+            >
+              <el-icon v-if="seasonCheckLoading" :size="13" class="is-loading"><Loading /></el-icon>
+              <span v-else class="cd2-identify-icon">🔍</span>
+              {{ seasonCheckLoading ? '核查中...' : '核查残缺季' }}
+            </button>
+            <button
+              v-if="checkedShowCount > 0 && cd2MediaDepth >= 1"
+              class="cd2-clear-check-btn"
+              @click="clearSeasonCheck"
+              title="清除核查标注"
+            >
+              ✕ 清除标注
+            </button>
             <button
               v-if="cd2MediaDepth >= 2"
               class="cd2-identify-btn"
@@ -1981,7 +2265,9 @@ onMounted(() => {
                   :class="{
                     'is-dir': file.isDirectory,
                     'is-clickable': file.isDirectory,
-                    'is-checked': selectedCd2MediaItems.includes(file.fullPathName || file.name)
+                    'is-checked': selectedCd2MediaItems.includes(file.fullPathName || file.name),
+                    'sc-show-incomplete': file.isDirectory && getShowCheckStatus(file)?.status === 'incomplete',
+                    'sc-show-complete': file.isDirectory && getShowCheckStatus(file)?.status === 'complete',
                   }"
                 >
                   <el-checkbox
@@ -1999,8 +2285,39 @@ onMounted(() => {
                     :class="{ 'is-folder': file.isDirectory }"
                     @click="file.isDirectory && enterFolder('media', file.name)"
                   >{{ file.name }}</span>
-                  <!-- 目录：显示文件数和大小（年份文件夹强制屏蔽） -->
-                  <span v-if="file.isDirectory && file.fileCount != null && !isYearFolder(file.name)" class="cd2-dir-stats">
+                  <!-- 残缺季标注：剧集级别（depth=1 年份层级） -->
+                  <span
+                    v-if="file.isDirectory && cd2MediaDepth === 1 && getShowCheckStatus(file)"
+                    class="sc-inline-badge"
+                    :class="getShowCheckStatus(file).status === 'incomplete' ? 'sc-badge-warn' : 'sc-badge-ok'"
+                  >
+                    {{ getShowCheckStatus(file).status === 'incomplete' ? `⚠️ 缺 ${getShowCheckStatus(file).incompleteCount} 季` : '✅ 完整' }}
+                  </span>
+                  <!-- 单剧核查按钮（depth=1 剧集层级） -->
+                  <button
+                    v-if="file.isDirectory && cd2MediaDepth === 1 && !isYearFolder(file.name)"
+                    class="cd2-check-one-btn"
+                    :disabled="isShowChecking('media', file) || cd2Loading"
+                    @click.stop="runSingleShowCheck('media', file)"
+                    :title="`核查「${file.name}」的 Season 完整性`"
+                  >
+                    <el-icon v-if="isShowChecking('media', file)" :size="11" class="is-loading"><Loading /></el-icon>
+                    <span v-else>🔍</span>
+                  </button>
+                  <!-- 残缺季标注：Season 级别（depth=2 剧集内部） -->
+                  <span
+                    v-if="file.isDirectory && cd2MediaDepth >= 2 && getSeasonCheckDetail(file, 'media')"
+                    class="sc-inline-badge sc-badge-season"
+                  >
+                    <span class="sc-season-nums">
+                      <span class="sc-season-actual">{{ getSeasonCheckDetail(file, 'media').actual }}</span>
+                      <span class="sc-season-sep">/</span>
+                      <span class="sc-season-expected">{{ getSeasonCheckDetail(file, 'media').expected }}</span>
+                    </span>
+                    <span class="sc-season-missing">缺 {{ getSeasonCheckDetail(file, 'media').expected - getSeasonCheckDetail(file, 'media').actual }} 集</span>
+                  </span>
+                  <!-- 目录：显示文件数和大小（年份文件夹强制屏蔽，有标注时隐藏原始 stats） -->
+                  <span v-if="file.isDirectory && file.fileCount != null && !isYearFolder(file.name) && !getSeasonCheckDetail(file, 'media')" class="cd2-dir-stats">
                     {{ file.fileCount }} 文件
                     <template v-if="file.totalSize"> · {{ formatBytes(file.totalSize) }}</template>
                   </span>
@@ -2044,6 +2361,26 @@ onMounted(() => {
               <span v-if="cd2OrganizedRelative" class="cd2-crumb-rel">/{{ cd2OrganizedRelative }}</span>
               <span v-else class="cd2-crumb-rel is-root">/ (根目录)</span>
             </div>
+            <!-- 残缺季核查（仅年份层级 depth=1） -->
+            <button
+              v-if="cd2OrganizedDepth === 1"
+              class="cd2-season-check-btn"
+              :disabled="seasonCheckLoading || cd2Loading"
+              @click="runSeasonCheck('organized')"
+              title="扫描当前年份目录下所有剧集，找出集数残缺的 Season 文件夹"
+            >
+              <el-icon v-if="seasonCheckLoading" :size="13" class="is-loading"><Loading /></el-icon>
+              <span v-else class="cd2-identify-icon">🔍</span>
+              {{ seasonCheckLoading ? '核查中...' : '核查残缺季' }}
+            </button>
+            <button
+              v-if="checkedShowCount > 0 && cd2OrganizedDepth >= 1"
+              class="cd2-clear-check-btn"
+              @click="clearSeasonCheck"
+              title="清除核查标注"
+            >
+              ✕ 清除标注
+            </button>
             <button
               v-if="cd2OrganizedDepth >= 2"
               class="cd2-identify-btn"
@@ -2103,13 +2440,49 @@ onMounted(() => {
                 v-for="file in displayedOrganizedFiles"
                 :key="file.fullPathName || file.name"
                 class="cd2-file-item"
-                :class="{ 'is-dir': file.isDirectory, 'is-clickable': file.isDirectory }"
+                :class="{
+                  'is-dir': file.isDirectory,
+                  'is-clickable': file.isDirectory,
+                  'sc-show-incomplete': file.isDirectory && getOrganizedShowCheckStatus(file)?.status === 'incomplete',
+                  'sc-show-complete': file.isDirectory && getOrganizedShowCheckStatus(file)?.status === 'complete',
+                }"
                 @click="file.isDirectory && enterFolder('organized', file.name)"
               >
                 <span class="cd2-file-icon">{{ file.isDirectory ? '📁' : '📄' }}</span>
                 <span class="cd2-file-name">{{ file.name }}</span>
-                <!-- 目录：显示文件数和大小（年份文件夹强制屏蔽） -->
-                <span v-if="file.isDirectory && file.fileCount != null && !isYearFolder(file.name)" class="cd2-dir-stats">
+                <!-- 残缺季标注：剧集级别 -->
+                <span
+                  v-if="file.isDirectory && cd2OrganizedDepth === 1 && getOrganizedShowCheckStatus(file)"
+                  class="sc-inline-badge"
+                  :class="getOrganizedShowCheckStatus(file).status === 'incomplete' ? 'sc-badge-warn' : 'sc-badge-ok'"
+                >
+                  {{ getOrganizedShowCheckStatus(file).status === 'incomplete' ? `⚠️ 缺 ${getOrganizedShowCheckStatus(file).incompleteCount} 季` : '✅ 完整' }}
+                </span>
+                <!-- 单剧核查按钮（depth=1 剧集层级） -->
+                <button
+                  v-if="file.isDirectory && cd2OrganizedDepth === 1 && !isYearFolder(file.name)"
+                  class="cd2-check-one-btn"
+                  :disabled="isShowChecking('organized', file) || cd2Loading"
+                  @click.stop="runSingleShowCheck('organized', file)"
+                  :title="`核查「${file.name}」的 Season 完整性`"
+                >
+                  <el-icon v-if="isShowChecking('organized', file)" :size="11" class="is-loading"><Loading /></el-icon>
+                  <span v-else>🔍</span>
+                </button>
+                <!-- 残缺季标注：Season 级别 -->
+                <span
+                  v-if="file.isDirectory && cd2OrganizedDepth >= 2 && getSeasonCheckDetail(file, 'organized')"
+                  class="sc-inline-badge sc-badge-season"
+                >
+                  <span class="sc-season-nums">
+                    <span class="sc-season-actual">{{ getSeasonCheckDetail(file, 'organized').actual }}</span>
+                    <span class="sc-season-sep">/</span>
+                    <span class="sc-season-expected">{{ getSeasonCheckDetail(file, 'organized').expected }}</span>
+                  </span>
+                  <span class="sc-season-missing">缺 {{ getSeasonCheckDetail(file, 'organized').expected - getSeasonCheckDetail(file, 'organized').actual }} 集</span>
+                </span>
+                <!-- 目录：显示文件数和大小（有标注时隐藏原始 stats） -->
+                <span v-if="file.isDirectory && file.fileCount != null && !isYearFolder(file.name) && !getSeasonCheckDetail(file, 'organized')" class="cd2-dir-stats">
                   {{ file.fileCount }} 文件
                   <template v-if="file.totalSize"> · {{ formatBytes(file.totalSize) }}</template>
                 </span>
@@ -3018,13 +3391,8 @@ onMounted(() => {
   font-weight: 400;
 }
 
-.cd2-cat-tag {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--accent-purple, #8b5cf6);
-  background: rgba(139, 92, 246, 0.12);
-  padding: 2px 10px;
-  border-radius: var(--radius-full);
+.cd2-cat-select {
+  width: 100px;
 }
 
 .cd2-header-actions {
@@ -3033,13 +3401,6 @@ onMounted(() => {
   gap: 10px;
 }
 
-
-.cd2-default-hint {
-  font-size: 10px;
-  color: var(--text-tertiary);
-  font-weight: 400;
-  font-style: italic;
-}
 
 .cd2-refresh-btn {
   display: inline-flex;
@@ -3609,6 +3970,37 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
+/* 单剧核查按钮（剧集行内） */
+.cd2-check-one-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  opacity: 0;
+  font-size: 12px;
+  padding: 0;
+}
+.cd2-file-item:hover .cd2-check-one-btn {
+  opacity: 1;
+}
+.cd2-check-one-btn:hover:not(:disabled) {
+  background: var(--accent-blue-soft, rgba(59, 130, 246, 0.12));
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+.cd2-check-one-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
 /* ==================== Move Fallback Dialog ==================== */
 .fallback-dialog-body {
   text-align: center;
@@ -3745,5 +4137,109 @@ onMounted(() => {
   .cd2-crumb {
     font-size: 10px;
   }
+}
+
+/* ==================== 残缺季核查按钮（nav bar 内） ==================== */
+.cd2-season-check-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid var(--accent-orange);
+  border-radius: var(--radius-sm);
+  background: rgba(245, 158, 11, 0.08);
+  color: var(--accent-orange);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+  margin-left: auto;
+}
+.cd2-season-check-btn:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: var(--accent-orange);
+}
+.cd2-season-check-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cd2-clear-check-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.cd2-clear-check-btn:hover {
+  color: var(--text-secondary);
+  border-color: var(--text-tertiary);
+}
+
+/* ==================== 残缺季内联标注 ==================== */
+.sc-inline-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+.sc-badge-warn {
+  background: rgba(245, 158, 11, 0.12);
+  color: #d97706;
+  border: 1px solid rgba(245, 158, 11, 0.25);
+}
+.sc-badge-ok {
+  background: rgba(34, 197, 94, 0.1);
+  color: #16a34a;
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+.sc-badge-season {
+  background: rgba(239, 68, 68, 0.08);
+  color: #dc2626;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  gap: 4px;
+}
+.sc-season-nums {
+  font-weight: 700;
+  font-size: 11.5px;
+}
+.sc-season-actual {
+  color: #ef4444;
+}
+.sc-season-sep {
+  color: var(--text-tertiary);
+}
+.sc-season-expected {
+  color: var(--text-secondary);
+}
+.sc-season-missing {
+  font-weight: 500;
+  font-size: 10.5px;
+  color: #f97316;
+}
+
+/* 目录项高亮：残缺 */
+.sc-show-incomplete {
+  background: rgba(245, 158, 11, 0.04) !important;
+  border-left: 3px solid var(--accent-orange) !important;
+}
+/* 目录项高亮：完整 */
+.sc-show-complete {
+  background: rgba(34, 197, 94, 0.03) !important;
+  border-left: 3px solid rgba(34, 197, 94, 0.4) !important;
 }
 </style>

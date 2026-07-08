@@ -606,6 +606,13 @@ def auto_process_show(
         category = resolve_category(tmdb_id) or ""
     result["details"]["category"] = category
 
+    # -------------------------------------------------------------------
+    # 综艺（Variety Show）特殊标记：
+    # TMDB 对综艺的集数/季数元数据经常不准确，需采用「以已完结为基准」
+    # 的反向对齐策略，避免误删用户已整理好的综艺文件。
+    # -------------------------------------------------------------------
+    is_variety = (category == "综艺")
+
     tv_details = get_tv_details(tmdb_id)
     if not tv_details:
         result["stage"] = "tmdb_error"
@@ -700,6 +707,20 @@ def auto_process_show(
         else:
             logger.debug("[%s] Skipping non-season dir: '%s'", title, name)
 
+    # -------------------------------------------------------------------
+    # Season 0（特别篇/Specials）全豁免兜底 — 适用于所有分类：
+    # Season 0 内容为花絮、幕后、采访等特别篇，TMDB 元数据几乎不可靠，
+    # 一律不做任何自动化处理（不判定完整性、不洗版、不删除）。
+    # -------------------------------------------------------------------
+    if 0 in season_dir_map:
+        s0_dirs = season_dir_map.pop(0)
+        s0_names = ", ".join(d.get("name", "Season 0") for d in s0_dirs)
+        logger.warning(
+            "[%s] [Season 0 豁免] 发现 %d 个 Specials 目录 (%s)，"
+            "属于特别篇，跳过自动洗版，请前往大盘手动处理",
+            title, len(s0_dirs), s0_names,
+        )
+
     _season_nums = sorted(season_dir_map.keys())
     _total_dirs = sum(len(v) for v in season_dir_map.values())
     logger.info(
@@ -711,7 +732,32 @@ def auto_process_show(
     season_validation = []
     incomplete_seasons = []
 
-    for season_num in range(1, total_seasons + 1):
+    # -------------------------------------------------------------------
+    # ★ 保存 Step 2b 前的原始「已完结」Season 号集合。
+    #    Step 2b 会从 season_dir_map 中移除完整性校验不通过的 Season，
+    #    但综艺在 Step 3a 中需要用此原始集合来判定媒体库 Season 是否为
+    #    「两端共有」（而非依赖校验后的 season_dir_map，后者已丢失
+    #    残缺 Season 的信息）。
+    # -------------------------------------------------------------------
+    _organized_season_nums_original = set(season_dir_map.keys())
+
+    # -------------------------------------------------------------------
+    # 综艺特殊逻辑：以「已完结」目录实际存在的 Season 为基准。
+    # 常规剧集按 TMDB 元数据指定的总季数（range(1, total_seasons+1)）
+    # 逐季校验；综艺则仅遍历已完结中实际存在的 Season，避免因 TMDB
+    # 季数/集数不准误判用户已整理好的内容。
+    # -------------------------------------------------------------------
+    if is_variety:
+        seasons_to_check = sorted(season_dir_map.keys())
+        logger.info(
+            "[%s] [综艺特殊逻辑] 以已完结目录实际存在的 Season 为准，"
+            "TMDB 总季数=%d，已完结实际有 %d 季: %s",
+            title, total_seasons, len(seasons_to_check), seasons_to_check,
+        )
+    else:
+        seasons_to_check = list(range(1, total_seasons + 1))
+
+    for season_num in seasons_to_check:
         season_info = get_tv_season_info(tmdb_id, season_num)
         try:
             expected_eps = int(season_info.get("episode_count", 0)) if season_info else 0
@@ -741,13 +787,13 @@ def auto_process_show(
                 f"{organized_show_path}/{sd['name']}"
             )
             count = _count_files_in_cd2_dir(cd2, sd_path)
-            logger.info(
-                "[%s] S%d candidate '%s': expected=%d, actual=%d%s",
-                title, season_num, sd.get("name", ""),
-                expected_eps, count,
-                " * MATCH" if count == expected_eps and count > 0 else "",
-            )
-            if count == expected_eps and count > 0:
+            if count >= expected_eps and count > 0:
+                extra_info = f" (+{count - expected_eps})" if count > expected_eps else ""
+                logger.info(
+                    "[%s] S%d candidate '%s': expected=%d, actual=%d ✓ COMPLETE%s",
+                    title, season_num, sd.get("name", ""),
+                    expected_eps, count, extra_info,
+                )
                 complete_candidates.append(sd)
             else:
                 logger.warning(
@@ -808,14 +854,24 @@ def auto_process_show(
         )
 
     # ---- 2c. 安全检查：如果没有完整的季，优雅退出 ----
+    # 综艺例外：已完结中无完整 Season 时仍需继续评估媒体库，
+    # 因为两端共同存在的 Season 若均残缺，应触发 Case B 整删重洗。
     if not season_dir_map:
-        result["stage"] = "no_complete_seasons"
-        result["message"] = (
-            f"已完结目录中无完整季文件夹 "
-            f"(跳过 {len(incomplete_seasons)} 个文件数不匹配的季: {incomplete_seasons})"
-        )
-        result["success"] = True
-        return result
+        if is_variety:
+            logger.info(
+                "[%s] [综艺特殊逻辑] 已完结中无完整 Season "
+                "（%d 个残缺季: %s），继续评估媒体库以判断是否触发 Case B 整删重洗",
+                title, len(incomplete_seasons), incomplete_seasons,
+            )
+            # 不 return，继续进入 Step 3 媒体库评估
+        else:
+            result["stage"] = "no_complete_seasons"
+            result["message"] = (
+                f"已完结目录中无完整季文件夹 "
+                f"(跳过 {len(incomplete_seasons)} 个文件数不匹配的季: {incomplete_seasons})"
+            )
+            result["success"] = True
+            return result
 
     logger.info(
         "[%s] %d complete season(s) ready to process: %s",
@@ -890,6 +946,36 @@ def auto_process_show(
         if not m_se:
             continue
         sn = int(m_se.group(1))
+
+        # ---------------------------------------------------------------
+        # Season 0 全豁免：媒体库中的 Specials 目录同样不做任何处理。
+        # ---------------------------------------------------------------
+        if sn == 0:
+            logger.warning(
+                "[%s] [Season 0 豁免] Media S0 '%s': 属于特别篇，"
+                "跳过自动洗版，请前往大盘手动处理",
+                title, media_season_name,
+            )
+            continue
+
+        # ---------------------------------------------------------------
+        # 综艺特殊逻辑：媒体库中已完结目录不存在的 Season 不做任何处理。
+        # 「绝对不触碰、不判断、也不删除」。
+        #
+        # ★ 使用 Step 2b 前的原始集合 (_organized_season_nums_original)
+        #   而非校验后的 season_dir_map，因为后者在 Step 2b 中已移除
+        #   完整性校验不通过的 Season。如果使用 season_dir_map，会导致
+        #   已完结中残缺的 Season 在媒体库侧也被跳过，从而无法触发
+        #   Case B 整删重洗。
+        # ---------------------------------------------------------------
+        if is_variety and sn not in _organized_season_nums_original:
+            logger.info(
+                "[%s] [综艺特殊逻辑] Media S%d '%s': "
+                "已完结目录中无此 Season，不做任何处理（不判定、不删除、不洗版）",
+                title, sn, media_season_name,
+            )
+            continue
+
         season_info = get_tv_season_info(tmdb_id, sn)
         try:
             expected_eps = int(season_info.get("episode_count", 0)) if season_info else 0
@@ -912,10 +998,10 @@ def auto_process_show(
         # 完整性判定：
         # 1) TMDB 无数据 (expected_eps=0) 但目录有文件 → 保守处理，标记为"有内容"
         #    （files_present=True），不参与残缺判定，避免因 TMDB 数据缺失误删
-        # 2) 文件数精确匹配 → 完整
-        # 3) 其他情况 → 残缺
+        # 2) 文件数 >= 预期集数 → 完整（多出的可能是第 0 集、花絮、特辑等）
+        # 3) 文件数 < 预期集数 → 残缺
         files_present = (expected_eps == 0 and actual_files > 0)
-        is_complete = (actual_files == expected_eps and actual_files > 0)
+        is_complete = (actual_files >= expected_eps and actual_files > 0)
         media_season_state.setdefault(sn, []).append({
             "name": media_season_name,
             "path": media_season_path,
@@ -1209,12 +1295,21 @@ def auto_process_show(
     #   → 删除整个剧集目录
     #   → WAITING_FOR_DELETE_WEBHOOK（移动+校验+删除种子在
     #     Emby 确认删除后的 webhook handler 中完成）
+    #
+    # ★ 综艺安全说明：
+    #    综艺的 media_season_state 在 Step 3a 中已过滤为非对齐 Season
+    #    （已完结中不存在的 Season 不进入评估），因此 all_media_incomplete
+    #    仅基于「两端共有」的 Season 判定。这意味着：
+    #    - 两端共有 Season 均残缺 → 进入 Case B 整删重洗 ✓
+    #    - 媒体库独有的非对齐 Season → 已被 Step 3a 跳过，不受影响 ✓
     # =====================================================================
     if all_media_incomplete:
+        variety_tag = "[综艺] " if is_variety else ""
         logger.info(
-            "[%s] 情况 B: 全部 %d 个可判定媒体库 Season 均残缺（%d 个有文件但 TMDB 无数据）— "
+            "[%s] %s情况 B: 全部 %d 个可判定媒体库 Season 均残缺"
+            "（%d 个有文件但 TMDB 无数据）— "
             "删除整个剧集目录，等待 Emby 删除 webhook",
-            title, incomplete_count, files_present_count,
+            title, variety_tag, incomplete_count, files_present_count,
         )
 
         # 通过 CD2 删除整个剧集目录

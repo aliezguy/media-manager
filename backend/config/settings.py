@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "mp_password": "",
 
     "tmdb_api_key": "",
+    "tmdb_base_url": "https://api.tmdb.org/3",
     
     # 洗版策略 (默认空)
     "wash_schemes": [],
@@ -34,6 +35,10 @@ DEFAULT_CONFIG = {
     "cd2_password": "",
     "cd2_media_dir": "/80003588/emby库/电视剧/",
     "cd2_organized_dir": "/80003588/网盘整理/完结整理/电视剧/",
+
+    # Emby ↔ CD2 路径映射（用于路径转换）
+    "emby_prefix": "/volume3/emby影院/115网盘_3588/",
+    "cd2_media_prefix": "/80003588/emby库/",
 }
 
 def load_config():
