@@ -937,6 +937,18 @@ def auto_process_show(
     # 当 TMDB 无 episode_count 数据时（expected_eps=0），若目录中有文件，
     # 视为"有内容"（files_present=True），不参与残缺判定，避免误删。
     media_season_state: dict[int, list[dict]] = {}
+    # -------------------------------------------------------------------
+    # 追踪是否存在「非对齐」的媒体库 Season（综艺专属）。
+    # 非对齐 Season = 媒体库中有、但已完结目录中没有的 Season。
+    #
+    # 当此标记为 True 时，即使所有对齐 Season 均残缺，也不能触发
+    # Case B 整剧删除。因为整剧删除会连带删除这些非对齐 Season，
+    # 而已完结目录中没有它们的替换来源 → 造成永久数据丢失。
+    #
+    # 此时应走 Case C 逐季处理：仅替换对齐的残缺 Season，
+    # 非对齐 Season 原封不动保留在媒体库中。
+    # -------------------------------------------------------------------
+    _has_unaligned_media_seasons = False
     for mdir in media_season_dirs:
         media_season_name = mdir.get("name", "")
         media_season_path = _sanitize_cd2_path(
@@ -969,6 +981,12 @@ def auto_process_show(
         #   Case B 整删重洗。
         # ---------------------------------------------------------------
         if is_variety and sn not in _organized_season_nums_original:
+            # -----------------------------------------------------------
+            # 标记存在非对齐 Season，阻止 Case B 整剧删除。
+            # 原因：整剧删除会连带删除此非对齐 Season，而已完结中
+            # 没有它的替换来源，导致数据永久丢失。
+            # -----------------------------------------------------------
+            _has_unaligned_media_seasons = True
             logger.info(
                 "[%s] [综艺特殊逻辑] Media S%d '%s': "
                 "已完结目录中无此 Season，不做任何处理（不判定、不删除、不洗版）",
@@ -1045,15 +1063,43 @@ def auto_process_show(
     def _season_has_files_present(versions: list[dict]) -> bool:
         return any(v.get("files_present", False) for v in versions)
 
-    # 判定"所有季均残缺"时，将 TMDB 无数据但目录有文件的季排除
-    # （files_present=True），避免因 TMDB 数据缺失导致误入 Case B 整剧删除
+    # =================================================================
+    # 判定「所有参与评估的媒体库 Season 均残缺」（all_media_incomplete）。
+    #
+    # 判定逻辑（按优先级）：
+    # 1. media_season_state 非空 — 至少有 1 个有效 Season 参与评估
+    # 2. 无非对齐 Season（综艺专属安全阀）—
+    #    媒体库中存在但已完结中不存在的 Season 会阻止 Case B，
+    #    因为这些 Season 没有替换来源，整剧删除将导致数据永久丢失
+    # 3. 所有参与评估的 Season 均残缺 —
+    #    每个 Season 的所有版本目录都不是 complete 且没有 files_present
+    #    （TMDB 无数据但目录有文件的 Season 已被 files_present 排除）
+    #
+    # 条件 2 确保：综艺 S1/S2 残缺 + S3 非对齐 → 不触发 Case B，
+    # 而是走 Case C 仅替换 S1/S2，S3 原封不动保留。
+    # =================================================================
     all_media_incomplete = (
         len(media_season_state) > 0
+        and not _has_unaligned_media_seasons
         and all(
             not _season_has_complete(versions) and not _season_has_files_present(versions)
             for versions in media_season_state.values()
         )
     )
+
+    # 诊断日志：当 Case B 因存在非对齐 Season 被阻止时，明确记录原因
+    if _has_unaligned_media_seasons and len(media_season_state) > 0:
+        _all_aligned_incomplete = all(
+            not _season_has_complete(versions) and not _season_has_files_present(versions)
+            for versions in media_season_state.values()
+        )
+        if _all_aligned_incomplete:
+            logger.info(
+                "[%s] [综艺安全阀] 所有 %d 个对齐 Season 均残缺，"
+                "但存在非对齐 Season（媒体库独有，已完结无对应），"
+                "阻止 Case B 整剧删除，改为 Case C 逐季替换对齐 Season",
+                title, len(media_season_state),
+            )
 
     # 按目录版本统计（同一 Season 可能有多个版本目录，例如 "Season 1 -WEB-DL" 和 "Season 1 -DV"）
     total_versions = sum(len(versions) for versions in media_season_state.values())
