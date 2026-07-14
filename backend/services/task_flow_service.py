@@ -750,6 +750,9 @@ def auto_process_show(
     # ---- 2b. 逐季校验 TMDB 完整性 ----
     season_validation = []
     incomplete_seasons = []
+    # 保存不完整的 organized Season 目录信息，供 Case C 阶段引用。
+    # key: season_number, value: list of CD2 file dicts (与 season_dir_map 格式一致)
+    _incomplete_organized_candidates: dict[int, list[dict]] = {}
 
     # -------------------------------------------------------------------
     # ★ 保存 Step 2b 前的原始「已完结」Season 号集合。
@@ -855,6 +858,8 @@ def auto_process_show(
                 "path": _sanitize_cd2_path(f"{organized_show_path}/Season {season_num}"),
             }
             incomplete_seasons.append(season_num)
+            # ★ 保存不完整的 candidates，供 Case C 阶段判断是否需要跳过
+            _incomplete_organized_candidates[season_num] = candidates
             del season_dir_map[season_num]
             logger.warning(
                 "[%s] Season %d: no candidate matches expected %d files — "
@@ -1532,11 +1537,53 @@ def auto_process_show(
     db.refresh(auto_task)
 
     # ---- 4a. 删除媒体库中残缺的 Season ----
-    # 跳过完整季和有文件但 TMDB 无数据的季（files_present），仅删除确认残缺的
+    # 跳过完整季和有文件但 TMDB 无数据的季（files_present），仅删除确认残缺的。
+    #
+    # ★ 已完结不完整 → 不触发自动化：如果 organized 中该 Season 不完整
+    #   （不在 season_dir_map 中），则跳过删除媒体库，保留两端数据不变，
+    #   等待 organized 补全后下次扫描自动处理。用户可通过大盘"强制移动"手动处理。
+    skipped_incomplete_seasons: list[dict] = []
     for sn, versions in media_season_state.items():
         for state in versions:
             if state["complete"] or state.get("files_present", False):
                 continue
+
+            # ---- 已完结不完整检查 ----
+            if sn not in season_dir_map:
+                # organized 中该 Season 不完整 → 跳过，不删除媒体库
+                org_candidates = _incomplete_organized_candidates.get(sn, [])
+                org_dir_name = org_candidates[0].get("name", "") if org_candidates else ""
+                org_path = (
+                    org_candidates[0].get("fullPathName")
+                    or _sanitize_cd2_path(f"{organized_show_path}/{org_dir_name}")
+                ) if org_candidates else ""
+                org_file_count = _count_files_in_cd2_dir(cd2, org_path) if org_path else 0
+
+                logger.warning(
+                    "[%s] S%d '%s': 媒体库残缺 (%d/%d)，但已完结也不完整 (%d/%d)，"
+                    "跳过自动处理，保留两端数据不变。可通过大盘手动触发强制移动。",
+                    title, sn, state["name"],
+                    state["file_count"], state["expected"],
+                    org_file_count, state["expected"],
+                )
+                _write_action_log(
+                    db, auto_task.id, tmdb_id, title,
+                    ActionType.SKIP_FOLDER.value,
+                    target_name=state["name"],
+                    target_path=state["path"],
+                    reason=f"已完结 S{sn} 不完整 ({org_file_count}/{state['expected']})，媒体库残缺 ({state['file_count']}/{state['expected']})，跳过自动处理等待补全",
+                )
+                skipped_incomplete_seasons.append({
+                    "season": sn,
+                    "organized_dir_name": org_dir_name,
+                    "organized_path": org_path,
+                    "organized_file_count": org_file_count,
+                    "expected_file_count": state["expected"],
+                    "media_path": state["path"],
+                    "media_file_count": state["file_count"],
+                })
+                continue
+
             logger.info(
                 "[%s] S%d '%s': %d/%d 文件 — 残缺，从媒体库删除",
                 title, sn, state["name"], state["file_count"], state["expected"],
@@ -1624,6 +1671,20 @@ def auto_process_show(
             "[%s] [Case C 两阶段] %d 个残缺 Season 已删除，"
             "等待 Emby webhook 确认后执行替换移动（超时兜底: Emby API）",
             title, len(pending_season_deletes),
+        )
+
+    # 保存被跳过的残缺 Season 信息到 context，供前端展示 + 手动强制移动
+    if skipped_incomplete_seasons:
+        auto_task.context = {
+            **auto_task.context,
+            "skipped_incomplete_seasons": skipped_incomplete_seasons,
+        }
+        db.commit()
+        logger.info(
+            "[%s] [Case C] %d 个 Season 因已完结不完整被跳过，"
+            "已保存到 context 供手动处理: %s",
+            title, len(skipped_incomplete_seasons),
+            [s["season"] for s in skipped_incomplete_seasons],
         )
 
     # ---- 4b. 对比媒体库完整季与已完结目录 ----

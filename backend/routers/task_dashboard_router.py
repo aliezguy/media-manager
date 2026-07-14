@@ -151,10 +151,12 @@ def get_task_logs(
         .all()
     )
 
+    ctx = task.context or {}
     return {
         "task_id": task_id,
         "tmdb_id": task.tmdb_id,
         "total": len(logs),
+        "skipped_incomplete_seasons": ctx.get("skipped_incomplete_seasons", []),
         "items": [
             {
                 "id": log.id,

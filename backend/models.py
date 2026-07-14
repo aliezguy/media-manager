@@ -25,6 +25,7 @@ class ActionType(str, enum.Enum):
     KEEP_MEDIA = "KEEP_MEDIA"
     KEEP_ORGANIZED = "KEEP_ORGANIZED"
     KEEP_TORRENT = "KEEP_TORRENT"
+    FORCE_MOVE = "FORCE_MOVE"  # 手动强制移动：organized → media
 
 
 class TaskActionLog(Base):

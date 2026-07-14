@@ -42,6 +42,13 @@ const fetchBatchDelete = async (taskIds) => {
   return res.data
 }
 
+const fetchForceMoveSeason = async (taskId, season) => {
+  const res = await axios.post(`${API_URL}/api/tasks/${taskId}/force-move-season`, {
+    season: season
+  })
+  return res.data
+}
+
 // ==================== 状态 ====================
 const stats = ref({ total: 0, completed: 0, failed: 0, waiting: 0, init: 0 })
 const tasks = ref([])
@@ -61,6 +68,8 @@ const drawerTitle = ref('')
 const timelineLoading = ref(false)
 const timelineLogs = ref([])
 const currentTaskId = ref(null)
+const skippedIncompleteSeasons = ref([])
+const forceMovingSeason = ref(null)  // 正在执行强制移动的 season number
 
 // ==================== 统计卡片配置 ====================
 const statCards = computed(() => [
@@ -114,6 +123,7 @@ const openTimeline = async (task) => {
   try {
     const data = await fetchTaskLogs(task.id)
     timelineLogs.value = data.items || []
+    skippedIncompleteSeasons.value = data.skipped_incomplete_seasons || []
   } catch (e) {
     ElMessage.error('获取操作日志失败')
   } finally {
@@ -162,6 +172,39 @@ const handleBatchDelete = async () => {
     if (e !== 'cancel' && e !== 'close') {
       ElMessage.error('批量删除失败')
     }
+  }
+}
+
+// ==================== 强制移动 ====================
+const handleForceMove = async (seasonInfo) => {
+  if (!currentTaskId.value) return
+  const sn = seasonInfo.season
+  try {
+    await ElMessageBox.confirm(
+      `Season ${sn} 已完结目录仅有 ${seasonInfo.organized_file_count}/${seasonInfo.expected_file_count} 文件（不完整），` +
+      `媒体库现有 ${seasonInfo.media_file_count}/${seasonInfo.expected_file_count} 文件。` +
+      `\n\n确认强制将已完结目录移动到媒体库？`,
+      `强制移动 Season ${sn}`,
+      {
+        type: 'warning',
+        confirmButtonText: '确认移动',
+        cancelButtonText: '取消',
+      }
+    )
+    forceMovingSeason.value = sn
+    const result = await fetchForceMoveSeason(currentTaskId.value, sn)
+    ElMessage.success(result.message || `Season ${sn} 强制移动成功`)
+    // 刷新时间线
+    const data = await fetchTaskLogs(currentTaskId.value)
+    timelineLogs.value = data.items || []
+    skippedIncompleteSeasons.value = data.skipped_incomplete_seasons || []
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') {
+      const msg = e?.response?.data?.detail || e?.message || '强制移动失败'
+      ElMessage.error(msg)
+    }
+  } finally {
+    forceMovingSeason.value = null
   }
 }
 
@@ -441,13 +484,43 @@ const handleSizeChange = (size) => {
       class="timeline-drawer"
     >
       <div class="timeline-wrap" v-loading="timelineLoading">
-        <div v-if="!timelineLoading && timelineLogs.length === 0" class="timeline-empty">
+        <!-- 跳过 Season 手动处理区 -->
+        <div v-if="!timelineLoading && skippedIncompleteSeasons.length > 0" class="skipped-seasons-section">
+          <div class="skipped-header">
+            <el-icon :size="16" color="#f59e0b"><WarningFilled /></el-icon>
+            <span>以下 Season 因已完结不完整被跳过，可手动强制移动</span>
+          </div>
+          <div
+            v-for="s in skippedIncompleteSeasons"
+            :key="'skipped-' + s.season"
+            class="skipped-row"
+          >
+            <div class="skipped-info">
+              <span class="skipped-label">Season {{ s.season }}</span>
+              <span class="skipped-stats">
+                已完结 {{ s.organized_file_count }}/{{ s.expected_file_count }}
+                &nbsp;|&nbsp;
+                媒体库 {{ s.media_file_count }}/{{ s.expected_file_count }}
+              </span>
+            </div>
+            <button
+              class="btn-pill btn-pill-force"
+              :disabled="forceMovingSeason === s.season"
+              @click="handleForceMove(s)"
+            >
+              <el-icon :size="13" v-if="forceMovingSeason === s.season"><Loading /></el-icon>
+              <span>{{ forceMovingSeason === s.season ? '移动中...' : '强制移动' }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div v-if="!timelineLoading && timelineLogs.length === 0 && skippedIncompleteSeasons.length === 0" class="timeline-empty">
           <el-icon :size="40"><Document /></el-icon>
           <p>暂无操作日志</p>
           <span>该任务可能尚未产生任何自动化操作</span>
         </div>
 
-        <div class="timeline-list" v-else>
+        <div class="timeline-list" v-if="timelineLogs.length > 0">
           <div
             v-for="log in timelineLogs"
             :key="log.id"
@@ -767,6 +840,62 @@ const handleSizeChange = (size) => {
 .timeline-empty span {
   font-size: 13px;
   color: var(--text-tertiary);
+}
+
+/* 跳过 Season 手动处理区 */
+.skipped-seasons-section {
+  background: rgba(245, 158, 11, 0.06);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  margin-bottom: 16px;
+}
+.skipped-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+.skipped-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: var(--bg-primary);
+  border-radius: var(--radius-sm);
+  margin-top: 6px;
+}
+.skipped-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.skipped-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.skipped-stats {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.btn-pill-force {
+  background: rgba(245, 158, 11, 0.15);
+  color: #d97706;
+  padding: 6px 14px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.btn-pill-force:hover:not(:disabled) {
+  background: #f59e0b;
+  color: #fff;
+}
+.btn-pill-force:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* 时间线列表 */
