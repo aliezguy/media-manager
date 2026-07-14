@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -52,7 +53,25 @@ from routers import moviepilot, system, emby, history, qb, file_editor, cd2_rout
 # 初始化数据库表
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Emby AI Manager")
+# ---------------------------------------------------------------------------
+# APScheduler 生命周期管理
+# ---------------------------------------------------------------------------
+from services.scheduler_service import scheduler, load_all_tasks
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    load_all_tasks()
+    scheduler.start()
+    logging.getLogger("main").info("[Scheduler] APScheduler 已启动")
+    yield
+    # shutdown
+    scheduler.shutdown(wait=False)
+    logging.getLogger("main").info("[Scheduler] APScheduler 已关闭")
+
+
+app = FastAPI(title="Emby AI Manager", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -72,28 +91,6 @@ app.include_router(organize_router.router, prefix="/api", tags=["Organize"])
 app.include_router(task_flow_router.router, prefix="/api", tags=["TaskFlow"])
 app.include_router(task_dashboard_router.router, prefix="/api", tags=["Dashboard"])
 app.include_router(scheduler_router.router, prefix="/api", tags=["Scheduler"])
-# ---------------------------------------------------------------------------
-# APScheduler 生命周期管理
-# ---------------------------------------------------------------------------
-from services.scheduler_service import scheduler, load_all_tasks
-
-
-@app.on_event("startup")
-async def startup_scheduler():
-    """FastAPI 启动时：启动 APScheduler 并加载所有活跃任务。"""
-    load_all_tasks()
-    scheduler.start()
-    logging.getLogger("main").info("[Scheduler] APScheduler 已启动")
-
-
-@app.on_event("shutdown")
-async def shutdown_scheduler():
-    """FastAPI 关闭时：优雅关闭 APScheduler。"""
-    scheduler.shutdown(wait=False)
-    logging.getLogger("main").info("[Scheduler] APScheduler 已关闭")
-
-
-# 注意：你需要确保前端调用 emby 接口时路径是否匹配，如果前端是 /api/libraries，这里 prefix="/api" 就对了
 if os.path.exists("backend/static"):
     app.mount("/", StaticFiles(directory="backend/static", html=True), name="static")
 if __name__ == "__main__":
