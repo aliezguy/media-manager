@@ -17,7 +17,7 @@
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import grpc
@@ -605,6 +605,25 @@ def auto_process_show(
     if not category:
         category = resolve_category(tmdb_id) or ""
     result["details"]["category"] = category
+
+    # =================================================================
+    # ★ 入口排空：处理同剧集的历史 pending 任务。
+    #
+    # 场景：上一次扫描时 Case B/C 创建了 WAITING_FOR_* 任务，
+    # 但 Emby webhook 因故未到达（Emby 离线、网络抖动等）。
+    # 如果跳过 drain 直接走当前流程，媒体库目录可能已被删除
+    # （Case B CD2 整删），导致当前扫描误判为 Case A 首次导入，
+    # 创建重复任务，产生两条时间线。
+    #
+    # drain 会提前完成这些 pending 任务（重建目录 → 移动 →
+    # 校验 → 清理种子），让当前扫描看到最新状态。
+    # =================================================================
+    drain_count = _drain_pending_tasks_for_show(tmdb_id, db)
+    if drain_count > 0:
+        logger.info(
+            "[%s] 入口 drain 完成: 处理了 %d 个历史 pending 任务",
+            title, drain_count,
+        )
 
     # -------------------------------------------------------------------
     # 综艺（Variety Show）特殊标记：
@@ -1544,6 +1563,69 @@ def auto_process_show(
                     "error": del_result.get("errorMessage", "unknown"),
                 })
 
+    # =================================================================
+    # ★ Case C 两阶段化：构建 pending_season_deletes。
+    #
+    # Step 4a 已通过 CD2 删除了媒体库中的残缺 Season。
+    # 现在需要等待 Emby 确认删除（webhook）后，再将 organized
+    # 中的完整版本移入。如果超时未收到 webhook，兜底通过
+    # Emby API 精确删除 Season 后执行移动。
+    #
+    # 只有当 media_season_state 中全部都是残缺 Season（没有
+    # 完整季需要对比）时，才完全走两阶段流程。
+    # 如果同时有完整季需要对比，完整季的对比+移动仍内联执行，
+    # 残缺季的替换等待 webhook。
+    # =================================================================
+    pending_season_deletes: list[dict] = []
+    # 检查 media_season_state 中是否存在完整季或 files_present 季
+    _has_any_complete_season = any(
+        _season_has_complete(versions) or _season_has_files_present(versions)
+        for versions in media_season_state.values()
+    )
+
+    for cr in comparison_results:
+        if cr.get("action") != "deleted_media_incomplete":
+            continue
+        sn = cr["season"]
+        org_dirs = season_dir_map.get(sn, [])
+        for org_dir in org_dirs:
+            org_path = org_dir.get("fullPathName") or _sanitize_cd2_path(
+                f"{organized_show_path}/{org_dir['name']}"
+            )
+            # 超时时间: 当前 + 10 分钟（给 Emby 充足的检测时间）
+            timeout_at = (datetime.now() + timedelta(minutes=10)).isoformat()
+            pending_season_deletes.append({
+                "season": sn,
+                "media_deleted_path": cr.get("deleted_path", ""),
+                "media_deleted_name": cr.get("deleted_path", "").rstrip("/").rsplit("/", 1)[-1] if cr.get("deleted_path") else "",
+                "organized_source": {
+                    "season": sn,
+                    "dir_name": org_dir.get("name", ""),
+                    "path": org_path,
+                },
+                "emby_search_info": {
+                    "series_name": title,
+                    "season_number": sn,
+                    "tmdb_id": tmdb_id,
+                },
+                "timeout_at": timeout_at,
+                "status": "pending",
+            })
+
+    if pending_season_deletes:
+        # 更新任务状态为等待 Season 删除 webhook
+        auto_task.status = TaskStatus.WAITING_FOR_SEASON_DELETE_WEBHOOK.value
+        auto_task.context = {
+            **auto_task.context,
+            "pending_season_deletes": pending_season_deletes,
+        }
+        db.commit()
+        logger.info(
+            "[%s] [Case C 两阶段] %d 个残缺 Season 已删除，"
+            "等待 Emby webhook 确认后执行替换移动（超时兜底: Emby API）",
+            title, len(pending_season_deletes),
+        )
+
     # ---- 4b. 对比媒体库完整季与已完结目录 ----
     for sn, versions in media_season_state.items():
         for state in versions:
@@ -1718,6 +1800,10 @@ def auto_process_show(
                     ),
                 })
 
+    # ★ deleted_media_incomplete (Step 4a 删除的残缺 Season) 已改为
+    #    两阶段处理（等待 Emby webhook 确认删除后移动），不在 Step 4d 中收集。
+    #    详见 pending_season_deletes 构建逻辑及 handle_library_deleted_webhook。
+
     # ---- 4e. 移动 + 校验每个候选 ----
     verify_results = []
     if candidates_to_move:
@@ -1792,7 +1878,9 @@ def auto_process_show(
     # ---- 4f. 清理父目录 ----
     # 如果所有媒体库 Season 都已删除且没有候选需要移动，
     # 清理空的剧集文件夹。
-    if deleted_media_seasons and not candidates_to_move:
+    # ★ 注意：有 pending_season_deletes 时不清理 —
+    #  webhook 阶段需要目标剧集目录存在才能执行移动。
+    if deleted_media_seasons and not candidates_to_move and not pending_season_deletes:
         try:
             remaining = cd2.get_sub_files(media_show_path)
             remaining_dirs = [f for f in remaining if f.get("isDirectory")]
@@ -1815,23 +1903,8 @@ def auto_process_show(
     )
     dup_deleted_count = len(deleted_organized_seasons)
 
-    if not has_actions:
-        # ---- 情况 D: 无需操作（全部完整且相同）----
-        auto_task.status = TaskStatus.COMPLETED.value
-        auto_task.context = {
-            **auto_task.context,
-            "deleted_media_seasons": deleted_media_seasons,
-            "deleted_organized_seasons": deleted_organized_seasons,
-            "comparison_results": comparison_results,
-        }
-        db.commit()
-        db.refresh(auto_task)
-
-        result["stage"] = "no_action_needed"
-        result["task_id"] = auto_task.id
-        result["message"] = "媒体库所有季均完整，已完结与媒体库版本相同，无需处理"
-        result["success"] = True
-    elif verify_results and not all_moves_verified:
+    # 优先检查: 内联移动+校验失败 → CRITICAL
+    if verify_results and not all_moves_verified:
         # ---- 移动+校验失败 — CRITICAL，保留种子 ----
         failed = [vr for vr in verify_results if not vr["verified"]]
         logger.critical(
@@ -1868,7 +1941,7 @@ def auto_process_show(
                     "retry_count": fv.get("retry_count", 0),
                 },
             )
-        # 更新 AutoTaskFlow → FAILED
+        # 更新 AutoTaskFlow → FAILED（pending 仍保留在 context 中供后续排查）
         auto_task.status = TaskStatus.FAILED.value
         auto_task.context = {
             **auto_task.context,
@@ -1888,6 +1961,67 @@ def auto_process_show(
         )
         result["details"]["verify_results"] = verify_results
         result["success"] = False
+
+    elif pending_season_deletes:
+        # =================================================================
+        # Case C 两阶段: 残缺 Season 已通过 CD2 删除，等待 Emby webhook
+        # 确认后由 handle_library_deleted_webhook 执行 organized → media
+        # 的移动替换。
+        #
+        # 如果同时有完整季的内联移动（verify_results），它们已经完成，
+        # 任务保持在 WAITING_FOR_SEASON_DELETE_WEBHOOK 等待残缺季的 webhook。
+        # =================================================================
+        auto_task.context = {
+            **auto_task.context,
+            "deleted_media_seasons": deleted_media_seasons,
+            "deleted_organized_seasons": deleted_organized_seasons,
+            "comparison_results": comparison_results,
+            "verify_results": verify_results,
+            "pending_season_deletes": pending_season_deletes,
+        }
+        # 状态已在 Step 4a 后设置为 WAITING_FOR_SEASON_DELETE_WEBHOOK
+        db.commit()
+        db.refresh(auto_task)
+
+        result["task_id"] = auto_task.id
+        result["stage"] = "waiting_for_season_delete_webhook"
+
+        msg_parts = []
+        pending_sns = sorted(set(e["season"] for e in pending_season_deletes))
+        msg_parts.append(
+            f"已删除残缺季 S{pending_sns}，等待 Emby 确认后移动替换"
+            f"（超时 {len(pending_season_deletes)} 个 pending）"
+        )
+        if verify_results:
+            msg_parts.append(
+                f"同时已完成 {len(verify_results)} 个完整季的内联替换"
+            )
+        if dup_deleted_count:
+            msg_parts.append(
+                f"已删除 {dup_deleted_count} 个已完结重复季"
+            )
+
+        result["message"] = "；".join(msg_parts)
+        result["success"] = True
+        # 不删除种子 — 等所有 pending 完成后再清理
+        # 不执行 TvShowDetail 的 COMPLETED 更新
+
+    elif not has_actions:
+        # ---- 情况 D: 无需操作（全部完整且相同）----
+        auto_task.status = TaskStatus.COMPLETED.value
+        auto_task.context = {
+            **auto_task.context,
+            "deleted_media_seasons": deleted_media_seasons,
+            "deleted_organized_seasons": deleted_organized_seasons,
+            "comparison_results": comparison_results,
+        }
+        db.commit()
+        db.refresh(auto_task)
+
+        result["stage"] = "no_action_needed"
+        result["task_id"] = auto_task.id
+        result["message"] = "媒体库所有季均完整，已完结与媒体库版本相同，无需处理"
+        result["success"] = True
     else:
         # ---- 全部校验通过 → 删除 qB 种子 ----
         qb_result = {"success": True, "deleted_count": 0}
@@ -1981,31 +2115,690 @@ def auto_process_show(
 
 
 # ---------------------------------------------------------------------------
+# Case C 两阶段辅助：执行 pending Season 移动 + 超时兜底
+# ---------------------------------------------------------------------------
+
+def _execute_pending_season_move(
+    cd2, task: AutoTaskFlow, entry: dict, db: Session,
+) -> dict:
+    """执行单个 pending Season 的移动+校验，并写入 action log。
+
+    用于 Case C 阶段二（Emby webhook 确认删除后 或 超时兜底）。
+
+    返回 _verify_season_move 的结果 dict。
+    """
+    ctx = task.context or {}
+    title = ctx.get("title", "Unknown")
+    tmdb_id = task.tmdb_id
+    media_show_path = ctx.get("media_show_path", "")
+
+    org = entry.get("organized_source", {})
+    sn = org.get("season", 0)
+    dir_name = org.get("dir_name", "")
+    source_path = org.get("path", "")
+
+    if not source_path or not media_show_path:
+        logger.error(
+            "[%s] _execute_pending_season_move: S%d 缺少 source_path 或 media_show_path",
+            title, sn,
+        )
+        return {"success": False, "verified": False,
+                "season": sn, "dir_name": dir_name,
+                "source_stats": {"fileCount": 0, "totalSize": 0},
+                "dest_stats": {"fileCount": 0, "totalSize": 0},
+                "dest_path": "", "error": "缺少路径", "retry_count": 0}
+
+    # 确认源目录存在
+    if not _cd2_dir_exists(cd2, source_path):
+        logger.warning(
+            "[%s] _execute_pending_season_move: S%d 源目录已不存在 '%s'",
+            title, sn, source_path,
+        )
+        return {"success": False, "verified": False,
+                "season": sn, "dir_name": dir_name,
+                "source_stats": {"fileCount": 0, "totalSize": 0},
+                "dest_stats": {"fileCount": 0, "totalSize": 0},
+                "dest_path": "", "error": "源目录不存在", "retry_count": 0}
+
+    vr = _verify_season_move(cd2, source_path, media_show_path, dir_name, title, sn)
+    if vr["verified"]:
+        _write_action_log(
+            db, task.id, tmdb_id, title,
+            ActionType.MOVE_FOLDER.value,
+            target_name=dir_name,
+            target_path=vr.get("dest_path", ""),
+            reason=f"Case C 阶段二: Season {sn} 移动并校验通过",
+            detail={
+                "season": sn,
+                "source_stats": vr["source_stats"],
+                "dest_stats": vr["dest_stats"],
+            },
+        )
+    return vr
+
+
+def _resolve_single_case_b_task(task: AutoTaskFlow, db: Session,
+                               do_emby_cleanup: bool = False) -> bool:
+    """执行单个 Case B (WAITING_FOR_DELETE_WEBHOOK) 任务的阶段二。
+
+    不依赖 Emby webhook — 直接重建媒体库目录 → 移动 organized Season →
+    校验 → 清理种子。用于超时兜底和入口 drain。
+
+    当 *do_emby_cleanup* 为 True 时（仅超时兜底路径），在确认媒体库为空后
+    先通过 Emby API 清理僵尸 Series 条目，再执行导入。
+
+    ★ 安全守卫：如果媒体库目录已有文件（说明后续扫描已成功导入），
+    无论 *do_emby_cleanup* 为何值，均跳过 Emby API 删除，直接标记 COMPLETED。
+    这防止超时兜底误删已被后续扫描恢复的正确 Emby 条目。
+
+    返回 True 如果任务已终结（COMPLETED 或 FAILED）。
+    """
+    ctx = task.context or {}
+    title = ctx.get("title", "Unknown")
+    tmdb_id = task.tmdb_id
+    media_show_path = ctx.get("media_show_path", "")
+    organized_seasons_to_move = ctx.get("organized_seasons_to_move", [])
+    qb_config_id = ctx.get("qb_config_id", "")
+
+    if not media_show_path:
+        logger.error("[CaseB-Resolve] task=%d 缺少 media_show_path", task.id)
+        task.status = TaskStatus.FAILED.value
+        task.error_message = "上下文中缺少 media_show_path"
+        task.updated_at = datetime.now()
+        db.commit()
+        return True
+
+    if not organized_seasons_to_move:
+        logger.info("[CaseB-Resolve] task=%d '%s' 无 organized seasons 需移动，标记 COMPLETED",
+                    task.id, title)
+        task.status = TaskStatus.COMPLETED.value
+        task.updated_at = datetime.now()
+        db.commit()
+        return True
+
+    cd2 = get_cd2_client()
+
+    # =================================================================
+    # ★ 安全守卫：媒体库已有文件 → 后续扫描已成功导入 →
+    #    跳过所有操作（包括 Emby API 删除），直接 COMPLETED。
+    # =================================================================
+    if _cd2_dir_exists(cd2, media_show_path):
+        stats = _get_season_stats(cd2, media_show_path)
+        if stats["fileCount"] > 0:
+            logger.info(
+                "[CaseB-Resolve] task=%d '%s' 媒体库已有 %d 个文件"
+                "（后续扫描已导入），跳过 Emby 清理，标记 COMPLETED",
+                task.id, title, stats["fileCount"],
+            )
+            task.status = TaskStatus.COMPLETED.value
+            task.error_message = (
+                f"媒体库已有 {stats['fileCount']} 个文件（后续扫描已导入），无需处理"
+            )
+            task.updated_at = datetime.now()
+            db.commit()
+            return True
+
+    # =================================================================
+    # 媒体库为空 — 仅在超时兜底路径中通过 Emby API 清理僵尸条目。
+    # 入口 drain 路径不删 Emby（因为 auto_process_show 正在运行，
+    # Emby 可能本就没有这个条目，或正在处理中）。
+    # =================================================================
+    if do_emby_cleanup:
+        from services.emby_service import search_series_by_tmdb, delete_emby_item
+        series = search_series_by_tmdb(tmdb_id)
+        if series:
+            series_id = series.get("Id", "")
+            if delete_emby_item(series_id):
+                logger.info(
+                    "[CaseB-Resolve] task=%d Emby API 已删除 Series '%s' (ItemId=%s)",
+                    task.id, title, series_id,
+                )
+            else:
+                logger.warning(
+                    "[CaseB-Resolve] task=%d Emby API 删除 Series '%s' 失败",
+                    task.id, title,
+                )
+        else:
+            logger.info(
+                "[CaseB-Resolve] task=%d Emby 中未找到 '%s'，可能已自动清理",
+                task.id, title,
+            )
+
+    # ---- 过滤仍然存在的 organized 源 ----
+    available_sources = []
+    for si in organized_seasons_to_move:
+        source_path = si.get("path", "")
+        if source_path and _cd2_dir_exists(cd2, source_path):
+            available_sources.append(si)
+        else:
+            logger.warning(
+                "[CaseB-Resolve] task=%d '%s' S%d 源目录已不存在 '%s'",
+                task.id, title, si.get("season", 0), source_path,
+            )
+
+    if not available_sources:
+        # 所有源已消失 — 检查媒体库是否已有内容
+        if _cd2_dir_exists(cd2, media_show_path):
+            stats = _get_season_stats(cd2, media_show_path)
+            if stats["fileCount"] > 0:
+                logger.info(
+                    "[CaseB-Resolve] task=%d '%s' 源已空但媒体库有 %d 个文件，标记 COMPLETED",
+                    task.id, title, stats["fileCount"],
+                )
+                task.status = TaskStatus.COMPLETED.value
+            else:
+                task.status = TaskStatus.FAILED.value
+                task.error_message = "organized 源已空且媒体库无内容"
+        else:
+            task.status = TaskStatus.FAILED.value
+            task.error_message = "organized 源已空且媒体库目录不存在"
+        task.updated_at = datetime.now()
+        db.commit()
+        return True
+
+    # ---- 确保媒体库目录存在 ----
+    if not _cd2_dir_exists(cd2, media_show_path):
+        target_parent = "/".join(media_show_path.rstrip("/").split("/")[:-1])
+        show_name = media_show_path.rstrip("/").rsplit("/", 1)[-1]
+        logger.info(
+            "[CaseB-Resolve] task=%d '%s' 重建媒体库目录: '%s'",
+            task.id, title, media_show_path,
+        )
+        mk_result = cd2.create_folder(parent_path=target_parent, folder_name=show_name)
+        if not mk_result.get("success"):
+            logger.error(
+                "[CaseB-Resolve] task=%d 无法创建媒体库目录: %s",
+                task.id, mk_result.get("errorMessage", ""),
+            )
+            task.status = TaskStatus.FAILED.value
+            task.error_message = f"无法创建媒体库目录: {mk_result.get('errorMessage', '')}"
+            task.updated_at = datetime.now()
+            db.commit()
+            return True
+
+    # ---- 移动 + 校验每个 organized Season ----
+    verify_results = []
+    for si in available_sources:
+        sn = si.get("season", 0)
+        dir_name = si.get("dir_name", "")
+        source_path = si.get("path", "")
+
+        if not _cd2_dir_exists(cd2, source_path):
+            logger.warning(
+                "[CaseB-Resolve] task=%d '%s' S%d 源目录 '%s' 移动前消失，跳过",
+                task.id, title, sn, source_path,
+            )
+            continue
+
+        vr = _verify_season_move(cd2, source_path, media_show_path, dir_name, title, sn)
+        verify_results.append(vr)
+        if vr["verified"]:
+            _write_action_log(
+                db, task.id, tmdb_id, title,
+                ActionType.MOVE_FOLDER.value,
+                target_name=dir_name,
+                target_path=vr.get("dest_path", ""),
+                reason=f"Case B 超时兜底/入口 drain: Season {sn} 移动并校验通过",
+                detail={
+                    "season": sn,
+                    "source_stats": vr["source_stats"],
+                    "dest_stats": vr["dest_stats"],
+                },
+            )
+
+    if not verify_results:
+        logger.warning("[CaseB-Resolve] task=%d '%s' 没有成功移动任何 Season",
+                       task.id, title)
+        task.status = TaskStatus.COMPLETED.value
+        task.error_message = "所有源在移动前消失"
+        task.updated_at = datetime.now()
+        db.commit()
+        return True
+
+    all_verified = all(vr["verified"] for vr in verify_results)
+
+    if all_verified:
+        # ---- 全部通过 → 删除 qB 种子 ----
+        season_dirs = [s.get("dir_name", "") for s in available_sources]
+        qb_result = _delete_qb_torrents_by_title(
+            qb_config_id, title, season_dir_names=season_dirs,
+        )
+        # 记录种子操作日志
+        for tname in qb_result.get("deleted_names", []) or []:
+            _write_action_log(
+                db, task.id, tmdb_id, title,
+                ActionType.DELETE_TORRENT.value,
+                target_name=tname,
+                reason="Case B 超时兜底/入口 drain 完成，清理种子",
+            )
+        logger.info(
+            "[CaseB-Resolve] task=%d '%s' ✓ 全部 %d 个 Season 校验通过, %d 个种子已删除",
+            task.id, title, len(verify_results), qb_result.get("deleted_count", 0),
+        )
+        task.status = TaskStatus.COMPLETED.value
+        task.error_message = None
+    else:
+        failed = [vr for vr in verify_results if not vr["verified"]]
+        logger.critical(
+            "[CaseB-Resolve] task=%d '%s' ✗ %d/%d 个 Season 校验失败",
+            task.id, title, len(failed), len(verify_results),
+        )
+        task.status = TaskStatus.FAILED.value
+        task.error_message = f"{len(failed)}/{len(verify_results)} 个 Season 校验失败"
+
+    task.context = {**ctx, "verify_results": verify_results}
+    task.updated_at = datetime.now()
+    db.commit()
+    return True
+
+
+def _resolve_single_case_c_task(task: AutoTaskFlow, db: Session, force: bool = False) -> int:
+    """处理单个 Case C 任务的 pending entries。
+
+    对每个超时（或 force=True 时全部）pending entry：
+    1. 通过 Emby API 精确删除对应 Season（兜底清理）
+    2. 执行 organized → media 的移动+校验
+
+    返回本次处理的 entry 数量。
+    """
+    from services.emby_service import (
+        search_series_by_tmdb,
+        get_season_by_number,
+        delete_emby_item,
+    )
+
+    ctx = task.context or {}
+    pending = ctx.get("pending_season_deletes", [])
+    if not pending:
+        logger.warning(
+            "[CaseC-Resolve] task=%d 状态为 %s 但无 pending_season_deletes",
+            task.id, task.status,
+        )
+        task.status = TaskStatus.COMPLETED.value
+        task.error_message = "无 pending 数据，自动完成"
+        task.updated_at = datetime.now()
+        db.commit()
+        return 0
+
+    title = ctx.get("title", "Unknown")
+    cd2 = get_cd2_client()
+    now = datetime.now()
+    resolved_count = 0
+    any_resolved = False
+
+    for entry in pending:
+        if entry.get("status") != "pending":
+            continue
+
+        # 非强制模式下检查超时
+        if not force:
+            timeout_str = entry.get("timeout_at", "")
+            if not timeout_str:
+                continue
+            try:
+                timeout_at = datetime.fromisoformat(timeout_str)
+            except (ValueError, TypeError):
+                continue
+            if now < timeout_at:
+                continue
+
+        sn = entry.get("season", 0)
+        emby_info = entry.get("emby_search_info", {})
+        mode = "入口drain" if force else "超时兜底"
+
+        logger.info(
+            "[CaseC-Resolve] task=%d '%s' S%d (%s)，通过 Emby API 清理",
+            task.id, title, sn, mode,
+        )
+
+        # ---- Emby API 精确删除 Season ----
+        search_tmdb = emby_info.get("tmdb_id", task.tmdb_id)
+        season_num = emby_info.get("season_number", sn)
+
+        series = search_series_by_tmdb(search_tmdb)
+        if series:
+            season_item = get_season_by_number(series.get("Id", ""), season_num)
+            if season_item:
+                season_item_id = season_item.get("Id", "")
+                if delete_emby_item(season_item_id):
+                    logger.info(
+                        "[CaseC-Resolve] task=%d Emby API 已删除 '%s' S%d (ItemId=%s)",
+                        task.id, title, season_num, season_item_id,
+                    )
+
+        # ---- 执行移动 ----
+        vr = _execute_pending_season_move(cd2, task, entry, db)
+        entry["status"] = "resolved" if vr["verified"] else "failed"
+        entry["verify_result"] = vr
+        any_resolved = True
+        resolved_count += 1
+
+    if any_resolved:
+        all_done = all(
+            e.get("status") in ("resolved", "failed")
+            for e in pending
+        )
+        if all_done:
+            # 全部完成 → 清理种子 → COMPLETED
+            qb_config_id = ctx.get("qb_config_id", "")
+            season_dirs = [
+                e.get("organized_source", {}).get("dir_name", "")
+                for e in pending
+            ]
+            qb_result = _delete_qb_torrents_by_title(
+                qb_config_id, title, season_dir_names=season_dirs,
+            )
+            for tname in qb_result.get("deleted_names", []) or []:
+                _write_action_log(
+                    db, task.id, task.tmdb_id, title,
+                    ActionType.DELETE_TORRENT.value,
+                    target_name=tname,
+                    reason=f"Case C {mode} 完成，清理种子",
+                )
+            task.status = TaskStatus.COMPLETED.value
+            task.error_message = None
+            logger.info(
+                "[CaseC-Resolve] task=%d '%s' COMPLETED: %d 个 pending resolved, %d 个种子已删除",
+                task.id, title, len(pending), qb_result.get("deleted_count", 0),
+            )
+        task.context = {**ctx, "pending_season_deletes": pending}
+        task.updated_at = datetime.now()
+        db.commit()
+
+    return resolved_count
+
+
+def _drain_pending_tasks_for_show(tmdb_id: int, db: Session) -> int:
+    """在 auto_process_show 入口处排空同剧集的所有 pending 任务。
+
+    处理两种 pending 状态：
+    - WAITING_FOR_DELETE_WEBHOOK (Case B): 整剧删除等待 webhook
+    - WAITING_FOR_SEASON_DELETE_WEBHOOK (Case C): 单季删除等待 webhook
+
+    通过提前 drain，避免：
+    1. 旧任务无限期卡在 pending 状态
+    2. 新扫描创建重复任务，产生两条时间线
+    3. 媒体库目录被 Case B 删除后，新扫描误走 Case A 重复移动
+
+    返回 drain 掉的任务数量。
+    """
+    # ---- Case B: 整剧删除 pending ----
+    case_b_tasks = (
+        db.query(AutoTaskFlow)
+        .filter(
+            AutoTaskFlow.tmdb_id == tmdb_id,
+            AutoTaskFlow.status == TaskStatus.WAITING_FOR_DELETE_WEBHOOK.value,
+        )
+        .all()
+    )
+    for task in case_b_tasks:
+        ctx = task.context or {}
+        title = ctx.get("title", "Unknown")
+        logger.info(
+            "[Drain] task=%d '%s' (Case B) 在入口处 drain — "
+            "已等待 %s",
+            task.id, title,
+            str(datetime.now() - (task.created_at or datetime.now())).split(".")[0]
+            if task.created_at else "未知",
+        )
+        _resolve_single_case_b_task(task, db)
+
+    # ---- Case C: 单季删除 pending ----
+    case_c_tasks = (
+        db.query(AutoTaskFlow)
+        .filter(
+            AutoTaskFlow.tmdb_id == tmdb_id,
+            AutoTaskFlow.status == TaskStatus.WAITING_FOR_SEASON_DELETE_WEBHOOK.value,
+        )
+        .all()
+    )
+    for task in case_c_tasks:
+        ctx = task.context or {}
+        title = ctx.get("title", "Unknown")
+        logger.info(
+            "[Drain] task=%d '%s' (Case C) 在入口处 drain",
+            task.id, title,
+        )
+        _resolve_single_case_c_task(task, db, force=True)
+
+    return len(case_b_tasks) + len(case_c_tasks)
+
+
+def resolve_season_delete_timeouts(db: Session) -> int:
+    """扫描所有 pending 任务，处理超时的 entry。
+
+    覆盖两种类型：
+    - WAITING_FOR_DELETE_WEBHOOK (Case B): 整剧删除超过 30 分钟未收到 webhook
+    - WAITING_FOR_SEASON_DELETE_WEBHOOK (Case C): 单季 pending 超过 10 分钟
+
+    返回本次处理的 entry 数量。
+    """
+    now = datetime.now()
+    resolved_count = 0
+
+    # =====================================================================
+    # Case B: 整剧删除超时（30 分钟）
+    # =====================================================================
+    case_b_tasks = (
+        db.query(AutoTaskFlow)
+        .filter(
+            AutoTaskFlow.status == TaskStatus.WAITING_FOR_DELETE_WEBHOOK.value,
+        )
+        .all()
+    )
+    for task in case_b_tasks:
+        if task.created_at is None:
+            continue
+        age = now - task.created_at
+        if age < timedelta(minutes=30):
+            continue  # 未超时
+
+        ctx = task.context or {}
+        title = ctx.get("title", "Unknown")
+        logger.info(
+            "[TimeoutScan] Case B task=%d '%s' 已超时 %s",
+            task.id, title, str(age).split(".")[0],
+        )
+
+        # ---- 执行阶段二（内部含 Emby API 守卫）----
+        _resolve_single_case_b_task(task, db, do_emby_cleanup=True)
+        resolved_count += 1
+
+    # =====================================================================
+    # Case C: 单季删除超时（10 分钟 — 由 entry 级别的 timeout_at 控制）
+    # =====================================================================
+    case_c_tasks = (
+        db.query(AutoTaskFlow)
+        .filter(
+            AutoTaskFlow.status == TaskStatus.WAITING_FOR_SEASON_DELETE_WEBHOOK.value,
+        )
+        .all()
+    )
+    for task in case_c_tasks:
+        count = _resolve_single_case_c_task(task, db, force=False)
+        resolved_count += count
+
+    return resolved_count
+
+
+# ---------------------------------------------------------------------------
 # 阶段二：处理 library.deleted webhook → 重建目录 + 移动 + 校验 + 清理种子
 # ---------------------------------------------------------------------------
 
 def handle_library_deleted_webhook(payload: dict, db: Session) -> bool:
-    """处理 Emby 'library.deleted' webhook（仅整剧删除事件）。
+    """处理 Emby 'library.deleted' webhook。
 
-    这是洗版流程的第二阶段（也是最终阶段）。阶段一 (auto_process) 通过 CD2
-    删除了媒体库中的整个剧集目录，并将详情保存到 WAITING_FOR_DELETE_WEBHOOK
-    任务中。Emby 通过触发此 webhook 确认删除已完成 — 此时可以安全地重建剧集
-    目录、将已完结 Season 移入、逐字节校验、并删除 qBittorrent 种子 — 全部
-    在 webhook handler 内联完成。
+    支持两种删除事件：
+    1. **整剧删除** (Type=Series): Case B 阶段二 —
+       重建目录 → 移动 Season → 校验 → 清理种子。
+    2. **单季删除** (Type=Season): Case C 阶段二 —
+       匹配 pending_season_deletes → 移动替换 → 校验。
+       （仅处理 WAITING_FOR_SEASON_DELETE_WEBHOOK 任务，
+       非等待状态的 Season 删除事件直接忽略。）
 
     种子删除由**文件系统校验**（fileCount + totalSize 匹配）决定，
     不再依赖 Emby 的 library.new webhook。
     """
-    from utils.path_utils import extract_tmdb_id_from_payload
+    from utils.path_utils import extract_tmdb_id_from_payload, extract_tmdb_id_from_path
 
-    tmdb_id = extract_tmdb_id_from_payload(payload)
+    item = payload.get("Item", {})
+    item_type = item.get("Type", "")
+
+    # =================================================================
+    # TMDB ID 提取策略：
+    # - Series 事件: 使用 ProviderIds → Path 的优先级（现有逻辑）
+    # - Season 事件: ProviderIds 中是 Season 级别的 TMDB ID（与
+    #   任务存储的 Show 级别 TMDB ID 不同），优先使用 Path 中的
+    #   Show 级别 TMDB ID
+    # =================================================================
+    if item_type == "Season":
+        # Season 事件优先从 Path 提取 Show 级别 TMDB ID
+        path_tmdb = extract_tmdb_id_from_path(item.get("Path", ""))
+        if path_tmdb is not None:
+            tmdb_id = path_tmdb
+        else:
+            tmdb_id = extract_tmdb_id_from_payload(payload)  # fallback
+    else:
+        tmdb_id = extract_tmdb_id_from_payload(payload)
+
     if tmdb_id is None:
         logger.debug("library.deleted: 未找到 TMDB ID，跳过")
         return False
 
-    item = payload.get("Item", {})
-    if item.get("Type") != "Series":
-        logger.debug(f"library.deleted: Type={item.get('Type')}，跳过")
+    # =====================================================================
+    # 分支 A: Season 级别删除 → Case C 阶段二
+    # =====================================================================
+    if item_type == "Season":
+        season_num = item.get("IndexNumber")
+        if season_num is None:
+            logger.debug("library.deleted: Season 事件无 IndexNumber，跳过")
+            return False
+
+        logger.info(
+            "library.deleted: tmdb=%d Type=Season S%d — 查找 pending task",
+            tmdb_id, season_num,
+        )
+
+        # 查找匹配的 WAITING_FOR_SEASON_DELETE_WEBHOOK 任务
+        tasks = (
+            db.query(AutoTaskFlow)
+            .filter(
+                AutoTaskFlow.tmdb_id == tmdb_id,
+                AutoTaskFlow.status == TaskStatus.WAITING_FOR_SEASON_DELETE_WEBHOOK.value,
+            )
+            .order_by(desc(AutoTaskFlow.created_at))
+            .all()
+        )
+
+        if not tasks:
+            logger.debug(
+                "library.deleted: tmdb=%d S%d — 无 WAITING_FOR_SEASON_DELETE_WEBHOOK 任务，跳过",
+                tmdb_id, season_num,
+            )
+            return False
+
+        cd2 = get_cd2_client()
+        any_handled = False
+
+        for task in tasks:
+            ctx = task.context or {}
+            pending = ctx.get("pending_season_deletes", [])
+            if not pending:
+                continue
+
+            title = ctx.get("title", "Unknown")
+            matched_entry = None
+
+            for entry in pending:
+                if entry.get("status") != "pending":
+                    continue
+                if entry.get("season") == season_num:
+                    matched_entry = entry
+                    break
+
+            if matched_entry is None:
+                continue  # 该任务的 pending 列表中无此 Season
+
+            logger.info(
+                "[%s] library.deleted webhook 确认 S%d 删除 — 执行 organized → media 移动",
+                title, season_num,
+            )
+
+            # 执行移动 + 校验
+            vr = _execute_pending_season_move(cd2, task, matched_entry, db)
+            matched_entry["status"] = "resolved" if vr["verified"] else "failed"
+            matched_entry["verify_result"] = vr
+            any_handled = True
+
+            # 检查是否所有 pending 都已 resolved
+            all_done = all(
+                e.get("status") in ("resolved", "failed")
+                for e in pending
+            )
+
+            if all_done:
+                # 全部完成 → 清理 qB 种子 → COMPLETED
+                qb_config_id = ctx.get("qb_config_id", "")
+                season_dirs = [
+                    e.get("organized_source", {}).get("dir_name", "")
+                    for e in pending
+                ]
+                qb_result = _delete_qb_torrents_by_title(
+                    qb_config_id, title, season_dir_names=season_dirs,
+                )
+
+                # 记录种子操作日志
+                for tname in qb_result.get("deleted_names", []) or []:
+                    _write_action_log(
+                        db, task.id, tmdb_id, title,
+                        ActionType.DELETE_TORRENT.value,
+                        target_name=tname,
+                        reason="Case C 阶段二完成，清理种子",
+                    )
+                for tname in qb_result.get("skipped_incomplete", []) or []:
+                    _write_action_log(
+                        db, task.id, tmdb_id, title,
+                        ActionType.KEEP_TORRENT.value,
+                        target_name=tname,
+                        reason="种子未下载完成，保留",
+                    )
+
+                task.status = TaskStatus.COMPLETED.value
+                task.error_message = None
+                task.context = {**ctx, "pending_season_deletes": pending}
+                task.updated_at = datetime.now()
+
+                failed_entries = [e for e in pending if e.get("status") == "failed"]
+                if failed_entries:
+                    logger.warning(
+                        "[%s] Case C 阶段二: %d 个 Season 完成，%d 个失败 — "
+                        "种子已清理但请人工核实失败项",
+                        title, len(pending) - len(failed_entries), len(failed_entries),
+                    )
+
+                logger.info(
+                    "[%s] Case C 阶段二完成: %d 个 Season, %d 个种子已删除",
+                    title, len(pending), qb_result.get("deleted_count", 0),
+                )
+            else:
+                # 还有未完成的 pending — 保持状态等待下一个 webhook
+                task.context = {**ctx, "pending_season_deletes": pending}
+                task.updated_at = datetime.now()
+                logger.info(
+                    "[%s] Case C 阶段二: S%d 完成，还有 %d 个 pending 等待 webhook",
+                    title, season_num,
+                    sum(1 for e in pending if e.get("status") == "pending"),
+                )
+
+            db.commit()
+
+        return any_handled
+
+    # =====================================================================
+    # 分支 B: Series 级别删除 → Case B 阶段二（原有逻辑，不变）
+    # =====================================================================
+    if item_type != "Series":
+        logger.debug(f"library.deleted: Type={item_type}，跳过")
         return False
 
     # ---- 区分 PARTIAL（部分删除）与 FULL（整剧删除）----

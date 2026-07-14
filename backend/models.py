@@ -8,7 +8,8 @@ from datetime import datetime
 class TaskStatus(str, enum.Enum):
     """自动化任务状态枚举"""
     INIT = "INIT"
-    WAITING_FOR_DELETE_WEBHOOK = "WAITING_FOR_DELETE_WEBHOOK"
+    WAITING_FOR_DELETE_WEBHOOK = "WAITING_FOR_DELETE_WEBHOOK"               # Case B: 整剧删除等待 Emby webhook
+    WAITING_FOR_SEASON_DELETE_WEBHOOK = "WAITING_FOR_SEASON_DELETE_WEBHOOK"  # Case C: 单季删除等待 Emby webhook
     WAITING_FOR_NEW_WEBHOOK = "WAITING_FOR_NEW_WEBHOOK"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"

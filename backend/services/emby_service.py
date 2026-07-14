@@ -280,3 +280,91 @@ def cleanup_emby_zombie(cd2_path: str) -> bool:
         item_name, item_id,
     )
     return delete_emby_item(item_id)
+
+
+# ==========================================
+# Case C 超时兜底：Emby API 辅助方法
+# ==========================================
+
+def search_series_by_tmdb(tmdb_id: int) -> dict | None:
+    """在 Emby 中按 TMDB ID 搜索剧集（Series）。
+
+    使用 Emby 的 AnyProviderIdEquals 查询参数精确匹配 TMDB ID。
+
+    Args:
+        tmdb_id: TMDB 剧集 ID
+
+    Returns:
+        匹配的 Series Item dict，或 None
+    """
+    host = _emby_host()
+    headers = _make_headers()
+    if not host or not headers:
+        logger.warning("Emby search_series_by_tmdb 失败: 缺少 emby_host 或 emby_api_key")
+        return None
+
+    try:
+        url = f"{host}/emby/Items"
+        params = {
+            "IncludeItemTypes": "Series",
+            "AnyProviderIdEquals": f"tmdb.{tmdb_id}",
+            "Recursive": "true",
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            logger.warning("Emby search_series_by_tmdb(%d) failed: HTTP %d", tmdb_id, resp.status_code)
+            return None
+        items = resp.json().get("Items", [])
+        if not items:
+            logger.info("Emby search_series_by_tmdb(%d): 未找到匹配项", tmdb_id)
+            return None
+        return items[0]
+    except Exception as e:
+        logger.warning("Emby search_series_by_tmdb(%d) error: %s", tmdb_id, e)
+        return None
+
+
+def get_season_by_number(series_id: str, season_number: int) -> dict | None:
+    """在 Emby 中查找指定 Series 下的特定 Season。
+
+    Args:
+        series_id: Emby Series Item ID
+        season_number: Season 编号（如 4 表示 Season 4）
+
+    Returns:
+        匹配的 Season Item dict，或 None
+    """
+    host = _emby_host()
+    headers = _make_headers()
+    if not host or not headers:
+        logger.warning("Emby get_season_by_number 失败: 缺少配置")
+        return None
+
+    try:
+        url = f"{host}/emby/Items"
+        params = {
+            "ParentId": series_id,
+            "IncludeItemTypes": "Season",
+            "IndexNumber": season_number,
+        }
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(
+                "Emby get_season_by_number(series=%s, S%d) failed: HTTP %d",
+                series_id, season_number, resp.status_code,
+            )
+            return None
+        items = resp.json().get("Items", [])
+        if not items:
+            logger.info(
+                "Emby get_season_by_number(series=%s, S%d): 未找到",
+                series_id, season_number,
+            )
+            return None
+        return items[0]
+    except Exception as e:
+        logger.warning(
+            "Emby get_season_by_number(series=%s, S%d) error: %s",
+            series_id, season_number, e,
+        )
+        return None

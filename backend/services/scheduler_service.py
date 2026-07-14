@@ -444,3 +444,35 @@ def load_all_tasks() -> None:
         logger.error("[Scheduler] 加载任务失败: %s", e)
     finally:
         db.close()
+
+    # ---- 注册 Case C 超时兜底检查任务（每 60 秒执行一次）----
+    try:
+        scheduler.add_job(
+            _season_delete_timeout_job,
+            trigger="interval",
+            seconds=60,
+            id="season_delete_timeout_check",
+            replace_existing=True,
+        )
+        logger.info("[Scheduler] 已注册 Case C 超时兜底检查 (interval=60s)")
+    except Exception as e:
+        logger.error("[Scheduler] 注册超时检查任务失败: %s", e)
+
+
+async def _season_delete_timeout_job():
+    """超时兜底检查 — 在线程中运行以支持同步 DB 操作。"""
+    import asyncio
+    from services.task_flow_service import resolve_season_delete_timeouts
+
+    def _run():
+        db: Session = _get_db()
+        try:
+            count = resolve_season_delete_timeouts(db)
+            if count > 0:
+                logger.info("[TimeoutCheck] 处理了 %d 个超时的 pending Season", count)
+        except Exception as e:
+            logger.error("[TimeoutCheck] 执行失败: %s", e)
+        finally:
+            db.close()
+
+    await asyncio.to_thread(_run)
