@@ -401,7 +401,7 @@ const handleSizeChange = (size) => {
             <span class="time-cell">{{ formatTime(row.updated_at) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180" align="center" fixed="right">
+        <el-table-column label="操作" width="180" align="center">
           <template #default="{ row }">
             <div class="action-cell">
               <button class="btn-pill btn-pill-view" @click.stop="openTimeline(row)">
@@ -930,6 +930,17 @@ const handleSizeChange = (size) => {
   .dashboard-container {
     padding: 8px;
   }
+  .dashboard-header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .header-right {
+    width: 100%;
+  }
+  .header-right .btn-pill-refresh {
+    width: 100%;
+    justify-content: center;
+  }
   .stats-grid {
     grid-template-columns: repeat(2, 1fr);
     gap: 10px;
@@ -946,11 +957,29 @@ const handleSizeChange = (size) => {
     align-items: flex-start;
     gap: 10px;
   }
+  .toolbar-right {
+    width: 100%;
+    justify-content: space-between;
+  }
   .filter-group {
     width: 100%;
   }
   .filter-group .el-select {
     width: 100% !important;
+  }
+  /* 表格水平滚动 — 防止操作列遮挡内容 */
+  .table-section {
+    overflow-x: auto;
+  }
+  .table-section :deep(.el-table) {
+    min-width: 700px;
+  }
+  .action-cell {
+    gap: 4px;
+  }
+  .action-cell .btn-pill {
+    padding: 4px 8px;
+    font-size: 11px;
   }
   :deep(.timeline-drawer) {
     --el-drawer-size: 90vw !important;

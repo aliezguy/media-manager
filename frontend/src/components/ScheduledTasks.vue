@@ -322,7 +322,7 @@ onMounted(() => {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="260">
           <template #default="{ row }">
             <div class="action-btns">
               <el-button size="small" type="primary" link @click="openEditDialog(row)">
@@ -885,8 +885,8 @@ onMounted(() => {
 /* ==================== 移动端响应式 ==================== */
 @media (max-width: 768px) {
   .scheduler-root {
-    padding: 12px;
-    gap: 12px;
+    padding: 8px;
+    gap: 10px;
   }
 
   .page-header {
@@ -903,6 +903,14 @@ onMounted(() => {
 
   .page-title {
     font-size: 17px;
+  }
+
+  /* 表格水平滚动 — 防止操作列遮挡内容 */
+  .table-card {
+    overflow-x: auto;
+  }
+  .table-card :deep(.el-table) {
+    min-width: 700px;
   }
 
   .action-btns {

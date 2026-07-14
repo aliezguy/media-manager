@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Delete, CircleCheck, Loading, Monitor, Close, Filter, Setting, Right } from '@element-plus/icons-vue'
@@ -540,6 +540,15 @@ const getStateColor = (state) => {
 // 基础路径（从配置中读取，带 fallback 默认值）
 const CD2_MEDIA_BASE = ref('/80003588/emby库/电视剧/')
 const CD2_ORGANIZED_BASE = ref('/80003588/网盘整理/完结整理/电视剧/')
+
+// ==================== 移动端响应式 ====================
+const windowWidth = ref(window.innerWidth)
+const isMobile = computed(() => windowWidth.value < 768)
+const showCD2 = ref(false)  // 移动端 CD2 默认收起
+
+const onWindowResize = () => {
+  windowWidth.value = window.innerWidth
+}
 
 // --- CD2 区域拖拽调整大小 ---
 const cd2SectionHeight = ref(null)  // null = 自动高度, number = 固定 px
@@ -1684,6 +1693,11 @@ onMounted(async () => {
   cd2MediaPath.value = cd2MediaRoot.value
   cd2OrganizedPath.value = cd2OrganizedRoot.value
   loadCD2Data()
+  window.addEventListener('resize', onWindowResize)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', onWindowResize)
 })
 </script>
 
@@ -2096,7 +2110,7 @@ onMounted(async () => {
     </div>
 
     <!-- ==================== CD2 网盘目录浏览 (导航版) ==================== -->
-    <div class="cd2-section" :style="cd2SectionHeight ? { height: cd2SectionHeight + 'px', flexShrink: '0', flex: 'none' } : {}">
+    <div class="cd2-section" :class="{ 'cd2-collapsed': isMobile && !showCD2 }" :style="cd2SectionHeight && !isMobile ? { height: cd2SectionHeight + 'px', flexShrink: '0', flex: 'none' } : {}">
       <!-- Section Header -->
       <div class="cd2-section-header">
         <div class="cd2-section-title">
@@ -2121,6 +2135,13 @@ onMounted(async () => {
           </span>
         </div>
         <div class="cd2-header-actions">
+          <button
+            v-if="isMobile"
+            class="cd2-toggle-btn"
+            @click="showCD2 = !showCD2"
+          >
+            {{ showCD2 ? '收起 ▲' : '展开 ▼' }}
+          </button>
           <button class="cd2-refresh-btn" :disabled="cd2Loading" @click="loadCD2Data">
             <el-icon :size="14" :class="{ 'is-loading': cd2Loading }"><Loading /></el-icon>
             {{ cd2Loading ? '加载中...' : '刷新' }}
@@ -2128,20 +2149,22 @@ onMounted(async () => {
         </div>
       </div>
 
-      <!-- 加载中 -->
-      <div v-if="cd2Loading" class="cd2-loading">
-        <el-icon :size="24" class="is-loading" color="var(--accent-blue)"><Loading /></el-icon>
-        <span>正在连接 CloudDrive2 ...</span>
-      </div>
+      <!-- 移动端：内容可折叠 -->
+      <template v-if="!isMobile || showCD2">
+        <!-- 加载中 -->
+        <div v-if="cd2Loading" class="cd2-loading">
+          <el-icon :size="24" class="is-loading" color="var(--accent-blue)"><Loading /></el-icon>
+          <span>正在连接 CloudDrive2 ...</span>
+        </div>
 
-      <!-- 错误 -->
-      <div v-else-if="cd2Error" class="cd2-error">
-        <span class="cd2-error-icon">⚠️</span>
-        <span>{{ cd2Error }}</span>
-      </div>
+        <!-- 错误 -->
+        <div v-else-if="cd2Error" class="cd2-error">
+          <span class="cd2-error-icon">⚠️</span>
+          <span>{{ cd2Error }}</span>
+        </div>
 
-      <!-- 数据内容：双列 -->
-      <div v-else class="cd2-split">
+        <!-- 数据内容：双列 -->
+        <div v-else class="cd2-split">
         <!-- ===== 左列：媒体库（待整理） ===== -->
         <div class="cd2-col">
           <div class="cd2-col-header">
@@ -2513,6 +2536,7 @@ onMounted(async () => {
           </div>
         </div>
       </div>
+      </template>
     </div>
   </div>
 
@@ -4038,6 +4062,8 @@ onMounted(async () => {
   .cleanup-container {
     padding: 8px;
     gap: 10px;
+    overflow-y: auto;
+    overflow-x: hidden;
   }
 
   .cleanup-header {
@@ -4074,6 +4100,8 @@ onMounted(async () => {
   .split-view {
     grid-template-columns: 1fr;
     gap: 12px;
+    flex: none;
+    min-height: 400px;
   }
 
   .col-header {
@@ -4100,17 +4128,53 @@ onMounted(async () => {
   .cd2-section {
     padding-top: 10px;
     gap: 8px;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .cd2-section.cd2-collapsed {
+    /* 收起状态：只显示 header，隐藏内部内容 */
+    min-height: auto;
   }
 
   .cd2-section-header {
-    flex-direction: column;
-    align-items: flex-start;
+    flex-direction: row;
+    align-items: center;
     gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .cd2-section-title {
+    flex: 1;
+    min-width: 0;
+    flex-wrap: wrap;
   }
 
   .cd2-header-actions {
-    width: 100%;
-    justify-content: space-between;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .cd2-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-full);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
+  .cd2-toggle-btn:hover {
+    border-color: var(--accent-blue);
+    color: var(--accent-blue);
+    background: var(--accent-blue-soft);
   }
 
   .cd2-split {
@@ -4124,6 +4188,7 @@ onMounted(async () => {
 
   .cd2-nav-bar {
     gap: 6px;
+    flex-wrap: wrap;
   }
 
   .cd2-file-item {
@@ -4136,6 +4201,23 @@ onMounted(async () => {
 
   .cd2-crumb {
     font-size: 10px;
+  }
+
+  /* 移动端隐藏拖拽手柄 */
+  .cd2-resize-handle {
+    display: none;
+  }
+
+  /* 移动端导航栏按钮缩小/换行 */
+  .cd2-nav-bar .cd2-identify-btn,
+  .cd2-nav-bar .cd2-season-check-btn,
+  .cd2-nav-bar .cd2-clear-check-btn,
+  .cd2-nav-bar .cd2-auto-process-btn,
+  .cd2-nav-bar .cd2-delete-dir-btn,
+  .cd2-nav-bar .cd2-move-dir-btn {
+    font-size: 10px;
+    padding: 3px 8px;
+    white-space: nowrap;
   }
 }
 
