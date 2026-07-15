@@ -93,7 +93,7 @@ def update_subscription(payload):
     try:
         url = f"{host}/api/v1/subscribe/"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        resp = requests.put(url, json=payload, headers=headers, timeout=10)
+        resp = requests.put(url, json=payload, headers=headers, timeout=30)
         return resp.status_code == 200
     except Exception as e:
         logger.error(f"❌ 更新异常: {e}")
@@ -109,7 +109,7 @@ def get_subscription(sub_id):
     try:
         url = f"{host}/api/v1/subscribe/{sub_id}"
         headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(url, headers=headers, timeout=30)
         if resp.status_code == 200:
             return resp.json()
     except Exception as e:
@@ -165,7 +165,7 @@ def add_wash_subscription(payload):
         
         url = f"{host}/api/v1/subscribe/"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
         
         # 判断结果
         if resp.status_code == 200:
@@ -521,7 +521,7 @@ def recognize_torrent_with_mp(torrent_name: str) -> dict | None:
             url,
             headers=headers,
             params={"title": torrent_name},
-            timeout=10,
+            timeout=30,
         )
         if resp.status_code != 200:
             logger.debug("MP recognize HTTP %d for '%s'", resp.status_code, torrent_name[:60])
