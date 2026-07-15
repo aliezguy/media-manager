@@ -67,8 +67,14 @@ _VIDEO_EXTENSIONS = {
 _SEASON_RE = re.compile(r'^[Ss]eason\s+(\d+)\b')
 
 # 用于区分 PARTIAL（部分）删除事件与 FULL（整剧）删除事件的正则表达式
-_PARTIAL_DELETE_RE = re.compile(r'从\s+\S+\s+中删除了\s+\d+\s*项目')
-_FULL_DELETE_RE = re.compile(r'从\s*mediaServer\s*中删除了')
+# Emby 不同版本的 webhook 标题格式不同：
+#   FULL:    "从 mediaServer 中删除了 <剧名>" / "已删除了 mediaServer 中的 <剧名>"
+#   PARTIAL: "从...删除了 N 项目" / "mediaServer 上已移除了 <剧名> 中的 N 项"
+#
+# 策略：PARTIAL 按语义匹配 — 标题中含 "N 项" 或 "N 项目"（有数量=部分删除）
+#       FULL 按语义匹配 — 标题中含 "mediaServer" + "删除"或"移除"（先被 PARTIAL 筛选后余下的就是整剧删除）
+_PARTIAL_DELETE_RE = re.compile(r'\d+\s*(?:项|项目)')
+_FULL_DELETE_RE = re.compile(r'(?:mediaServer.*(?:删除|移除)|(?:删除|移除).*mediaServer)')
 
 
 def _sanitize_cd2_path(path: str) -> str:

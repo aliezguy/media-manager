@@ -17,7 +17,7 @@ from sqlalchemy import desc
 
 from database import get_db
 from models import AutoTaskFlow, TaskStatus, TaskActionLog, ActionType
-from services.cd2_service import get_cd2_client
+from services.cd2_service import get_client as get_cd2_client
 
 logger = logging.getLogger(__name__)
 
