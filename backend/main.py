@@ -48,7 +48,7 @@ logging.getLogger("main").info("Emby AI Manager 启动 — 日志文件: %s", LO
 logging.getLogger("main").info("=" * 60)
 
 # 导入路由
-from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router
+from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router, douban
 
 # 初始化数据库表
 Base.metadata.create_all(bind=engine)
@@ -91,6 +91,7 @@ app.include_router(organize_router.router, prefix="/api", tags=["Organize"])
 app.include_router(task_flow_router.router, prefix="/api", tags=["TaskFlow"])
 app.include_router(task_dashboard_router.router, prefix="/api", tags=["Dashboard"])
 app.include_router(scheduler_router.router, prefix="/api", tags=["Scheduler"])
+app.include_router(douban.router, prefix="/api", tags=["Douban"])
 if os.path.exists("backend/static"):
     app.mount("/", StaticFiles(directory="backend/static", html=True), name="static")
 if __name__ == "__main__":

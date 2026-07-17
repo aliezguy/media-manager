@@ -1,6 +1,6 @@
 <script setup>
 import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
-import { Files, Connection, VideoCameraFilled, Expand, Fold, Timer, Box, EditPen, Menu, Brush, DataAnalysis, Calendar } from '@element-plus/icons-vue'
+import { Files, Connection, VideoCameraFilled, Expand, Fold, Timer, Box, EditPen, Menu, Brush, DataAnalysis, Calendar, User } from '@element-plus/icons-vue'
 
 import TagManager from './components/TagManager.vue'
 import EmbySettings from './components/EmbySettings.vue'
@@ -11,6 +11,7 @@ import FileEditor from './components/FileEditor.vue'
 import TorrentCleanup from './components/TorrentCleanup.vue'
 import TaskDashboard from './components/TaskDashboard.vue'
 import ScheduledTasks from './components/ScheduledTasks.vue'
+import ActorLocalizationStudio from './components/ActorLocalizationStudio.vue'
 
 const isCollapse = ref(false)
 const activeMenu = ref('manager')
@@ -26,6 +27,7 @@ const menuItems = [
   { index: 'qb', label: '下载管理', icon: Box, component: QbManager },
   { index: 'cleanup', label: '种子清理', icon: Brush, component: TorrentCleanup },
   { index: 'dashboard', label: '大盘', icon: DataAnalysis, component: TaskDashboard },
+  { index: 'actor', label: '演职员', icon: User, component: ActorLocalizationStudio },
   { index: 'scheduler', label: '定时扫描', icon: Calendar, component: ScheduledTasks },
   { index: 'emby', label: 'Emby', icon: Connection, component: EmbySettings },
   { index: 'mp', label: '配置', icon: VideoCameraFilled, component: MpConfig },

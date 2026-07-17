@@ -37,6 +37,11 @@ class LibraryItemsRequest(AppConfig):
 class SearchRequest(AppConfig):
     search_term: str
 
+class ActorItemsRequest(AppConfig):
+    library_id: str
+    limit: int = 50
+    start_index: int = 0
+
 class AISingleRequest(AppConfig):
     item_id: str
     force_refresh: bool = False
@@ -501,7 +506,7 @@ def get_library_items(req: LibraryItemsRequest):
     try:
         res = requests.get(url, params=params)
         res.raise_for_status()
-        return {"items": process_emby_items(res.json().get('Items', [])), "total": res.json().get('TotalRecordCount')}
+        return {"items": process_emby_items(res.json().get("Items") or []), "total": res.json().get('TotalRecordCount')}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -517,7 +522,53 @@ def search_items(req: SearchRequest):
     try:
         res = requests.get(url, params=params)
         res.raise_for_status()
-        return {"items": process_emby_items(res.json().get('Items', []))}
+        return {"items": process_emby_items(res.json().get("Items") or [])}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+def process_actor_items(items):
+    if not items:
+        return []
+    """处理 Emby 返回的项目列表，保留 People 和 ProviderIds。"""
+    result = []
+    for item in items:
+        people = item.get('People', []) or []
+        actors = [p for p in people if p.get('Type') == 'Actor']
+        result.append({
+            "id": item.get('Id'),
+            "name": item.get('Name', ''),
+            "year": item.get('ProductionYear'),
+            "type": item.get('Type', ''),
+            "library": item.get('CollectionType', ''),
+            "actors": actors,
+            "provider_ids": item.get('ProviderIds', {}) or {}
+        })
+    return result
+
+@router.post("/actor_items")
+def get_actor_items(req: ActorItemsRequest):
+    """获取指定库下的媒体项（含演员和 ProviderIds，供演职员治理页面使用）。"""
+    url = f"{req.emby_host}/emby/Users/{req.emby_user_id}/Items"
+    params = {
+        'IncludeItemTypes': 'Series,Movie', 'Recursive': 'true',
+        'ParentId': req.library_id,
+        'Fields': 'People,ProviderIds,ProductionYear',
+        'SortBy': 'DateCreated', 'SortOrder': 'Descending',
+        'api_key': req.emby_api_key
+    }
+    if req.limit != -1:
+        params['Limit'] = req.limit
+    if req.start_index:
+        params['StartIndex'] = req.start_index
+    try:
+        res = requests.get(url, params=params)
+        res.raise_for_status()
+        items = process_actor_items(res.json().get("Items") or [])
+        total = res.json().get('TotalRecordCount', 0) or len(items)
+
+        return {"items": items, "total": total}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
