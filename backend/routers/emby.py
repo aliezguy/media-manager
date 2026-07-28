@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.orm import Session
-from database import get_db
-from models import MediaTag
+from database import get_db, SessionLocal
+from models import MediaTag, MediaSyncStatus
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import requests
@@ -41,6 +41,8 @@ class ActorItemsRequest(AppConfig):
     library_id: str
     limit: int = 50
     start_index: int = 0
+    status_filter: Optional[str] = None  # 'synced' | 'pending' | None(全部)
+    search: Optional[str] = None  # 服务端全局搜索关键词（按名称模糊匹配）
 
 class AISingleRequest(AppConfig):
     item_id: str
@@ -549,8 +551,72 @@ def process_actor_items(items):
 
 @router.post("/actor_items")
 def get_actor_items(req: ActorItemsRequest):
-    """获取指定库下的媒体项（含演员和 ProviderIds，供演职员治理页面使用）。"""
+    """获取指定库下的媒体项（含演员和 ProviderIds，供演职员治理页面使用）。
+
+    支持 status_filter 参数进行服务端状态筛选:
+    - 'synced':  只返回 media_sync_status 中 status='synced' 的项
+    - 'pending': 只返回 media_sync_status 中 status!='synced' 的项
+    - None/空:   返回全部（原逻辑：从 Emby 分页 + JOIN DB 状态）
+    """
     url = f"{req.emby_host}/emby/Users/{req.emby_user_id}/Items"
+
+    # ---- 带状态筛选：DB 优先 ----
+    if req.status_filter:
+        db = SessionLocal()
+        try:
+            base_q = db.query(MediaSyncStatus).filter(
+                MediaSyncStatus.library_id == req.library_id
+            )
+            if req.status_filter == 'synced':
+                base_q = base_q.filter(MediaSyncStatus.status == 'synced')
+            else:
+                # pending: status 为 'pending' 或 NULL（尚未审计过）
+                base_q = base_q.filter(
+                    (MediaSyncStatus.status != 'synced') | (MediaSyncStatus.status == None)
+                )
+
+            # ★ 服务端全局搜索：按标题模糊匹配
+            if req.search:
+                base_q = base_q.filter(MediaSyncStatus.title.ilike(f'%{req.search}%'))
+
+            total = base_q.count()
+            rows = base_q.order_by(
+                MediaSyncStatus.update_time.desc()
+            ).offset(req.start_index).limit(req.limit).all()
+
+            matching_ids = [r.emby_item_id for r in rows]
+            if not matching_ids:
+                return {"items": [], "total": total}
+
+            # 去 Emby 按 ID 批量拉取详情
+            id_params = {
+                'Ids': ','.join(matching_ids),
+                'Fields': 'People,ProviderIds,ProductionYear',
+                'api_key': req.emby_api_key,
+            }
+            resp = requests.get(url, params=id_params, timeout=30)
+            resp.raise_for_status()
+            raw_items = resp.json().get("Items") or []
+            items = process_actor_items(raw_items)
+
+            # 按 DB 查询顺序重排（Emby 返回顺序不保证与 Ids 一致）
+            id_order = {id_: idx for idx, id_ in enumerate(matching_ids)}
+            items.sort(key=lambda it: id_order.get(it.get("id", ""), 9999))
+
+            # 注入 DB 状态
+            status_map = {r.emby_item_id: r.to_dict() for r in rows}
+            for it in items:
+                sid = it.get("id", "")
+                rec = status_map.get(sid, {})
+                it["sync_status"] = rec.get("status", "pending")
+                it["sync_matched"] = rec.get("matched_actors", 0)
+                it["sync_total"] = rec.get("total_actors", 0)
+
+            return {"items": items, "total": total}
+        finally:
+            db.close()
+
+    # ---- 无状态筛选：Emby 分页 + JOIN DB ----
     params = {
         'IncludeItemTypes': 'Series,Movie', 'Recursive': 'true',
         'ParentId': req.library_id,
@@ -562,11 +628,40 @@ def get_actor_items(req: ActorItemsRequest):
         params['Limit'] = req.limit
     if req.start_index:
         params['StartIndex'] = req.start_index
+    # ★ 服务端全局搜索：通过 Emby 原生 searchTerm 参数搜索
+    if req.search:
+        params['searchTerm'] = req.search
     try:
         res = requests.get(url, params=params)
         res.raise_for_status()
         items = process_actor_items(res.json().get("Items") or [])
         total = res.json().get('TotalRecordCount', 0) or len(items)
+
+        # 从 SQLite 批量查询汉化状态并与 Emby 数据合并
+        db = SessionLocal()
+        try:
+            item_ids = [it["id"] for it in items if it.get("id")]
+            if item_ids:
+                rows = db.query(MediaSyncStatus).filter(
+                    MediaSyncStatus.emby_item_id.in_(item_ids)
+                ).all()
+                status_map = {r.emby_item_id: r.to_dict() for r in rows}
+            else:
+                status_map = {}
+
+            for it in items:
+                sid = it.get("id", "")
+                if sid in status_map:
+                    rec = status_map[sid]
+                    it["sync_status"] = rec.get("status", "pending")
+                    it["sync_matched"] = rec.get("matched_actors", 0)
+                    it["sync_total"] = rec.get("total_actors", 0)
+                else:
+                    it["sync_status"] = "pending"
+                    it["sync_matched"] = 0
+                    it["sync_total"] = 0
+        finally:
+            db.close()
 
         return {"items": items, "total": total}
     except Exception as e:

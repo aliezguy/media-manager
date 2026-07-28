@@ -1,0 +1,698 @@
+"""
+演员库管理 API — Actor Library
+
+提供 actor_profiles 表的分页查询、搜索过滤，单个演员的强制刷新，
+以及一键批量修复残缺元数据。
+"""
+import logging
+import os
+import random
+import shutil
+import threading
+import time
+import traceback
+
+import requests
+from fastapi import APIRouter, Query, HTTPException, BackgroundTasks
+
+from config.settings import load_config
+from database import SessionLocal
+from models import ActorProfile
+from services.actor_profile_service import _download_image
+from utils.task_manager import task_manager
+
+logger = logging.getLogger("uvicorn")
+router = APIRouter()
+
+
+@router.get("/actors")
+def list_actors(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(24, ge=1, le=100, description="每页数量"),
+    search: str = Query("", description="演员姓名模糊搜索"),
+    has_local_image: str = Query("", description="本地头像过滤: true/false/空=全部"),
+):
+    """分页查询演员档案列表。
+
+    支持按姓名模糊搜索、按本地头像有无过滤，默认按 update_time 倒序排列。
+    """
+    db = SessionLocal()
+    try:
+        q = db.query(ActorProfile)
+
+        # 姓名模糊搜索
+        if search.strip():
+            q = q.filter(ActorProfile.name.contains(search.strip()))
+
+        # 本地头像过滤
+        if has_local_image.lower() == "true":
+            q = q.filter(
+                ActorProfile.local_image_path.isnot(None),
+                ActorProfile.local_image_path != "",
+            )
+        elif has_local_image.lower() == "false":
+            from sqlalchemy import or_
+            q = q.filter(
+                or_(
+                    ActorProfile.local_image_path.is_(None),
+                    ActorProfile.local_image_path == "",
+                )
+            )
+
+        total = q.count()
+        items = (
+            q.order_by(ActorProfile.update_time.desc(), ActorProfile.name)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+
+        return {
+            "total": total,
+            "items": [
+                {
+                    "name": a.name,
+                    "local_image_path": a.local_image_path or "",
+                    "image_url": a.image_url or "",
+                    "source": a.source or "",
+                    "tmdb_id": a.tmdb_id or "",
+                    "imdb_id": a.imdb_id or "",
+                    "douban_celebrity_id": a.douban_celebrity_id or "",
+                    "birth_date": a.birth_date or "",
+                    "birth_place": a.birth_place or "",
+                    "overview": a.overview or "",
+                    "update_time": (
+                        a.update_time.isoformat() if a.update_time else ""
+                    ),
+                }
+                for a in items
+            ],
+        }
+    finally:
+        db.close()
+
+
+@router.post("/actors/{actor_name}/refresh")
+def refresh_actor(actor_name: str):
+    """强制刷新单个演员档案 — 全量穿透强制更新。
+
+    流程:
+      1. 主动反查 Emby /Persons API，获取 emby_person_id + emby_image_tag
+         （支撑 L0.5 Emby 原生头像优先逻辑）
+      2. 调用 resolve_actor_profile(force_refresh=True, context_info=ctx)
+         → 跳过 L0 缓存拦截 → 全量穿透 L0.5 Emby → L1 豆瓣 → L2 TMDB
+      3. 提交事务，返回最新档案数据
+    """
+    from services.actor_profile_service import resolve_actor_profile
+
+    cfg = load_config()
+    emby_server = cfg.get("emby_host", "").rstrip("/")
+    emby_api_key = cfg.get("emby_api_key", "")
+
+    ctx = {}
+
+    # ★ 主动反查 Emby 获取 Person ID 上下文（支撑 L0.5）
+    if emby_server and emby_api_key:
+        try:
+            res = requests.get(
+                f"{emby_server}/emby/Persons",
+                params={"SearchTerm": actor_name, "api_key": emby_api_key},
+                timeout=5,
+            )
+            if res.status_code == 200:
+                items = res.json().get("Items", [])
+                for item in items:
+                    if item.get("Name") == actor_name:
+                        ctx["emby_person_id"] = item.get("Id")
+                        ctx["emby_image_tag"] = (
+                            item.get("PrimaryImageTag")
+                            or (
+                                item.get("ImageTags", {}).get("Primary")
+                                if isinstance(item.get("ImageTags"), dict)
+                                else None
+                            )
+                        )
+                        # ★ 核心修复：把 Emby 的 ProviderIds 完整塞入上下文
+                        #    包含 DoubanCelebrityId → L1 豆瓣精准查询
+                        #    包含 Tmdb → L2 TMDB 精准 ID 拦截
+                        ctx["ProviderIds"] = item.get("ProviderIds", {})
+                        break
+            else:
+                logger.warning(
+                    "   ⚠ [Refresh] Emby /Persons 返回 %d: %s",
+                    res.status_code,
+                    res.text[:200],
+                )
+        except requests.exceptions.RequestException as e:
+            logger.warning(
+                "   ⚠ [Refresh] Emby 反查网络异常 (%s): %s",
+                type(e).__name__,
+                e,
+            )
+        except Exception as e:
+            logger.warning("   ⚠ [Refresh] Emby 反查失败: %s", e)
+
+    if ctx:
+        logger.info(
+            "   🚀 [Refresh] 携带 Emby 上下文穿透刷新: %s",
+            actor_name,
+        )
+    else:
+        logger.info(
+            "   🚀 [Refresh] 无 Emby 上下文，穿透刷新（跳过 L0.5）: %s",
+            actor_name,
+        )
+
+    db = SessionLocal()
+    try:
+        result = resolve_actor_profile(
+            actor_name, db,
+            context_info=ctx,
+            force_refresh=True,
+        )
+
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"无法解析演员 '{actor_name}'：所有图片源均无可用数据",
+            )
+
+        db.commit()
+        return {
+            "name": result["name"],
+            "local_image_path": result.get("local_image_path", ""),
+            "image_url": result.get("image_url", ""),
+            "source": result.get("source", ""),
+            "tmdb_id": result.get("tmdb_id", ""),
+            "imdb_id": result.get("imdb_id", ""),
+            "douban_celebrity_id": result.get("douban_celebrity_id", ""),
+            "birth_date": result.get("birth_date", ""),
+            "birth_place": result.get("birth_place", ""),
+            "overview": result.get("overview", ""),
+            "message": f"演员 '{actor_name}' 刷新成功",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"刷新演员 '{actor_name}' 失败: {str(e)}",
+        )
+    finally:
+        db.close()
+
+
+# ================================================================
+# 一键批量修复 — 后台任务 + 触发接口
+# ================================================================
+
+def _batch_repair_task(task_id: str):
+    """后台任务：遍历所有缺元数据的演员，强制穿透刷新。
+
+    查询条件：overview 为空 或 tmdb_id 为空。
+    每个演员独立 try/except 隔离，单个失败不影响整体。
+    ★ try/except/finally 全局防线：保证任务永不被悬挂。
+    """
+    from services.actor_profile_service import resolve_actor_profile
+
+    cfg = load_config()
+    emby_server = cfg.get("emby_host", "").rstrip("/")
+    emby_api_key = cfg.get("emby_api_key", "")
+
+    db = SessionLocal()
+    _repair_success = False
+    _repair_final_msg = "❌ 批量修复失败，请查看服务端日志"
+    repaired = 0
+    failed = 0
+    skipped = 0
+
+    try:
+        # 查询缺失 TMDB ID 的演员
+        from sqlalchemy import or_
+        broken = (
+            db.query(ActorProfile)
+            .filter(
+                or_(
+                    ActorProfile.tmdb_id.is_(None),
+                    ActorProfile.tmdb_id == "",
+                )
+            )
+            .all()
+        )
+
+        total = len(broken)
+        task_manager.update_progress(
+            task_id,
+            total=total,
+            message=f"发现 {total} 位演员缺少元数据，开始修复...",
+        )
+
+        if total == 0:
+            _repair_success = True
+            _repair_final_msg = "✅ 所有演员元数据已完整，无需修复"
+            return
+
+        logger.info(
+            "🔧 [BatchRepair] 开始修复 %d 位残缺演员 (task=%s)",
+            total, task_id,
+        )
+
+        for idx, actor in enumerate(broken):
+            current = idx + 1
+            actor_name = actor.name
+
+            task_manager.update_progress(
+                task_id,
+                current=current - 1,
+                message=f"修复中 {current}/{total}: {actor_name}",
+            )
+
+            try:
+                # ★ 主动反查 Emby 获取 Person 上下文
+                ctx = {}
+                if emby_server and emby_api_key:
+                    try:
+                        res = requests.get(
+                            f"{emby_server}/emby/Persons",
+                            params={"SearchTerm": actor_name, "api_key": emby_api_key},
+                            timeout=5,
+                        )
+                        if res.status_code == 200:
+                            items = res.json().get("Items", [])
+                            for item in items:
+                                if item.get("Name") == actor_name:
+                                    ctx["emby_person_id"] = item.get("Id")
+                                    ctx["emby_image_tag"] = (
+                                        item.get("PrimaryImageTag")
+                                        or (
+                                            item.get("ImageTags", {}).get("Primary")
+                                            if isinstance(item.get("ImageTags"), dict)
+                                            else None
+                                        )
+                                    )
+                                    ctx["ProviderIds"] = item.get("ProviderIds", {})
+                                    break
+                    except Exception:
+                        pass  # Emby 不可达不阻塞修复流程
+
+                # ★ 强制穿透刷新（跳过 L0 缓存 + 冷却期）
+                result = resolve_actor_profile(
+                    actor_name, db,
+                    context_info=ctx,
+                    force_refresh=True,
+                )
+
+                if result and (result.get("overview") or result.get("tmdb_id")):
+                    db.commit()
+                    repaired += 1
+                    logger.info(
+                        "   ✅ [BatchRepair] %s 修复成功 (tmdb=%s, overview=%d chars)",
+                        actor_name,
+                        result.get("tmdb_id", "-"),
+                        len(result.get("overview", "")),
+                    )
+                else:
+                    db.rollback()
+                    skipped += 1
+                    logger.warning(
+                        "   ⏭ [BatchRepair] %s 仍未获取到元数据", actor_name,
+                    )
+            except Exception:
+                db.rollback()
+                failed += 1
+                logger.error(
+                    "   ❌ [BatchRepair] %s 异常:\n%s",
+                    actor_name, traceback.format_exc(),
+                )
+
+            task_manager.update_progress(
+                task_id,
+                current=current,
+                message=(
+                    f"已完成 {current}/{total} "
+                    f"（修复 {repaired} | 跳过 {skipped} | 失败 {failed}）"
+                ),
+            )
+
+            # ★ 拟人化随机休眠：避免高频并发触发豆瓣/TMDB 反爬流控
+            time.sleep(random.uniform(1.5, 3.5))
+
+        _repair_success = True
+        _repair_final_msg = (
+            f"✅ 批量修复完成: {total} 位演员 | "
+            f"修复 {repaired} | 跳过 {skipped} | 失败 {failed}"
+        )
+
+    except Exception as e:
+        logger.error(
+            "❌ [BatchRepair] 批量修复任务崩溃 (task=%s):\n%s",
+            task_id, traceback.format_exc(),
+        )
+        _repair_final_msg = f"❌ 任务崩溃: {str(e)[:200]}"
+        try:
+            task_manager.update_progress(
+                task_id, status="error", message=_repair_final_msg,
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            task_manager.complete_task(
+                task_id, _repair_final_msg, success=_repair_success,
+            )
+        except Exception:
+            try:
+                task_manager.complete_task(
+                    task_id, "❌ 批量修复异常终止", success=False,
+                )
+            except Exception:
+                pass
+        db.close()
+
+
+@router.post("/actors/repair_missing")
+def repair_missing_actors(background_tasks: BackgroundTasks):
+    """一键批量修复：查询所有缺失元数据的演员，后台逐项穿透刷新。
+
+    Returns:
+        {"task_id": str} — 前端通过 GET /api/tasks/{task_id} 轮询进度
+    """
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_
+        broken_count = (
+            db.query(ActorProfile)
+            .filter(
+                or_(
+                    ActorProfile.tmdb_id.is_(None),
+                    ActorProfile.tmdb_id == "",
+                )
+            )
+            .count()
+        )
+    finally:
+        db.close()
+
+    if broken_count == 0:
+        return {
+            "task_id": "",
+            "message": "所有演员元数据已完整，无需修复",
+        }
+
+    task_id = task_manager.create_task(
+        total=broken_count,
+        message=f"发现 {broken_count} 位演员缺少元数据，准备修复...",
+        metadata={"type": "batch_repair", "count": broken_count},
+    )
+
+    background_tasks.add_task(_batch_repair_task, task_id=task_id)
+
+    logger.info(
+        "🔧 [BatchRepair] 触发批量修复: task=%s count=%d",
+        task_id, broken_count,
+    )
+    return {
+        "task_id": task_id,
+        "message": f"批量修复已启动，共 {broken_count} 位演员",
+    }
+
+
+# ================================================================
+# 历史路径一键修复 — 扫描并重命名缺少规范 ID 的本地图片文件夹
+# ================================================================
+
+# people 目录 (项目根/people/)
+PEOPLE_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "people")
+)
+
+
+@router.post("/actors/fix_paths")
+@router.get("/actors/fix_paths")
+def fix_historical_actor_paths():
+    """将不带规范 ID（-tmdb- 或 -douban-）的旧路径进行物理重命名和 DB 更新。
+
+    核心功能：
+      1. 扫描数据库中 local_image_path 缺少 -tmdb- / -douban- 的历史记录
+      2. 将旧目录下的图片原封不动地移动到规范新目录（保留原始扩展名）
+      3. 冲突解决：若移动后新目录下存在多张图片，以文件大小（getsize）
+         作为清晰度判断基准，保留体积最大的一张，删除其余冗余图片
+      4. 将最终获胜的图片名称更新至数据库 local_image_path
+      5. 清理安全的空旧目录
+
+    Returns:
+        {"status": "success", "total_scanned": int, "fixed_count": int,
+         "resolved_conflict_count": int, "errors": [...]}
+    """
+    db = SessionLocal()
+    try:
+        # 查找有图片但路径中不含 -tmdb- 或 -douban- 规范标记的记录
+        actors_to_fix = (
+            db.query(ActorProfile)
+            .filter(
+                ActorProfile.local_image_path.isnot(None),
+                ActorProfile.local_image_path != "",
+                ~ActorProfile.local_image_path.like("%-tmdb-%"),
+                ~ActorProfile.local_image_path.like("%-douban-%"),
+            )
+            .all()
+        )
+
+        fixed_count = 0
+        resolved_conflict_count = 0
+        errors = []
+
+        for actor in actors_to_fix:
+            try:
+                current_path = actor.local_image_path
+                path_parts = current_path.replace("\\", "/").split("/")
+
+                if len(path_parts) < 3:
+                    continue
+
+                parent_dir = path_parts[-3]       # 首字，如 "曲"
+                old_actor_dir = path_parts[-2]    # 旧目录名，如 "曲靖"
+                old_file_name = path_parts[-1]    # 原始文件名，如 "folder.png"
+
+                # ---- 优先提取规范 ID ----
+                target_id = getattr(actor, 'tmdb_id', '') or ''
+                id_type = "tmdb" if target_id else ""
+                if not target_id:
+                    target_id = getattr(actor, 'douban_celebrity_id', '') or ''
+                    id_type = "douban" if target_id else ""
+
+                if not target_id:
+                    continue  # 无任何 ID 的旧记录无法规范化，跳过
+
+                new_actor_dir = f"{actor.name}-{id_type}-{target_id}"
+                new_rel_dir = f"{parent_dir}/{new_actor_dir}"
+
+                # 已经是规范路径，跳过
+                if f"{parent_dir}/{old_actor_dir}" == new_rel_dir:
+                    continue
+
+                old_abs_path = os.path.join(PEOPLE_DIR, current_path)
+                old_abs_dir = os.path.dirname(old_abs_path)
+                new_abs_dir = os.path.join(PEOPLE_DIR, new_rel_dir)
+
+                os.makedirs(new_abs_dir, exist_ok=True)
+
+                # ---- 1. 安全移动：加 moved_ 前缀防止覆盖同名文件 ----
+                if os.path.exists(old_abs_path):
+                    temp_move_path = os.path.join(new_abs_dir, f"moved_{old_file_name}")
+                    shutil.move(old_abs_path, temp_move_path)
+                    logger.info(
+                        "   📦 [FixPaths] 迁移: %s → %s",
+                        current_path, temp_move_path,
+                    )
+
+                # ---- 2. 优胜劣汰比对：扫描新目录内所有图片，找出体积最大（最清晰）的 ----
+                valid_exts = (".png", ".jpg", ".jpeg", ".webp")
+                best_file = None
+                max_size = -1
+
+                files_in_new_dir = []
+                if os.path.exists(new_abs_dir):
+                    files_in_new_dir = os.listdir(new_abs_dir)
+
+                for f in files_in_new_dir:
+                    if f.startswith("folder") or f.startswith("moved_folder"):
+                        ext = os.path.splitext(f)[1].lower()
+                        if ext in valid_exts:
+                            f_path = os.path.join(new_abs_dir, f)
+                            try:
+                                f_size = os.path.getsize(f_path)
+                                if f_size > max_size:
+                                    max_size = f_size
+                                    best_file = f
+                            except OSError:
+                                pass
+
+                # ---- 3. 清理与回写：先杀光所有冗余文件，最后再把获胜者重命名 ----
+                if best_file:
+                    best_ext = os.path.splitext(best_file)[1].lower()
+                    final_file_name = f"folder{best_ext}"
+                    best_file_path = os.path.join(new_abs_dir, best_file)
+                    final_abs_path = os.path.join(new_abs_dir, final_file_name)
+
+                    # ★ 先遍历删除败者（绝对安全，不会删到 best_file）
+                    for f in files_in_new_dir:
+                        if f != best_file:
+                            if (f.startswith("folder") or f.startswith("moved_folder")) and f.endswith(valid_exts):
+                                try:
+                                    os.remove(os.path.join(new_abs_dir, f))
+                                    resolved_conflict_count += 1
+                                    logger.info(
+                                        "   🗑 [FixPaths] 淘汰冗余图片: %s/%s",
+                                        new_rel_dir, f,
+                                    )
+                                except OSError:
+                                    pass
+
+                    # ★ 最后，只有当获胜者的名字还不叫 folder.xxx 时，才进行重命名
+                    if best_file != final_file_name:
+                        shutil.move(best_file_path, final_abs_path)
+
+                    # ---- 4. 最终路径更新至数据库 ----
+                    actor.local_image_path = f"{new_rel_dir}/{final_file_name}"
+                    fixed_count += 1
+                    logger.info(
+                        "   ✅ [FixPaths] 规范化: %s → %s (winner=%s, %d bytes)",
+                        current_path, actor.local_image_path,
+                        final_file_name, max_size,
+                    )
+                else:
+                    logger.warning(
+                        "   ⚠ [FixPaths] 迁移后新目录无有效图片: %s", actor.name,
+                    )
+
+                # ---- 5. 清理安全的旧空目录 ----
+                if os.path.exists(old_abs_dir) and os.path.isdir(old_abs_dir):
+                    try:
+                        if not os.listdir(old_abs_dir):
+                            os.rmdir(old_abs_dir)
+                            logger.debug("   🧹 [FixPaths] 清理空目录: %s", old_abs_dir)
+                    except OSError:
+                        pass
+
+            except Exception as e:
+                errors.append(f"{actor.name}: {str(e)}")
+                logger.error(
+                    "   ❌ [FixPaths] 修复失败: %s — %s",
+                    actor.name, e,
+                )
+
+        db.commit()
+        logger.info(
+            "🔧 [FixPaths] 历史路径大迁徙完成: scanned=%d fixed=%d conflicts=%d errors=%d",
+            len(actors_to_fix), fixed_count, resolved_conflict_count, len(errors),
+        )
+        return {
+            "status": "success",
+            "total_scanned": len(actors_to_fix),
+            "fixed_count": fixed_count,
+            "resolved_conflict_count": resolved_conflict_count,
+            "errors": errors,
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(
+            "❌ [FixPaths] 批量修复异常: %s\n%s",
+            e, traceback.format_exc(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"历史路径修复失败: {str(e)}",
+        )
+    finally:
+        db.close()
+
+
+# ================================================================
+# 极速恢复 API — 利用数据库残存的 image_url 重新下载丢失的物理文件
+# ================================================================
+
+@router.post("/actors/recover_images")
+@router.get("/actors/recover_images")
+def recover_missing_images():
+    """极速恢复：扫描数据库，若发现本地文件丢失但存在网络直链，则直接重新下载。
+
+    适用于 fix_paths 搬家过程中因 BUG 导致物理文件被误删、
+    但数据库中仍保留 image_url 和 local_image_path 的场景。
+    相比 force_refresh 全量穿透，此接口仅做一次 HTTP 下载，零外部 API 查询。
+
+    Returns:
+        {"status": "success", "recovered_count": int, "failed_count": int, "errors": [...]}
+    """
+    db = SessionLocal()
+    try:
+        actors = (
+            db.query(ActorProfile)
+            .filter(
+                ActorProfile.local_image_path.isnot(None),
+                ActorProfile.local_image_path != "",
+                ActorProfile.image_url.isnot(None),
+                ActorProfile.image_url != "",
+            )
+            .all()
+        )
+
+        recovered_count = 0
+        failed_count = 0
+        errors = []
+
+        for actor in actors:
+            try:
+                abs_path = os.path.join(PEOPLE_DIR, actor.local_image_path)
+
+                # 物理文件确实丢失了
+                if not os.path.exists(abs_path):
+                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+                    if _download_image(actor.image_url, abs_path):
+                        recovered_count += 1
+                        logger.info(
+                            "   ✅ [Recover] 极速恢复: %s → %s",
+                            actor.name, actor.local_image_path,
+                        )
+                    else:
+                        # 下载失败，清空本地路径，交由后续常规批量修复处理
+                        actor.local_image_path = ""
+                        failed_count += 1
+                        logger.warning(
+                            "   ⚠ [Recover] 下载失败，清空路径: %s (%s)",
+                            actor.name, actor.image_url[:80],
+                        )
+            except Exception as e:
+                errors.append(f"{actor.name}: {str(e)}")
+                actor.local_image_path = ""
+                failed_count += 1
+                logger.error(
+                    "   ❌ [Recover] 恢复异常: %s — %s",
+                    actor.name, e,
+                )
+
+        db.commit()
+        logger.info(
+            "🩹 [Recover] 极速恢复完成: recovered=%d failed=%d errors=%d",
+            recovered_count, failed_count, len(errors),
+        )
+        return {
+            "status": "success",
+            "recovered_count": recovered_count,
+            "failed_count": failed_count,
+            "errors": errors,
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(
+            "❌ [Recover] 批量恢复异常: %s\n%s",
+            e, traceback.format_exc(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"极速恢复失败: {str(e)}",
+        )
+    finally:
+        db.close()

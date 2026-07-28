@@ -48,10 +48,12 @@ logging.getLogger("main").info("Emby AI Manager 启动 — 日志文件: %s", LO
 logging.getLogger("main").info("=" * 60)
 
 # 导入路由
-from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router, douban
+from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router, douban, sync_status, sync_actions, actor_router
 
 # 初始化数据库表
+from database import _run_migrations
 Base.metadata.create_all(bind=engine)
+_run_migrations()
 
 # ---------------------------------------------------------------------------
 # APScheduler 生命周期管理
@@ -65,8 +67,20 @@ async def lifespan(app: FastAPI):
     load_all_tasks()
     scheduler.start()
     logging.getLogger("main").info("[Scheduler] APScheduler 已启动")
+
+    # 启动演职员中文化后台任务队列
+    import asyncio as _asyncio
+    from services.task_queue import process_sync_queue
+    _sync_worker = _asyncio.create_task(process_sync_queue())
+    logging.getLogger("main").info("[TaskQueue] 中文化任务 Worker 已挂载")
+
     yield
     # shutdown
+    _sync_worker.cancel()
+    try:
+        await _sync_worker
+    except _asyncio.CancelledError:
+        pass
     scheduler.shutdown(wait=False)
     logging.getLogger("main").info("[Scheduler] APScheduler 已关闭")
 
@@ -92,6 +106,19 @@ app.include_router(task_flow_router.router, prefix="/api", tags=["TaskFlow"])
 app.include_router(task_dashboard_router.router, prefix="/api", tags=["Dashboard"])
 app.include_router(scheduler_router.router, prefix="/api", tags=["Scheduler"])
 app.include_router(douban.router, prefix="/api", tags=["Douban"])
+app.include_router(sync_status.router, prefix="/api", tags=["SyncStatus"])
+app.include_router(sync_actions.router, prefix="/api", tags=["SyncActions"])
+app.include_router(actor_router.router, prefix="/api", tags=["ActorLibrary"])
+
+# ★ 演员本地头像静态资源 — Kodi/Emby 标准 people/ 目录
+#    使用项目根目录绝对路径，避免工作目录变化导致的 404
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_BACKEND_DIR)
+PEOPLE_DIR = os.path.join(_PROJECT_ROOT, "people")
+os.makedirs(PEOPLE_DIR, exist_ok=True)
+app.mount("/static_actors", StaticFiles(directory=PEOPLE_DIR), name="static_actors")
+app.mount("/people", StaticFiles(directory=PEOPLE_DIR), name="people")
+
 if os.path.exists("backend/static"):
     app.mount("/", StaticFiles(directory="backend/static", html=True), name="static")
 if __name__ == "__main__":

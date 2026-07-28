@@ -1,7 +1,7 @@
 # backend/models.py
 import enum
 from database import Base
-from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, JSON, DateTime, Text
 from datetime import datetime
 
 
@@ -147,3 +147,78 @@ class ScanRunLog(Base):
     processed_count = Column(Integer, default=0)
     details = Column(JSON)
     created_at = Column(DateTime, default=datetime.now)
+
+
+class MediaSyncStatus(Base):
+    """演职员中文化 — 同步状态持久化"""
+    __tablename__ = "media_sync_status"
+
+    emby_item_id = Column(String, primary_key=True, index=True)
+    tmdb_id = Column(String, index=True)
+    imdb_id = Column(String, index=True)
+    douban_id = Column(String, index=True)
+    library_id = Column(String, index=True)
+    title = Column(String)
+    status = Column(String, default="pending")
+    matched_actors = Column(Integer, default=0)
+    total_actors = Column(Integer, default=0)
+    error_message = Column(Text)
+    update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class MediaMetadata(Base):
+    """媒体元数据表 — 标题、概述、图片外链"""
+    __tablename__ = "media_metadata"
+
+    emby_item_id = Column(String, primary_key=True, index=True)
+    parent_id = Column(String, index=True, nullable=True)
+    media_type = Column(String, nullable=False)
+    title = Column(String)
+    overview = Column(Text)
+    index_number = Column(Integer, nullable=True)
+    parent_index_number = Column(Integer, nullable=True)   # Season 编号 (仅 Episode)
+    recursive_item_count = Column(Integer, nullable=True)   # 子项总数 (仅 Series: 含 Seasons + Episodes)
+    poster_url = Column(Text)
+    backdrop_url = Column(Text)
+    update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ActorProfile(Base):
+    """全局演员元数据中心 — 全维度生平 + 本地化头像。
+
+    通过 name (中文名) 作为主键，存储从豆瓣/TMDB 聚合的完整演员档案。
+    local_image_path 指向本地下载的头像文件，解除对外部 CDN 的永久依赖。
+    """
+    __tablename__ = "actor_profiles"
+
+    name = Column(String, primary_key=True, index=True)
+    local_image_path = Column(String)                 # 相对路径 如 "张/张译.jpg"
+    image_url = Column(Text)                          # 外部直链兜底 (豆瓣/TMDB)
+    source = Column(String)                           # "douban" / "tmdb" / "emby"
+    tmdb_id = Column(String, index=True)
+    imdb_id = Column(String, index=True)
+    douban_celebrity_id = Column(String, index=True)
+    birth_date = Column(String)
+    birth_place = Column(String)
+    overview = Column(Text)
+    update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class ActorRecord(Base):
+    """演员关联记录表 — 纯关联实体，连接 Emby 媒体项与演员。
+
+    职责仅是记录某媒体项有哪些演员、饰演什么角色。
+    头像、生平等全维度数据统一由 ActorProfile 管理，通过 name 关联。
+    """
+    __tablename__ = "actor_records"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    emby_item_id = Column(String, index=True, nullable=False)
+    name = Column(String, nullable=False)             # → ActorProfile.name
+    role = Column(String)
+    type = Column(String, nullable=False, default="Actor")
+    sort_order = Column(Integer, default=0)
+    update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)

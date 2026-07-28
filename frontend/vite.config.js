@@ -12,7 +12,15 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:8000', // 转发给后端
         changeOrigin: true,
-        // rewrite: (path) => path.replace(/^\/api/, '') // 如果后端不需要 /api 前缀才开这个，你的代码目前是需要的，所以注释掉
+      },
+      // ★ 本地演员头像代理 — 将 /people 请求转发到 FastAPI 静态挂载
+      '/people': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/static_actors': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
       }
     }
   }

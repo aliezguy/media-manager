@@ -11,6 +11,8 @@ const config = reactive({
   emby_api_key: '',
   emby_user_id: '',
   sf_api_key: '',
+  max_actors_per_media: 50,
+  enable_emby_avatar_first: false,
   cd2_media_dir: '',
   cd2_organized_dir: '',
   emby_prefix: '',
@@ -158,6 +160,31 @@ const testConnection = async () => {
             </el-col>
           </el-row>
 
+          <el-row :gutter="40">
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="最大入库演员数">
+                <el-input-number
+                  v-model="config.max_actors_per_media"
+                  :min="1"
+                  :max="200"
+                  :step="5"
+                  controls-position="right"
+                  style="width: 100%"
+                />
+                <div class="tip">抓取全量构建匹配字典，回写 Emby 和入库时截断到此数量</div>
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="Emby 原生头像优先 (L0.5)">
+                <div class="switch-row">
+                  <el-switch v-model="config.enable_emby_avatar_first" />
+                  <span class="switch-hint">{{ config.enable_emby_avatar_first ? '已开启 - 优先使用 Emby 头像' : '已关闭 - 走豆瓣/TMDB 获取' }}</span>
+                </div>
+                <div class="tip">开启后在演员画像解析时，L0.5 优先通过 Emby API 获取头像，命中则跳过豆瓣和 TMDB 外部请求。适用于 TMDB 代理不稳定 (503) 的网络环境。</div>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
           <!-- Actions -->
           <div class="actions">
             <button
@@ -225,6 +252,18 @@ const testConnection = async () => {
   color: var(--text-tertiary);
   margin-top: 5px;
   line-height: 1.5;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 40px;
+}
+
+.switch-hint {
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 
 /* ==================== Divider ==================== */

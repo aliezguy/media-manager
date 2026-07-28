@@ -12,6 +12,7 @@ import TorrentCleanup from './components/TorrentCleanup.vue'
 import TaskDashboard from './components/TaskDashboard.vue'
 import ScheduledTasks from './components/ScheduledTasks.vue'
 import ActorLocalizationStudio from './components/ActorLocalizationStudio.vue'
+import ActorLibrary from './components/ActorLibrary.vue'
 
 const isCollapse = ref(false)
 const activeMenu = ref('manager')
@@ -28,6 +29,7 @@ const menuItems = [
   { index: 'cleanup', label: '种子清理', icon: Brush, component: TorrentCleanup },
   { index: 'dashboard', label: '大盘', icon: DataAnalysis, component: TaskDashboard },
   { index: 'actor', label: '演职员', icon: User, component: ActorLocalizationStudio },
+  { index: 'actorLib', label: '演员库', icon: User, component: ActorLibrary },
   { index: 'scheduler', label: '定时扫描', icon: Calendar, component: ScheduledTasks },
   { index: 'emby', label: 'Emby', icon: Connection, component: EmbySettings },
   { index: 'mp', label: '配置', icon: VideoCameraFilled, component: MpConfig },

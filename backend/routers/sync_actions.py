@@ -1,0 +1,2221 @@
+"""
+演职员中文化 — 任务触发接口。
+"""
+
+import logging
+import os
+import re
+import time as _time
+import traceback
+from datetime import datetime
+
+import requests as _requests
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel
+
+from config.settings import load_config
+from database import SessionLocal, DATA_DIR
+from models import MediaSyncStatus, MediaMetadata, ActorRecord, ActorProfile
+from services.task_queue import start_full_sync
+from services.ai_translator import get_translator
+from services.douban_service import _truncate_actors, DoubanSinizer
+from services.db_crud import (
+    save_media_to_db,
+    extract_provider_ids,
+    extract_external_images,
+)
+from services.actor_profile_service import resolve_actor_profile, ensure_profiles_for_people
+from utils.task_manager import task_manager
+
+router = APIRouter()
+logger = logging.getLogger("uvicorn")
+
+_CHINESE_RE = re.compile(r'[一-鿿]')
+_COMMIT_INTERVAL = 50  # 每处理 N 个未汉化顶层媒体批量提交一次
+
+
+class FullSyncRequest(BaseModel):
+    library_id: str
+
+
+class AuditSelectedRequest(BaseModel):
+    item_ids: list[str]
+
+
+class SinicizeSelectedRequest(BaseModel):
+    """选中项批量汉化请求。"""
+    item_ids: list[str]
+
+
+class SinicizeAllRequest(BaseModel):
+    """全量汉化请求 — 按媒体库批量处理所有未汉化项。"""
+    library_id: str
+
+
+@router.post("/sync/full")
+def trigger_full_sync(req: FullSyncRequest):
+    """触发全量汉化任务（非阻塞，立即返回）。
+
+    请求体:
+        {"library_id": "1875208"}
+
+    返回:
+        200: {"message": "全量同步任务已启动，共下发 690 个任务"}
+        409: {"detail": "当前已有汉化任务正在后台执行中，请稍后再试"}
+    """
+    logger.info(f"📨 [SyncActions] 收到全量同步请求: library_id={req.library_id}")
+    ok, msg = start_full_sync(req.library_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail=msg)
+    return {"message": msg}
+
+
+# ==========================================
+# audit_local 专用辅助
+# ==========================================
+
+def _count_chinese_roles(people: list) -> tuple:
+    """统计演员中角色名为中文的数量。
+
+    Returns:
+        (chinese_role_count, total_actors)
+    """
+    actors = [p for p in people if p.get("Type") == "Actor"]
+    total = len(actors)
+    if total == 0:
+        return 0, 0
+    chinese_count = sum(
+        1 for a in actors
+        if a.get("Role") and _CHINESE_RE.search(a.get("Role", ""))
+    )
+    return chinese_count, total
+
+
+def _is_chinese_role_synced(people: list) -> bool:
+    """判断媒体是否已汉化：>= 90% 演员角色名含中文。"""
+    chinese_count, total = _count_chinese_roles(people)
+    return total > 0 and (chinese_count / total) >= 0.9
+
+
+def _fetch_episodes(host: str, api_key: str, user_id: str,
+                    series_id: str) -> list:
+    """获取指定 Series 下的所有分集（Episodes），含分页保护。
+
+    增强版：额外请求 RecursiveItemCount 等统计字段。
+    """
+    base = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
+    all_episodes = []
+    start_index = 0
+    page_size = 100
+
+    while True:
+        params = {
+            "api_key": api_key,
+            "ParentId": series_id,
+            "IncludeItemTypes": "Episode",
+            "Recursive": "true",
+            "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount,ParentIndexNumber,IndexNumber",
+            "StartIndex": start_index,
+            "Limit": page_size,
+        }
+        try:
+            resp = _requests.get(base, params=params, timeout=30)
+            if resp.status_code != 200:
+                logger.warning(
+                    "   ⚠ [Episodes] 获取 %s 分集失败: HTTP %d",
+                    series_id, resp.status_code,
+                )
+                break
+            data = resp.json()
+            items = data.get("Items", [])
+            if not items:
+                break
+            all_episodes.extend(items)
+            total = data.get("TotalRecordCount", 0)
+            if start_index + page_size >= total:
+                break
+            start_index += page_size
+        except Exception:
+            logger.warning(
+                "   ⚠ [Episodes] 获取 %s 分集异常: %s",
+                series_id, traceback.format_exc(),
+            )
+            break
+
+    return all_episodes
+
+
+def _process_episodes(db, episodes: list, series_id: str, library_id: str,
+                      apply_localization: bool = False,
+                      douban_actor_map: dict = None,
+                      series_name: str = "",
+                      max_actors: int = 50) -> int:
+    """处理 Series 下的所有分集，统一通过 save_media_to_db 入库。
+
+    Args:
+        apply_localization: 是否对分集演员应用中文化（来自豆瓣匹配结果）
+        douban_actor_map: {emby_actor_name: {"name": 中文名, "role": 中文角色名}}
+        series_name: 剧集名称，供 AI 翻译上下文使用
+        max_actors:      最大入库演员数（用于截断）
+    """
+    processed = 0
+    for ep in episodes:
+        try:
+            ep_id = ep.get("Id", "")
+            if not ep_id:
+                continue
+
+            ep_people = ep.get("People", []) or []
+
+            # ★ 分集演员中文化：使用豆瓣匹配结果替换英文名/角色
+            if apply_localization and douban_actor_map:
+                ep_people = _localize_episode_people(
+                    ep_people, douban_actor_map, series_name=series_name,
+                )
+
+            # ★ 分集截断
+            ep_people = _truncate_actors(ep_people, max_actors)
+
+            pids = extract_provider_ids(ep)
+            chinese_count, total_actors = _count_chinese_roles(ep_people)
+            ep_status = "synced" if _is_chinese_role_synced(ep_people) else "pending"
+            ep_images = extract_external_images(ep, pids, ep.get("Type", "Episode"))
+
+            save_media_to_db(
+                db,
+                emby_item=ep,
+                provider_ids=pids,
+                images=ep_images,
+                people=ep_people if apply_localization else None,
+                library_id=library_id,
+                status=ep_status,
+                matched_actors=chinese_count,
+                total_actors=total_actors,
+                parent_id=series_id,
+            )
+
+            db.flush()
+            processed += 1
+        except Exception:
+            logger.warning(
+                "   ⚠ [Episode] 处理 %s (ID=%s) 失败:\n%s",
+                ep.get("Name", "?"), ep.get("Id", "?"),
+                traceback.format_exc(),
+            )
+            db.rollback()
+            continue
+
+    return processed
+
+
+def _localize_episode_people(ep_people: list, douban_map: dict,
+                             series_name: str = "") -> list:
+    """对分集的演员列表应用中文化替换（含 AI 兜底 + 动态缓存）。
+
+    三级漏斗策略：
+    a. 全量字典匹配：先查 douban_map（豆瓣全量演员 + Series 层已汉化数据）
+    b. AI 兜底翻译：未命中时，调 AI 翻译 Name + Role
+    c. 动态缓存学习：AI 成功结果即时写入 douban_map，阻止重复 API 调用
+
+    Args:
+        ep_people:   Emby 分集的 People 列表
+        douban_map:  {emby_name_lower: {"name": "中文名", "role": "中文角色"}}
+                     此字典会被原地修改（引用传递），用于跨分集缓存
+        series_name: 剧集名称，作为 AI 翻译上下文
+
+    Returns:
+        中文化后的 People 列表
+    """
+    # AI 翻译器（延迟初始化，仅在有未命中演员时才加载）
+    _translator = None
+
+    def _get_translator():
+        nonlocal _translator
+        if _translator is None:
+            _translator = get_translator()
+        return _translator
+
+    # 收集本轮需要 AI 翻译的未命中项（姓名 + 角色分开）
+    _pending_ai_names = {}    # {lookup_key: emby_name}
+    _pending_ai_roles = {}    # {lookup_key: emby_role}
+
+    localized = []
+    for p in ep_people:
+        person_type = p.get("Type", "Actor")
+        # GuestStar (客串演员) 也纳入中文化范围
+        if person_type not in ("Actor", "GuestStar"):
+            localized.append(p)
+            continue
+
+        emby_name = (p.get("Name") or "").strip()
+        emby_role = (p.get("Role") or "").strip()
+        lookup_key = emby_name.lower()
+
+        if lookup_key in douban_map:
+            # ---- 漏斗 a: 全量字典命中 ----
+            info = douban_map[lookup_key]
+            new_p = dict(p)
+            # ★ 注入豆瓣头像外链，供 actor_profile_service 超级漏斗短路使用
+            new_p["DoubanAvatarUrl"] = info.get("avatar", "")
+            # ★ 注入豆瓣演员 ID，使 L1 漏斗能精准调用 celebrity_details
+            douban_id_str = str(info.get("douban_id", "") or "")
+            if douban_id_str:
+                new_p["DoubanCelebrityId"] = douban_id_str
+            if info.get("name") and not _CHINESE_RE.search(emby_name):
+                new_p["Name"] = info["name"]
+            db_role = info.get("role", "")
+            if db_role and db_role not in ("演员", "配音", "actor", "actress"):
+                new_p["Role"] = db_role
+            localized.append(new_p)
+        else:
+            # ---- 漏斗 b: 标记待 AI 翻译 ----
+            if emby_name and not _CHINESE_RE.search(emby_name):
+                _pending_ai_names[lookup_key] = emby_name
+            if emby_role and not _CHINESE_RE.search(emby_role):
+                _pending_ai_roles[lookup_key] = emby_role
+            localized.append(p)
+
+    # ---- 漏斗 b/c: AI 批量翻译 + 缓存回写 ----
+    if _pending_ai_names or _pending_ai_roles:
+        translator = _get_translator()
+        if translator.is_available():
+            # b1. 批量翻译人名
+            if _pending_ai_names:
+                unique_names = list(set(_pending_ai_names.values()))
+                try:
+                    name_map = translator.translate_names(unique_names, context=series_name)
+                    # c. 动态缓存：将 AI 结果写入 douban_map
+                    for lookup_key, original_name in _pending_ai_names.items():
+                        translated = name_map.get(original_name, "")
+                        if translated and _CHINESE_RE.search(translated):
+                            douban_map.setdefault(lookup_key, {})["name"] = translated
+                            logger.debug(
+                                "   🤖 [AI缓存] 人名: %s → %s", original_name, translated,
+                            )
+                except Exception:
+                    logger.debug("   ⚠ [AI] 批量人名翻译异常，跳过")
+
+            # b2. 批量翻译角色名
+            if _pending_ai_roles:
+                unique_roles = list(set(_pending_ai_roles.values()))
+                # 过滤掉明显的占位符
+                unique_roles = [
+                    r for r in unique_roles
+                    if r and r.lower() not in ("actor", "actress", "guest", "guest star", "unknown")
+                ]
+                if unique_roles:
+                    try:
+                        role_map = translator.translate_roles(unique_roles, context=series_name)
+                        # c. 动态缓存
+                        for lookup_key, original_role in _pending_ai_roles.items():
+                            translated = role_map.get(original_role, "")
+                            if translated and _CHINESE_RE.search(translated):
+                                douban_map.setdefault(lookup_key, {})["role"] = translated
+                                logger.debug(
+                                    "   🤖 [AI缓存] 角色: %s → %s", original_role, translated,
+                                )
+                    except Exception:
+                        logger.debug("   ⚠ [AI] 批量角色翻译异常，跳过")
+
+            # b3. 用更新后的 douban_map 重新应用翻译
+            if _pending_ai_names or _pending_ai_roles:
+                for i, p in enumerate(localized):
+                    person_type = p.get("Type", "Actor")
+                    if person_type not in ("Actor", "GuestStar"):
+                        continue
+                    emby_name = (p.get("Name") or "").strip()
+                    lookup_key = emby_name.lower()
+                    if lookup_key in douban_map:
+                        info = douban_map[lookup_key]
+                        new_p = dict(p)
+                        # ★ 注入豆瓣头像外链
+                        new_p["DoubanAvatarUrl"] = info.get("avatar", "")
+                        # ★ 注入豆瓣演员 ID，使 L1 漏斗能精准调用 celebrity_details
+                        douban_id_str = str(info.get("douban_id", "") or "")
+                        if douban_id_str:
+                            new_p["DoubanCelebrityId"] = douban_id_str
+                        if info.get("name") and not _CHINESE_RE.search(emby_name):
+                            new_p["Name"] = info["name"]
+                        db_role = info.get("role", "")
+                        if db_role and db_role not in ("演员", "配音", "actor", "actress"):
+                            new_p["Role"] = db_role
+                        localized[i] = new_p
+
+    # ★ 空角色强制兜底：所有处理完毕后，仍为空的 Role 默认赋 "演员"
+    for i, p in enumerate(localized):
+        if p.get("Type", "") in ("Actor", "GuestStar"):
+            if not (p.get("Role") or "").strip():
+                new_p = dict(p)
+                new_p["Role"] = "演员"
+                localized[i] = new_p
+
+    return localized
+
+
+def _build_douban_actor_map(douban_actors: list, emby_actors: list) -> dict:
+    """构建豆瓣演员匹配映射表，供分集演员中文化使用。
+
+    匹配逻辑与 DoubanSinizer._match_and_update() 保持一致：
+    1. 直接中文名匹配
+    2. 拼音降级匹配
+
+    Returns:
+        {emby_name_lower: {"name": "豆瓣中文名", "role": "豆瓣角色名"}}
+    """
+    import re as _re
+    from pypinyin import lazy_pinyin as _lazy_pinyin
+
+    def _to_pinyin_key(chinese_name: str) -> str:
+        return "".join(_lazy_pinyin(chinese_name)).lower()
+
+    def _normalize_english(name: str) -> str:
+        return _re.sub(r"[^a-z]", "", name.lower())
+
+    actor_map = {}
+    douban_names = {da.get("name", "") for da in douban_actors}
+    used_douban = set()
+
+    for ea in emby_actors:
+        emby_name = (ea.get("Name") or "").strip()
+        if not emby_name:
+            continue
+
+        matched_da = None
+
+        # Level 1: 直接中文名匹配
+        if emby_name in douban_names:
+            for da in douban_actors:
+                if da.get("name") == emby_name and da["name"] not in used_douban:
+                    matched_da = da
+                    break
+
+        # Level 2: 拼音降级匹配
+        if not matched_da:
+            emby_key = _normalize_english(emby_name)
+            for da in douban_actors:
+                if da.get("name") in used_douban:
+                    continue
+                py_key = _to_pinyin_key(da.get("name", ""))
+                if emby_key == py_key:
+                    matched_da = da
+                    break
+
+        if matched_da:
+            used_douban.add(matched_da["name"])
+            actor_map[emby_name.lower()] = {
+                "name": matched_da.get("name", ""),
+                "role": matched_da.get("role", ""),
+                "avatar": matched_da.get("avatar", ""),
+                "douban_id": str(matched_da.get("id", "") or ""),
+            }
+
+    return actor_map
+
+
+def _enrich_actor_map_from_series(actor_map: dict, series_people: list):
+    """用 Series 层级已有的中文数据丰富演员映射表。
+
+    当 Series 已经汉化（演员名为中文），用 Series 的 Name→Role 关系
+    填充 actor_map，以便分集中的同名演员获得正确的角色名。
+    """
+    for p in series_people:
+        if p.get("Type") != "Actor":
+            continue
+        name = (p.get("Name") or "").strip()
+        role = (p.get("Role") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        # 不覆盖已有的豆瓣匹配结果
+        if key not in actor_map and _CHINESE_RE.search(name):
+            actor_map[key] = {"name": name, "role": role}
+
+
+def _db_path() -> str:
+    """返回当前 SQLite 数据库文件的绝对路径。"""
+    return os.path.join(DATA_DIR, "emby_ai.db")
+
+
+# ==========================================
+# ★ 公共函数：单 Item 完整审计 & 深度入库
+# ==========================================
+
+def _audit_and_save_single_item(
+    db,
+    item: dict,
+    host: str,
+    api_key: str,
+    user_id: str,
+    library_id: str = "",
+) -> dict:
+    """对单个 Emby Item 执行完整的汉化率审计 + 深度分集入库。
+
+    这是 audit_local 和 audit_selected 共用的唯一入口，
+    保证无论从哪个入口触发，执行的逻辑完全一致。
+
+    流程:
+    1. 90% 汉化率判定 (中文 Role 占比)
+    2. 提取 ProviderIds + 外部图片链接
+    3. 顶层媒体 UPSERT 到 media_sync_status + media_metadata (+ actor_records)
+    4. ★ 若 item['Type'] == 'Series'：
+       a. 递归抓取所有 Episode（含分页保护）
+       b. 构建演员中文映射表（来自 Series 自身已汉化数据）
+       c. 对分集演员应用中文化替换
+       d. 分集逐一 UPSERT 到三表
+       e. 已汉化 Series 存演员详情，未汉化仅存元数据
+
+    Args:
+        db:           SQLAlchemy Session（调用者管理 commit/rollback）
+        item:         Emby API 返回的 Item 字典
+        host:         Emby 服务地址
+        api_key:      Emby API Key
+        user_id:      Emby User ID
+        library_id:   所属媒体库 ID
+
+    Returns:
+        {"synced": bool, "item_type": str, "item_name": str, "episodes_processed": int}
+    """
+    item_id = item.get("Id", "")
+    item_name = item.get("Name", "")
+    item_type = item.get("Type", "")
+    people = item.get("People", []) or []
+
+    # ★ 继承 library_id：如果调用方未提供，尝试从 Item 自身提取
+    # Emby 在列表视图中会把媒体库 ID 放在 ParentId 字段
+    if not library_id:
+        library_id = item.get("ParentId", "") or ""
+
+    # ---- 1. 汉化率判定 ----
+    pids = extract_provider_ids(item)
+    chinese_count, total_actors = _count_chinese_roles(people)
+    is_synced = _is_chinese_role_synced(people)
+    item_status = "synced" if is_synced else "pending"
+    images = extract_external_images(item, pids, item_type)
+    episodes_processed = 0
+
+    # ★ 按配置截断演员数（抓取时不截断，入库时截断）
+    cfg = load_config()
+    max_actors = cfg.get("max_actors_per_media", 50)
+
+    try:
+        if is_synced:
+            # 截断回写：people 只保留前 max_actors 位 Actor
+            people = _truncate_actors(people, max_actors)
+
+            # ---- 已汉化 → 三表全量入库 ----
+            save_media_to_db(
+                db,
+                emby_item=item,
+                provider_ids=pids,
+                images=images,
+                people=people,
+                library_id=library_id,
+                status=item_status,
+                matched_actors=chinese_count,
+                total_actors=total_actors,
+                parent_id=None,
+            )
+            db.flush()
+
+            # ---- ★ Series 深度抓取分集 ----
+            if item_type == "Series":
+                total_episodes = item.get("RecursiveItemCount")
+                logger.info(
+                    "   📺 [Audit] Series 深度抓取分集: %s (ID: %s, 总 %s 项)",
+                    item_name, item_id,
+                    total_episodes if total_episodes is not None else "?",
+                )
+                episodes = _fetch_episodes(host, api_key, user_id, item_id)
+                if episodes:
+                    # 构建中文映射表（基于 Series 已有的汉化数据）
+                    douban_map = _build_douban_actor_map(
+                        douban_actors=[],
+                        emby_actors=[p for p in people if p.get("Type") == "Actor"],
+                    )
+                    _enrich_actor_map_from_series(douban_map, people)
+
+                    episodes_processed = _process_episodes(
+                        db, episodes, item_id, library_id,
+                        apply_localization=bool(douban_map),
+                        douban_actor_map=douban_map,
+                        series_name=item_name,
+                        max_actors=max_actors,
+                    )
+                    logger.info(
+                        "   ✅ [Audit] %s: %d 个分集已处理",
+                        item_name, episodes_processed,
+                    )
+        else:
+            # ---- 未汉化 → 仅状态记录 ----
+            save_media_to_db(
+                db,
+                emby_item=item,
+                provider_ids=pids,
+                images=None,
+                people=None,
+                library_id=library_id,
+                status=item_status,
+                matched_actors=chinese_count,
+                total_actors=total_actors,
+                parent_id=None,
+            )
+
+            # ★ 即使未汉化，仍抓取分集元数据
+            if item_type == "Series":
+                episodes = _fetch_episodes(host, api_key, user_id, item_id)
+                if episodes:
+                    episodes_processed = _process_episodes(
+                        db, episodes, item_id, library_id,
+                        apply_localization=False,
+                        douban_actor_map=None,
+                        series_name=item_name,
+                        max_actors=max_actors,
+                    )
+
+        db.flush()
+        return {
+            "synced": is_synced,
+            "item_type": item_type,
+            "item_name": item_name,
+            "episodes_processed": episodes_processed,
+        }
+
+    except Exception:
+        logger.error(
+            "   ❌ [Audit] 单 Item 审计失败: %s (ID=%s)\n%s",
+            item_name, item_id, traceback.format_exc(),
+        )
+        raise
+
+
+# ==========================================
+# 接口: POST /api/sync/audit_local
+# ==========================================
+
+@router.post("/sync/audit_local")
+def audit_local_sync(req: FullSyncRequest):
+    """扫描 Emby 库中已汉化的媒体并同步到本地数据库。
+
+    统一调用 _audit_and_save_single_item 执行深度审计。
+    """
+    cfg = load_config()
+    host = cfg.get("emby_host", "").rstrip("/")
+    api_key = cfg.get("emby_api_key", "")
+    user_id = cfg.get("emby_user_id", "")
+
+    if not host or not api_key:
+        raise HTTPException(status_code=400, detail="缺少 Emby 配置")
+
+    base_url = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
+
+    logger.info("📁 [Audit] 数据库路径: %s", _db_path())
+    logger.info("🚀 [Audit] 开始扫描库 ID=%s ...", req.library_id)
+
+    total_scanned = 0
+    total_synced = 0
+    total_episodes_processed = 0
+    total_committed = 0
+
+    db = SessionLocal()
+    try:
+        start_index = 0
+        page_size = 50
+        commit_counter = 0
+
+        while True:
+            params = {
+                "api_key": api_key,
+                "ParentId": req.library_id,
+                "IncludeItemTypes": "Series,Movie",
+                "Recursive": "true",
+                "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
+                "StartIndex": start_index,
+                "Limit": page_size,
+            }
+            try:
+                resp = _requests.get(base_url, params=params, timeout=30)
+            except Exception:
+                logger.error(
+                    "❌ [Audit] Emby 请求失败 (start=%d):\n%s",
+                    start_index, traceback.format_exc(),
+                )
+                break
+
+            if resp.status_code != 200:
+                logger.error(
+                    "❌ [Audit] Emby HTTP %d (start=%d): %s",
+                    resp.status_code, start_index, resp.text[:300],
+                )
+                break
+
+            data = resp.json()
+            items = data.get("Items", [])
+            if not items:
+                break
+
+            for item in items:
+                total_scanned += 1
+
+                try:
+                    result = _audit_and_save_single_item(
+                        db, item, host, api_key, user_id,
+                        library_id=req.library_id,
+                    )
+                    if result["synced"]:
+                        total_synced += 1
+                        db.commit()  # 已汉化 + 分集立即提交
+                        total_committed += 1
+                    else:
+                        commit_counter += 1
+                        if commit_counter >= _COMMIT_INTERVAL:
+                            db.commit()
+                            total_committed += 1
+                            commit_counter = 0
+
+                    total_episodes_processed += result["episodes_processed"]
+
+                except Exception:
+                    db.rollback()
+                    logger.warning(
+                        "   ⚠ [Audit] 跳过失败项: %s, 继续下一个",
+                        item.get("Name", "?"),
+                    )
+                    continue
+
+            # 分页控制
+            total_records = data.get("TotalRecordCount", 0)
+            if start_index + page_size >= total_records:
+                break
+            start_index += page_size
+
+        # 最终提交：未汉化条目剩余部分
+        if commit_counter > 0:
+            db.commit()
+            total_committed += 1
+
+        # ---- 提交后验证 ----
+        from sqlalchemy import func as _func
+        sync_count = db.query(_func.count(MediaSyncStatus.emby_item_id)).scalar() or 0
+        meta_count = db.query(_func.count(MediaMetadata.emby_item_id)).scalar() or 0
+        actor_count = db.query(_func.count(ActorRecord.id)).scalar() or 0
+
+        logger.info(
+            "📋 [Audit] 扫描完成 | "
+            "总计: %d | 已汉化: %d | 分集处理: %d | 提交: %d",
+            total_scanned, total_synced, total_episodes_processed, total_committed,
+        )
+        logger.info(
+            "📊 [Audit] 数据库确认: "
+            "media_sync_status=%d 行, media_metadata=%d 行, actor_records=%d 行",
+            sync_count, meta_count, actor_count,
+        )
+        return {
+            "message": "扫描完成",
+            "total_scanned": total_scanned,
+            "marked_as_synced": total_synced,
+            "episodes_processed": total_episodes_processed,
+            "db_sync_rows": sync_count,
+            "db_metadata_rows": meta_count,
+            "db_actor_rows": actor_count,
+        }
+
+    except Exception:
+        db.rollback()
+        logger.error("❌ [Audit] 未处理异常:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+    finally:
+        db.close()
+
+
+# ==========================================
+# 接口: POST /api/sync/audit_selected
+# ==========================================
+
+@router.post("/sync/audit_selected")
+def audit_selected_sync(req: AuditSelectedRequest):
+    """对用户选中的特定媒体项执行汉化率审计并更新数据库。
+
+    统一调用 _audit_and_save_single_item，与 audit_local 逻辑完全一致。
+    """
+    cfg = load_config()
+    host = cfg.get("emby_host", "").rstrip("/")
+    api_key = cfg.get("emby_api_key", "")
+    user_id = cfg.get("emby_user_id", "")
+
+    if not host or not api_key:
+        raise HTTPException(status_code=400, detail="缺少 Emby 配置")
+
+    if not req.item_ids:
+        raise HTTPException(status_code=400, detail="item_ids 不能为空")
+
+    ids_param = ",".join(req.item_ids)
+    base = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
+    # ★ 与 audit_local 使用相同的 Fields，确保拿到 RecursiveItemCount + People
+    params = {
+        "api_key": api_key,
+        "Ids": ids_param,
+        "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
+    }
+
+    logger.info(
+        "🎯 [AuditSelected] 审计 %d 个选中项: %s",
+        len(req.item_ids), ids_param[:200],
+    )
+
+    try:
+        resp = _requests.get(base, params=params, timeout=30)
+    except Exception:
+        logger.error(
+            "❌ [AuditSelected] Emby 批量请求失败:\n%s",
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=502, detail="Emby 批量请求失败")
+
+    if resp.status_code != 200:
+        logger.error(
+            "❌ [AuditSelected] Emby HTTP %d: %s",
+            resp.status_code, resp.text[:300],
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Emby 返回错误 HTTP {resp.status_code}",
+        )
+
+    data = resp.json()
+    items = data.get("Items", [])
+    total_checked = len(items)
+    marked_synced = 0
+    total_episodes_processed = 0
+
+    db = SessionLocal()
+    try:
+        for idx, item in enumerate(items, 1):
+            item_name = item.get("Name", "?")
+            item_type = item.get("Type", "?")
+            logger.info(
+                "📋 [AuditSelected] 进度 %d/%d: %s (%s)",
+                idx, total_checked, item_name, item_type,
+            )
+            try:
+                result = _audit_and_save_single_item(
+                    db, item, host, api_key, user_id,
+                    library_id="",
+                )
+                db.commit()  # 每个选中项独立提交
+
+                if result["synced"]:
+                    marked_synced += 1
+                total_episodes_processed += result["episodes_processed"]
+
+            except Exception:
+                db.rollback()
+                logger.warning(
+                    "   ⚠ [AuditSelected] 跳过失败项: %s",
+                    item.get("Name", "?"),
+                )
+                continue
+
+        logger.info(
+            "📋 [AuditSelected] 审计完成 | 共计: %d | 标记已汉化: %d | 分集: %d",
+            total_checked, marked_synced, total_episodes_processed,
+        )
+        return {
+            "message": "局部审计完成",
+            "total_checked": total_checked,
+            "marked_synced": marked_synced,
+            "episodes_processed": total_episodes_processed,
+        }
+
+    except Exception:
+        db.rollback()
+        logger.error(
+            "❌ [AuditSelected] 未处理异常:\n%s",
+            traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+    finally:
+        db.close()
+
+
+# ==========================================
+# 接口: GET /api/media/{item_id}/details
+# 分集数据透视 — 只读，查询本地 SQLite 中持久化的元数据与演员
+# ==========================================
+
+@router.get("/media/{item_id}/details")
+def get_media_details(item_id: str, request: Request):
+    """获取剧集的分集数据透视 — 含顶层常驻演员与各分集专属演员。
+
+    纯只读接口，数据全部来自本地 SQLite。
+    ★ 演员头像与生平数据通过 name 关联 ActorProfile，
+      优先返回 local_image_url (基于当前服务的 base_url 拼接)，
+      降级为外部 image_url。
+
+    返回结构:
+        {
+            "series": {
+                "emby_item_id": "...",
+                "title": "...",
+                "overview": "...",
+                "recursive_item_count": 12,
+                "actors": [
+                    {
+                        "name": "...", "role": "...", "type": "Actor",
+                        "image_url": "...",            // 外部直链兜底
+                        "local_image_url": "...",      // ★ 本地静态 URL (优先使用)
+                        "birth_date": "...", "birth_place": "...", "overview": "...",
+                        "sort_order": 0
+                    }
+                ]
+            },
+            "episodes": [...]
+        }
+    """
+    # ★ 使用当前 FastAPI 服务的 base_url 拼接静态资源路径，
+    #   而非 emby_host（那是 Emby 媒体服务器地址，不提供 actor_images）。
+    base_url = str(request.base_url).rstrip("/")
+
+    db = SessionLocal()
+    try:
+        # 1. 查询顶层剧集元数据
+        series_meta = db.query(MediaMetadata).filter(
+            MediaMetadata.emby_item_id == item_id
+        ).first()
+
+        if not series_meta:
+            raise HTTPException(status_code=404, detail=f"未找到媒体项: {item_id}")
+
+        # 2. 收集所有相关的演员 name → 批量查 ActorProfile
+        all_actor_names = set()
+
+        # 2a. 顶层演员
+        series_actor_records = db.query(ActorRecord).filter(
+            ActorRecord.emby_item_id == item_id
+        ).order_by(ActorRecord.sort_order).all()
+        for a in series_actor_records:
+            if a.name:
+                all_actor_names.add(a.name)
+
+        # 2b. 分集演员
+        episodes_meta = db.query(MediaMetadata).filter(
+            MediaMetadata.parent_id == item_id
+        ).order_by(
+            MediaMetadata.parent_index_number.asc(),
+            MediaMetadata.index_number.asc(),
+        ).all()
+
+        ep_actor_records_map = {}  # {ep_item_id: [ActorRecord]}
+        for ep in episodes_meta:
+            ep_actors = db.query(ActorRecord).filter(
+                ActorRecord.emby_item_id == ep.emby_item_id
+            ).order_by(ActorRecord.sort_order).all()
+            ep_actor_records_map[ep.emby_item_id] = ep_actors
+            for a in ep_actors:
+                if a.name:
+                    all_actor_names.add(a.name)
+
+        # ★ 批量查询 ActorProfile (一次查询，O(1) 字典查找)
+        profiles = {}
+        if all_actor_names:
+            profile_rows = db.query(ActorProfile).filter(
+                ActorProfile.name.in_(list(all_actor_names))
+            ).all()
+            for prof in profile_rows:
+                profiles[prof.name] = prof
+
+        # ---- 辅助: 组装单个演员的完整响应 ----
+        def _build_actor(a: ActorRecord) -> dict:
+            prof = profiles.get(a.name)
+            local_image_url = ""
+            image_url = ""
+
+            if prof:
+                # 优先本地静态文件 — 基于当前 API 服务的 base_url
+                if prof.local_image_path:
+                    local_image_url = f"{base_url}/static_actors/{prof.local_image_path}"
+                image_url = prof.image_url or ""
+
+            return {
+                "name": a.name,
+                "role": a.role or "",
+                "type": a.type,
+                "image_url": image_url,                   # 外部直链兜底
+                "local_image_url": local_image_url,       # ★ 本地静态 URL
+                "birth_date": prof.birth_date if prof else "",
+                "birth_place": prof.birth_place if prof else "",
+                "overview": prof.overview if prof else "",
+                "sort_order": a.sort_order,
+            }
+
+        # 3. 组装 Series
+        series = {
+            "emby_item_id": series_meta.emby_item_id,
+            "title": series_meta.title,
+            "overview": series_meta.overview,
+            "recursive_item_count": series_meta.recursive_item_count,
+            "actors": [_build_actor(a) for a in series_actor_records],
+        }
+
+        # 4. 组装 Episodes
+        episodes = []
+        for ep in episodes_meta:
+            ep_records = ep_actor_records_map.get(ep.emby_item_id, [])
+            episodes.append({
+                "emby_item_id": ep.emby_item_id,
+                "title": ep.title,
+                "overview": ep.overview,
+                "index_number": ep.index_number,
+                "parent_index_number": ep.parent_index_number,
+                "poster_url": ep.poster_url,
+                "actors": [_build_actor(a) for a in ep_records],
+            })
+
+        return {"series": series, "episodes": episodes}
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.error(
+            "❌ [MediaDetails] 查询失败 (item=%s):\n%s",
+            item_id, traceback.format_exc(),
+        )
+        raise HTTPException(status_code=500, detail="服务器内部错误")
+    finally:
+        db.close()
+
+
+# ==========================================
+# 接口: GET /api/tasks/{task_id}
+# 前端轮询后台任务进度
+# ==========================================
+
+@router.get("/tasks/{task_id}")
+def get_task_status(task_id: str):
+    """查询后台任务的实时进度。
+
+    返回:
+        {
+            "status": "running|completed|error",
+            "total": int, "current": int, "message": str,
+            "metadata": dict,
+        }
+        任务不存在返回 404。
+    """
+    status = task_manager.get_status(task_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期")
+    return status
+
+
+# ==========================================
+# 接口: POST /api/episodes/batch-enrich
+# 分集批量富化 — TMDB 季节 API → 简介 + 客串演员 + 本地漏斗
+# ==========================================
+
+class BatchEnrichRequest(BaseModel):
+    item_id: str  # Emby Series Item ID
+
+
+@router.post("/episodes/batch-enrich")
+def batch_enrich_episodes(
+    req: BatchEnrichRequest,
+    background_tasks: BackgroundTasks,
+):
+    """触发分集批量富化任务（后台执行，立即返回 task_id）。
+
+    后台任务会:
+    1. 查本地 DB 获取 Series 的 tmdb_id 及已有的分集记录
+    2. 按季调用 TMDB GET /tv/{tmdb_id}/season/{season_number}
+    3. 提取每集的 overview + guest_stars（客串演员）
+    4. 客串演员传入本地 L0-L2 超级漏斗完成头像嗅探/下载
+    5. 将简介写入 media_metadata、演员关联写入 actor_records
+
+    Args:
+        item_id: Emby Series 的 Item ID
+
+    Returns:
+        {"task_id": str, "message": str}
+    """
+    cfg = load_config()
+    api_key = cfg.get("tmdb_api_key", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="TMDB API Key 未配置")
+
+    # 验证 Series 存在且有 tmdb_id
+    db = SessionLocal()
+    try:
+        sync_status = db.query(MediaSyncStatus).filter(
+            MediaSyncStatus.emby_item_id == req.item_id
+        ).first()
+        if not sync_status:
+            raise HTTPException(status_code=404, detail="媒体项未入库，请先执行审计")
+        if not sync_status.tmdb_id:
+            raise HTTPException(
+                status_code=400,
+                detail="该媒体项缺少 TMDB ID，无法通过 TMDB API 获取分集数据",
+            )
+
+        # 统计已有的分集数据（用于估算总步数）
+        existing_eps = db.query(MediaMetadata).filter(
+            MediaMetadata.parent_id == req.item_id,
+            MediaMetadata.parent_index_number.isnot(None),
+        ).all()
+
+        # 收集所有不同的季号
+        season_numbers = sorted(set(
+            ep.parent_index_number for ep in existing_eps
+            if ep.parent_index_number is not None
+        ))
+        if not season_numbers:
+            season_numbers = [1]  # 默认至少尝试第 1 季
+
+        series_name = sync_status.title or req.item_id
+        tmdb_id = sync_status.tmdb_id
+    finally:
+        db.close()
+
+    # 创建后台任务
+    task_id = task_manager.create_task(
+        total=len(season_numbers),
+        message=f"开始处理: {series_name}",
+        metadata={
+            "item_id": req.item_id,
+            "item_name": series_name,
+            "tmdb_id": tmdb_id,
+            "season_count": len(season_numbers),
+        },
+    )
+
+    # 提交后台任务
+    background_tasks.add_task(
+        _batch_enrich_episodes_task,
+        task_id=task_id,
+        item_id=req.item_id,
+        tmdb_id=tmdb_id,
+        season_numbers=season_numbers,
+        series_name=series_name,
+    )
+
+    logger.info(
+        "🚀 [BatchEnrich] 后台任务已提交: task=%s series=%s seasons=%d",
+        task_id, series_name, len(season_numbers),
+    )
+    return {
+        "task_id": task_id,
+        "message": f"分集富化任务已启动，共 {len(season_numbers)} 季",
+    }
+
+
+# ==========================================
+# 后台任务: 分集批量富化引擎
+# ==========================================
+
+def _batch_enrich_episodes_task(
+    task_id: str,
+    item_id: str,
+    tmdb_id: str,
+    season_numbers: list,
+    series_name: str,
+):
+    """后台任务核心逻辑 — 按季调用 TMDB，处理 guest_stars + overview。
+
+    设计要点（规避 N+1 查询）:
+    - 使用 TMDB 整季接口 GET /tv/{id}/season/{n}，一次请求拿到全季数据
+    - guest_stars 列表一次性传给 ensure_profiles_for_people 批量处理
+    - 演员先去重（按 Name），再批量走漏斗，避免重复 TMDB 搜索
+
+    Args:
+        task_id:        任务 ID（用于进度上报）
+        item_id:        Emby Series Item ID
+        tmdb_id:        TMDB Series ID
+        season_numbers: 需要处理的季号列表
+        series_name:    剧集名称
+    """
+    cfg = load_config()
+    api_key = cfg.get("tmdb_api_key", "")
+    base_url = cfg.get("tmdb_base_url", "") or "https://api.tmdb.org/3"
+
+    # ★ sentinel 变量：finally 块统一保证任务被正确终结
+    _enrich_success = False
+    _enrich_final_msg = f"❌ 任务失败: {series_name}"
+
+    db = SessionLocal()
+    total_enriched_eps = 0
+    total_guest_stars = 0
+
+    try:
+        for idx, season_num in enumerate(season_numbers, 1):
+            # ---- 进度上报 ----
+            task_manager.update_progress(
+                task_id,
+                current=idx - 1,
+                message=f"正在处理 {series_name} 第 {season_num} 季...",
+            )
+
+            logger.info(
+                "📺 [BatchEnrich] 获取季数据: %s S%02d (进度 %d/%d)",
+                series_name, season_num, idx, len(season_numbers),
+            )
+
+            # ---- Step 1: 调用 TMDB 整季接口 ----
+            try:
+                resp = _requests.get(
+                    f"{base_url}/tv/{tmdb_id}/season/{season_num}",
+                    params={
+                        "api_key": api_key,
+                        "language": "zh-CN",
+                        "append_to_response": "credits",
+                    },
+                    timeout=30,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "   ⚠ [BatchEnrich] TMDB S%02d HTTP %d: %s",
+                        season_num, resp.status_code,
+                        resp.text[:200] if resp.text else "",
+                    )
+                    task_manager.update_progress(
+                        task_id,
+                        current=idx,
+                        message=f"第 {season_num} 季获取失败 (HTTP {resp.status_code})，继续下一季",
+                    )
+                    db.commit()
+                    continue
+
+                season_data = resp.json()
+            except Exception:
+                logger.error(
+                    "   ❌ [BatchEnrich] TMDB S%02d 请求异常:\n%s",
+                    season_num, traceback.format_exc(),
+                )
+                task_manager.update_progress(
+                    task_id, current=idx,
+                    message=f"第 {season_num} 季网络异常，继续下一季",
+                )
+                db.commit()
+                continue
+
+            episodes = season_data.get("episodes", [])
+            if not episodes:
+                logger.info(
+                    "   ℹ️ [BatchEnrich] S%02d 无分集数据", season_num,
+                )
+                task_manager.update_progress(
+                    task_id, current=idx,
+                    message=f"第 {season_num} 季无分集数据",
+                )
+                db.commit()
+                continue
+
+            # ---- Step 2: 收集本季所有 guest_stars（跨集去重） ----
+            season_guest_stars: dict[str, dict] = {}  # {name: person_dict}
+            ep_updates: list[dict] = []  # [{ep_number, overview, guest_names}]
+
+            for ep in episodes:
+                ep_number = ep.get("episode_number")
+                if ep_number is None:
+                    continue
+
+                overview = (ep.get("overview") or "").strip()
+                guest_stars = ep.get("guest_stars", []) or []
+
+                guest_names = []
+                for gs in guest_stars:
+                    gs_name = (gs.get("name") or "").strip()
+                    if gs_name and gs_name not in season_guest_stars:
+                        # 构造与 Emby People 兼容的 dict 格式
+                        season_guest_stars[gs_name] = {
+                            "Name": gs_name,
+                            "Type": "GuestStar",
+                            "Role": (gs.get("character") or "").strip(),
+                            "Tmdb": str(gs.get("id", "")),
+                            "DoubanAvatarUrl": "",
+                            "DoubanCelebrityId": "",
+                            "ProviderIds": {
+                                "Tmdb": str(gs.get("id", "")),
+                            },
+                        }
+                    guest_names.append(gs_name)
+
+                ep_updates.append({
+                    "episode_number": ep_number,
+                    "overview": overview,
+                    "guest_names": guest_names,
+                    "guest_stars_raw": [
+                        gs for gs in guest_stars
+                        if (gs.get("name") or "").strip() in guest_names
+                    ],
+                })
+
+            # ---- Step 3: 批量走本地漏斗 — 一次处理所有 guest_stars ----
+            if season_guest_stars:
+                logger.info(
+                    "   👥 [BatchEnrich] S%02d 共 %d 位客串演员，批量走 L0-L2 漏斗",
+                    season_num, len(season_guest_stars),
+                )
+                try:
+                    people_list = list(season_guest_stars.values())
+                    ensure_profiles_for_people(db, people_list)
+                    db.flush()
+                    total_guest_stars += len(people_list)
+                except Exception:
+                    logger.error(
+                        "   ❌ [BatchEnrich] S%02d guest_stars 漏斗处理异常:\n%s",
+                        season_num, traceback.format_exc(),
+                    )
+                    db.rollback()
+
+            # ---- Step 4: 更新 media_metadata.overview + 写入 actor_records ----
+            for ep_update in ep_updates:
+                ep_number = ep_update["episode_number"]
+                overview = ep_update["overview"]
+                guest_names = ep_update["guest_names"]
+
+                # 查找对应的本地 Episode 记录
+                ep_records = db.query(MediaMetadata).filter(
+                    MediaMetadata.parent_id == item_id,
+                    MediaMetadata.parent_index_number == season_num,
+                    MediaMetadata.index_number == ep_number,
+                ).all()
+
+                for ep_rec in ep_records:
+                    if overview:
+                        ep_rec.overview = overview
+                        ep_rec.update_time = datetime.now()
+
+                    # 写入客串演员到 actor_records（仅当该 Episode 尚无记录时）
+                    if guest_names and ep_rec.emby_item_id:
+                        existing_actors = db.query(ActorRecord).filter(
+                            ActorRecord.emby_item_id == ep_rec.emby_item_id,
+                            ActorRecord.type == "GuestStar",
+                        ).count()
+                        if existing_actors == 0:
+                            for gs_name in guest_names:
+                                gs_info = season_guest_stars.get(gs_name, {})
+                                db.add(ActorRecord(
+                                    emby_item_id=ep_rec.emby_item_id,
+                                    name=gs_name,
+                                    role=gs_info.get("Role", ""),
+                                    type="GuestStar",
+                                    sort_order=0,
+                                ))
+
+                total_enriched_eps += 1
+
+            db.commit()
+
+            task_manager.update_progress(
+                task_id,
+                current=idx,
+                message=f"已完成 {series_name} 第 {season_num} 季 ({len(episodes)} 集)",
+            )
+            logger.info(
+                "   ✅ [BatchEnrich] S%02d 完成: %d 集, %d 位客串演员",
+                season_num, len(episodes),
+                len(season_guest_stars),
+            )
+
+        # ---- 全部完成 ----
+        _enrich_success = True
+        _enrich_final_msg = (
+            f"✅ 完成: {series_name} | "
+            f"{len(season_numbers)} 季 / {total_enriched_eps} 集 | "
+            f"客串演员 {total_guest_stars} 位"
+        )
+
+    except Exception:
+        logger.error(
+            "❌ [BatchEnrich] 批量分集任务异常:\n%s",
+            traceback.format_exc(),
+        )
+        db.rollback()
+        # ★ sentinel 保持 False，finally 块会以 error 状态调用 complete_task
+    finally:
+        db.close()
+        # ★ 无论如何都会执行，确保任务状态被终结
+        task_manager.complete_task(
+            task_id, _enrich_final_msg, success=_enrich_success,
+        )
+
+
+# ==========================================
+# 接口: POST /api/audit/batch
+# ★ 统一审计入口 — 后台异步执行 + 整季 TMDB 批处理
+# ==========================================
+
+class BatchAuditRequest(BaseModel):
+    """统一审计请求 — 支持按 item_ids 或 library_id 两种模式。
+
+    - item_ids 模式（审计选中项）：前端传入选中的 ID 列表
+    - library_id 模式（审计本地汉化状态）：后端自动拉取库内全部 ID
+    """
+    item_ids: list[str] = []
+    library_id: str = ""
+
+
+@router.post("/audit/batch")
+def batch_audit(req: BatchAuditRequest, background_tasks: BackgroundTasks):
+    """统一审计入口：后台批量执行，立即返回 task_id 供前端轮询。
+
+    对 Series 使用 TMDB Season API 整季批处理，彻底杜绝逐集循环查询。
+
+    请求体:
+        {"item_ids": ["id1", "id2"], "library_id": ""}   // 审计选中项
+        {"item_ids": [], "library_id": "1875208"}          // 审计全量汉化状态
+
+    返回:
+        200: {"task_id": "abc123", "message": "审计任务已启动，共 50 项"}
+        400: 配置缺失 / 参数为空
+    """
+    cfg = load_config()
+    host = cfg.get("emby_host", "").rstrip("/")
+    api_key = cfg.get("emby_api_key", "")
+    user_id = cfg.get("emby_user_id", "")
+
+    if not host or not api_key:
+        raise HTTPException(status_code=400, detail="缺少 Emby 配置")
+
+    if not req.item_ids and not req.library_id:
+        raise HTTPException(status_code=400, detail="item_ids 和 library_id 至少提供一个")
+
+    task_id = task_manager.create_task(
+        total=0,  # 将在 _batch_audit_task 中动态计算
+        message="正在准备审计...",
+        metadata={
+            "mode": "selected" if req.item_ids else "library",
+            "library_id": req.library_id,
+            "item_count": len(req.item_ids) if req.item_ids else 0,
+        },
+    )
+
+    background_tasks.add_task(
+        _batch_audit_task,
+        task_id=task_id,
+        item_ids=req.item_ids,
+        library_id=req.library_id,
+        host=host,
+        api_key=api_key,
+        user_id=user_id,
+    )
+
+    logger.info(
+        "🚀 [BatchAudit] 后台任务已提交: task=%s mode=%s ids=%d",
+        task_id,
+        "selected" if req.item_ids else "library",
+        len(req.item_ids) if req.item_ids else 0,
+    )
+    return {
+        "task_id": task_id,
+        "message": f"审计任务已启动"
+        + (f"，共 {len(req.item_ids)} 项" if req.item_ids else "（全库扫描）"),
+    }
+
+
+# ==========================================
+# 后台任务: 统一批量审计引擎
+# ==========================================
+
+def _fetch_library_item_ids(host: str, api_key: str, user_id: str,
+                             library_id: str) -> list[str]:
+    """从 Emby 库中获取所有顶层媒体项的 ID 列表（轻量，仅 ID）。
+
+    用于 library_id 模式的审计：先拿到全部 ID，再按批次处理。
+    """
+    base = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
+    all_ids = []
+    start_index = 0
+    page_size = 200  # ID 列表很轻量，可以一次多拿
+
+    while True:
+        params = {
+            "api_key": api_key,
+            "ParentId": library_id,
+            "IncludeItemTypes": "Series,Movie",
+            "Recursive": "true",
+            "Fields": "",  # ★ 仅需 ID，不要任何额外字段
+            "StartIndex": start_index,
+            "Limit": page_size,
+        }
+        try:
+            resp = _requests.get(base, params=params, timeout=30)
+            if resp.status_code != 200:
+                logger.error(
+                    "❌ [BatchAudit] 获取库 ID 列表失败 HTTP %d (start=%d)",
+                    resp.status_code, start_index,
+                )
+                break
+            data = resp.json()
+            items = data.get("Items", [])
+            if not items:
+                break
+            all_ids.extend(item.get("Id", "") for item in items if item.get("Id"))
+            total = data.get("TotalRecordCount", 0)
+            if start_index + page_size >= total:
+                break
+            start_index += page_size
+        except Exception:
+            logger.error(
+                "❌ [BatchAudit] 获取库 ID 列表异常:\n%s",
+                traceback.format_exc(),
+            )
+            break
+
+    logger.info(
+        "📋 [BatchAudit] 库 %s 共发现 %d 个顶层媒体项",
+        library_id, len(all_ids),
+    )
+    return all_ids
+
+
+def _fetch_episodes_light(host: str, api_key: str, user_id: str,
+                          series_id: str) -> list:
+    """轻量级分集发现 — 仅获取 ID/编号/标题，零演员/ProviderIds 开销。
+
+    专为 Series 审计设计的极简 Emby 调用：
+    - 不请求 People / ProviderIds / Overview 等大字段
+    - 仅拿到 Emby Episode ID + 集号 + 季号，用于创建 MediaMetadata 锚点
+    - 后续所有富化数据（简介、客串演员）由 TMDB Season API 提供
+    """
+    base = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
+    all_eps = []
+    start_index = 0
+    page_size = 100
+
+    while True:
+        params = {
+            "api_key": api_key,
+            "ParentId": series_id,
+            "IncludeItemTypes": "Episode",
+            "Recursive": "true",
+            "Fields": "ParentIndexNumber,IndexNumber",  # ★ 仅季号+集号
+            "StartIndex": start_index,
+            "Limit": page_size,
+        }
+        try:
+            resp = _requests.get(base, params=params, timeout=30)
+            if resp.status_code != 200:
+                logger.warning(
+                    "   ⚠ [BatchAudit] 获取 %s 分集列表失败: HTTP %d",
+                    series_id, resp.status_code,
+                )
+                break
+            data = resp.json()
+            items = data.get("Items", [])
+            if not items:
+                break
+            all_eps.extend(items)
+            total = data.get("TotalRecordCount", 0)
+            if start_index + page_size >= total:
+                break
+            start_index += page_size
+        except Exception:
+            logger.warning(
+                "   ⚠ [BatchAudit] 获取 %s 分集列表异常:\n%s",
+                series_id, traceback.format_exc(),
+            )
+            break
+
+    return all_eps
+
+
+def _fetch_tmdb_seasons(tmdb_base: str, api_key: str, tmdb_id: str) -> list[int]:
+    """通过 TMDB 获取剧集的所有季号列表。
+
+    带 3 次网络重试：Timeout/ConnectionError 退避 2s 后重试；
+    HTTP 404 立即放弃（说明该 ID 非剧集，可能是电影 ID 误填）。
+
+    Returns:
+        季号列表 (如 [1, 2, 3])，失败返回 [1] 兜底
+    """
+    MAX_RETRIES = 3
+    RETRY_DELAY = 2.0
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = _requests.get(
+                f"{tmdb_base}/tv/{tmdb_id}",
+                params={"api_key": api_key, "language": "zh-CN"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                seasons = [
+                    s["season_number"]
+                    for s in data.get("seasons", [])
+                    if s.get("season_number", 0) > 0  # 排除特辑 (season 0)
+                ]
+                if seasons:
+                    return sorted(seasons)
+                # 200 但没有季数据（罕见），直接返回兜底值
+                logger.info(
+                    "   ⏭️ [TMDB] 季列表为空 (无 season_number>0): %s", tmdb_id,
+                )
+                return [1]
+
+            # ---- HTTP 非 200 状态码处理 ----
+            if resp.status_code == 404:
+                logger.info(
+                    "   ⏭️ [TMDB] 季列表 404 不存在，跳过查询 (可能非剧集ID): %s",
+                    tmdb_id,
+                )
+                return [1]  # 不重试，直接兜底
+
+            # 其他 HTTP 错误（429/500/502/503 等）— 视作网络异常重试
+            logger.warning(
+                "   ⚠ [BatchAudit] 获取 TMDB %s 季列表 HTTP %d (第 %d/%d 次尝试)",
+                tmdb_id, resp.status_code, attempt, MAX_RETRIES,
+            )
+            if attempt < MAX_RETRIES:
+                _time.sleep(RETRY_DELAY)
+
+        except (_requests.exceptions.Timeout, _requests.exceptions.ConnectionError) as e:
+            logger.warning(
+                "   ⚠ [BatchAudit] 获取 TMDB %s 季列表网络异常 (%s) — 第 %d/%d 次尝试",
+                tmdb_id, type(e).__name__, attempt, MAX_RETRIES,
+            )
+            if attempt < MAX_RETRIES:
+                _time.sleep(RETRY_DELAY)
+
+        except Exception as e:
+            # 非网络异常（JSON 解析失败等），不重试，直接暴露真实死因
+            logger.warning(
+                "   ⚠ [BatchAudit] 获取 TMDB %s 季列表异常: %s",
+                tmdb_id, str(e),
+            )
+            break
+
+    return [1]  # 兜底：至少尝试第 1 季
+
+
+def _batch_audit_task(
+    task_id: str,
+    item_ids: list[str],
+    library_id: str,
+    host: str,
+    api_key: str,
+    user_id: str,
+):
+    """★ 统一批量审计后台引擎。
+
+    核心原则：
+    1. 【绝对禁止】进入旧的逐集循环查询（_process_episodes / _fetch_episodes 全量版）
+    2. Series 分集数据全部通过 TMDB Season API 整季获取
+    3. 所有演员画像走本地 L0-L2 超级漏斗批量处理
+    4. 进度按"季"为单位推进，前端轮询实时反馈
+
+    流程概览：
+    Phase 0 — 收集 ID 列表（library_id 模式下从 Emby 拉取）
+    Phase 1 — 逐项状态检查 + UPSERT 入库 + 发现季数
+    Phase 2 — 按季 TMDB 批处理（guest_stars 去重 + ensure_profiles + 批量写入）
+    """
+    cfg = load_config()
+    tmdb_api_key = cfg.get("tmdb_api_key", "")
+    tmdb_base = cfg.get("tmdb_base_url", "") or "https://api.tmdb.org/3"
+    max_actors = cfg.get("max_actors_per_media", 50)
+
+    # ★ sentinel 变量：finally 块统一调用 complete_task，
+    #    无论成功、失败、还是早期 return，都能保证任务被正确终结
+    _batch_audit_success = False
+    _batch_audit_final_msg = "❌ 审计任务失败，请查看服务端日志"
+
+    # ---- Phase 0: 收集 ID 列表 ----
+    if library_id and not item_ids:
+        task_manager.update_progress(
+            task_id, current=0,
+            message="正在从 Emby 获取媒体库 ID 列表...",
+        )
+        item_ids = _fetch_library_item_ids(host, api_key, user_id, library_id)
+        if not item_ids:
+            # ★ sentinel: finally 块统一调用 complete_task
+            _batch_audit_success = True
+            _batch_audit_final_msg = "⚠ 媒体库中没有发现任何媒体项"
+            return
+
+    total_items = len(item_ids)
+    task_manager.update_progress(
+        task_id, total=total_items, current=0,
+        message=f"开始审计 {total_items} 个媒体项...",
+    )
+
+    # ---- Phase 1: 逐项状态检查 + 入库 + 发现季数 ----
+    db = SessionLocal()
+    series_queue: list[dict] = []  # [{item, tmdb_id, name, item_id}]
+    total_synced = 0
+    total_scanned = 0
+
+    # 分批从 Emby 获取（Emby Ids 参数有长度限制，按 100 个一组）
+    BATCH_SIZE = 100
+    base_url = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
+
+    try:
+        for batch_start in range(0, total_items, BATCH_SIZE):
+            batch_ids = item_ids[batch_start:batch_start + BATCH_SIZE]
+            ids_param = ",".join(batch_ids)
+
+            # 从 Emby 批量获取 Item 详情
+            params = {
+                "api_key": api_key,
+                "Ids": ids_param,
+                "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
+            }
+            try:
+                resp = _requests.get(base_url, params=params, timeout=60)
+                if resp.status_code != 200:
+                    logger.error(
+                        "❌ [BatchAudit] Emby 批量请求失败 HTTP %d (batch %d)",
+                        resp.status_code, batch_start,
+                    )
+                    task_manager.update_progress(
+                        task_id,
+                        current=batch_start + len(batch_ids),
+                        message=f"Emby 请求失败 (HTTP {resp.status_code})，跳过批次",
+                    )
+                    continue
+                items = resp.json().get("Items", [])
+            except Exception:
+                logger.error(
+                    "❌ [BatchAudit] Emby 批量请求异常 (batch %d):\n%s",
+                    batch_start, traceback.format_exc(),
+                )
+                task_manager.update_progress(
+                    task_id,
+                    current=batch_start + len(batch_ids),
+                    message="Emby 网络异常，跳过批次",
+                )
+                continue
+
+            for item in items:
+                item_id = item.get("Id", "")
+                item_name = item.get("Name", "")
+                item_type = item.get("Type", "")
+                people = item.get("People", []) or []
+
+                try:
+                    # ---- 汉化率判定 ----
+                    pids = extract_provider_ids(item)
+                    chinese_count, total_actors = _count_chinese_roles(people)
+                    is_synced = _is_chinese_role_synced(people)
+                    item_status = "synced" if is_synced else "pending"
+                    images = extract_external_images(item, pids, item_type)
+
+                    if is_synced:
+                        people_truncated = _truncate_actors(people, max_actors)
+                        save_media_to_db(
+                            db, emby_item=item, provider_ids=pids,
+                            images=images, people=people_truncated,
+                            library_id=library_id, status=item_status,
+                            matched_actors=chinese_count,
+                            total_actors=total_actors,
+                            parent_id=None,
+                        )
+                        total_synced += 1
+
+                        # ★ Series 加入队列，后续通过 TMDB Season API 处理
+                        if item_type == "Series":
+                            tmdb_id = pids.get("tmdb_id", "")
+                            if tmdb_id:
+                                series_queue.append({
+                                    "item": item,
+                                    "tmdb_id": tmdb_id,
+                                    "name": item_name,
+                                    "item_id": item_id,
+                                })
+                            else:
+                                logger.warning(
+                                    "   ⚠ [BatchAudit] %s 无 TMDB ID，跳过分集处理",
+                                    item_name,
+                                )
+                    else:
+                        # 未汉化 → 仅状态记录，不存演员
+                        save_media_to_db(
+                            db, emby_item=item, provider_ids=pids,
+                            images=None, people=None,
+                            library_id=library_id, status=item_status,
+                            matched_actors=chinese_count,
+                            total_actors=total_actors,
+                            parent_id=None,
+                        )
+
+                    db.flush()
+                    total_scanned += 1
+
+                    # ★ 逐项更新进度（而非等整批完成），确保前端进度条实时递增
+                    task_manager.update_progress(
+                        task_id, current=total_scanned,
+                        message=f"已检查 {total_scanned}/{total_items} 项"
+                        + (f"，已汉化 {total_synced}" if total_synced else ""),
+                    )
+
+                except Exception:
+                    db.rollback()
+                    logger.warning(
+                        "   ⚠ [BatchAudit] 保存失败: %s (ID=%s)\n%s",
+                        item_name, item_id, traceback.format_exc(),
+                    )
+                    continue
+
+            # 每批次提交一次
+            db.commit()
+
+        # ---- Phase 1 收尾 ----
+        db.commit()
+
+        if not series_queue:
+            _batch_audit_success = True
+            _batch_audit_final_msg = (
+                f"✅ 审计完成: 共 {total_scanned} 项，已汉化 {total_synced} 项"
+                f"（无 TMDB 剧集需处理）"
+            )
+            return
+
+        # ---- Phase 2: 整季 TMDB 批处理 ----
+        # 先统计总季数，动态调整 total
+        series_with_seasons: list[dict] = []
+        grand_total_seasons = 0
+
+        task_manager.update_progress(
+            task_id, current=0,
+            message=f"正在分析 {len(series_queue)} 部剧集的季数结构...",
+        )
+
+        for sq in series_queue:
+            seasons = _fetch_tmdb_seasons(tmdb_base, tmdb_api_key, sq["tmdb_id"])
+            sq["seasons"] = seasons
+            series_with_seasons.append(sq)
+            grand_total_seasons += len(seasons)
+
+        # ★ 将 total 调整为实际季数总和，进度更精确
+        task_manager.update_progress(
+            task_id, total=grand_total_seasons, current=0,
+            message=f"开始处理 {len(series_with_seasons)} 部剧集（共 {grand_total_seasons} 季）...",
+        )
+
+        season_processed = 0
+        total_guest_stars_all = 0
+        total_eps_enriched = 0
+
+        for sq in series_with_seasons:
+            item = sq["item"]
+            tmdb_id = sq["tmdb_id"]
+            item_name = sq["name"]
+            item_id = sq["item_id"]
+            seasons = sq["seasons"]
+
+            # ---- 轻量级分集发现：拿 Emby Episode ID + 编号 ----
+            episodes_light = _fetch_episodes_light(host, api_key, user_id, item_id)
+
+            # 批量创建/更新 MediaMetadata 锚点记录
+            for ep in episodes_light:
+                ep_id = ep.get("Id", "")
+                if not ep_id:
+                    continue
+                existing = db.query(MediaMetadata).filter(
+                    MediaMetadata.emby_item_id == ep_id
+                ).first()
+                if not existing:
+                    db.add(MediaMetadata(
+                        emby_item_id=ep_id,
+                        parent_id=item_id,
+                        media_type="Episode",
+                        title=ep.get("Name", ""),
+                        index_number=ep.get("IndexNumber"),
+                        parent_index_number=ep.get("ParentIndexNumber"),
+                        overview="",
+                    ))
+            db.flush()
+            db.commit()
+
+            # ---- 逐季 TMDB 批处理 ----
+            for season_num in seasons:
+                try:
+                    # ① 获取 TMDB 整季数据
+                    tmdb_resp = _requests.get(
+                        f"{tmdb_base}/tv/{tmdb_id}/season/{season_num}",
+                        params={
+                            "api_key": tmdb_api_key,
+                            "language": "zh-CN",
+                            "append_to_response": "credits",
+                        },
+                        timeout=30,
+                    )
+                    if tmdb_resp.status_code != 200:
+                        logger.warning(
+                            "   ⚠ [BatchAudit] 《%s》S%02d TMDB HTTP %d",
+                            item_name, season_num, tmdb_resp.status_code,
+                        )
+                        season_processed += 1
+                        task_manager.update_progress(
+                            task_id, current=season_processed,
+                            message=f"已处理《{item_name}》第 {season_num} 季 ({season_processed}/{grand_total_seasons})",
+                        )
+                        continue
+
+                    season_data = tmdb_resp.json()
+                    episodes = season_data.get("episodes", [])
+                    if not episodes:
+                        logger.info(
+                            "   ℹ️ [BatchAudit] 《%s》S%02d 无分集数据",
+                            item_name, season_num,
+                        )
+                        season_processed += 1
+                        task_manager.update_progress(
+                            task_id, current=season_processed,
+                            message=f"已处理《{item_name}》第 {season_num} 季 ({season_processed}/{grand_total_seasons})",
+                        )
+                        continue
+
+                    # ② 收集 + 去重 GuestStars（跨集合并，按 Name 为 key）
+                    all_guest_stars: dict[str, dict] = {}
+                    ep_guest_map: dict[int, list[str]] = {}  # {ep_number: [guest_names]}
+
+                    for ep in episodes:
+                        ep_num = ep.get("episode_number")
+                        if ep_num is None:
+                            continue
+
+                        guest_names: list[str] = []
+                        for gs in ep.get("guest_stars", []) or []:
+                            gs_name = (gs.get("name") or "").strip()
+                            if not gs_name:
+                                continue
+                            if gs_name not in all_guest_stars:
+                                all_guest_stars[gs_name] = {
+                                    "Name": gs_name,
+                                    "Type": "GuestStar",
+                                    "Role": (gs.get("character") or "").strip(),
+                                    "DoubanAvatarUrl": "",
+                                    "ProviderIds": {
+                                        "Tmdb": str(gs.get("id", "")),
+                                    },
+                                }
+                            guest_names.append(gs_name)
+                        ep_guest_map[ep_num] = guest_names
+
+                    # ③ 批量走本地 L0-L2 超级漏斗
+                    if all_guest_stars:
+                        logger.info(
+                            "   👥 [BatchAudit] 《%s》S%02d 共 %d 位客串演员 → 漏斗",
+                            item_name, season_num, len(all_guest_stars),
+                        )
+                        try:
+                            people_list = list(all_guest_stars.values())
+                            ensure_profiles_for_people(db, people_list)
+                            db.flush()
+                            total_guest_stars_all += len(people_list)
+                        except Exception:
+                            logger.error(
+                                "   ❌ [BatchAudit] 《%s》S%02d 漏斗异常:\n%s",
+                                item_name, season_num, traceback.format_exc(),
+                            )
+                            db.rollback()
+
+                    # ④ 批量更新 Episode Overview + 写入 GuestStar ActorRecords
+                    for ep in episodes:
+                        ep_num = ep.get("episode_number")
+                        if ep_num is None:
+                            continue
+
+                        overview = (ep.get("overview") or "").strip()
+                        guest_names = ep_guest_map.get(ep_num, [])
+
+                        # 按 (parent_id, season, episode) 定位 MediaMetadata 记录
+                        ep_recs = db.query(MediaMetadata).filter(
+                            MediaMetadata.parent_id == item_id,
+                            MediaMetadata.parent_index_number == season_num,
+                            MediaMetadata.index_number == ep_num,
+                        ).all()
+
+                        for ep_rec in ep_recs:
+                            if overview:
+                                ep_rec.overview = overview
+                                ep_rec.update_time = datetime.now()
+
+                            # 写入客串演员关联（仅当尚无记录时）
+                            if guest_names and ep_rec.emby_item_id:
+                                existing_count = db.query(ActorRecord).filter(
+                                    ActorRecord.emby_item_id == ep_rec.emby_item_id,
+                                ).count()
+                                if existing_count == 0:
+                                    for sort_idx, gs_name in enumerate(guest_names):
+                                        gs_info = all_guest_stars.get(gs_name, {})
+                                        db.add(ActorRecord(
+                                            emby_item_id=ep_rec.emby_item_id,
+                                            name=gs_name,
+                                            role=gs_info.get("Role", ""),
+                                            type="GuestStar",
+                                            sort_order=sort_idx,
+                                        ))
+
+                        total_eps_enriched += 1
+
+                    db.commit()
+                    logger.info(
+                        "   ✅ [BatchAudit] 《%s》S%02d 完成: %d 集, %d 位客串",
+                        item_name, season_num, len(episodes),
+                        len(all_guest_stars),
+                    )
+
+                except Exception:
+                    logger.error(
+                        "   ❌ [BatchAudit] 《%s》S%02d 处理异常:\n%s",
+                        item_name, season_num, traceback.format_exc(),
+                    )
+                    db.rollback()
+
+                season_processed += 1
+                # ★ 处理完一季后立即更新进度，确保前端进度条实时递增
+                task_manager.update_progress(
+                    task_id, current=season_processed,
+                    message=f"已处理《{item_name}》第 {season_num} 季 ({season_processed}/{grand_total_seasons})",
+                )
+
+            # 每部剧集完成后的进度消息
+            task_manager.update_progress(
+                task_id, current=season_processed,
+                message=f"已完成《{item_name}》（{len(seasons)} 季）",
+            )
+
+        # ---- 全部完成 ----
+        _batch_audit_success = True
+        _batch_audit_final_msg = (
+            f"✅ 审计完成: {total_scanned} 项 | "
+            f"已汉化 {total_synced} 项 | "
+            f"{len(series_with_seasons)} 部剧集 / {grand_total_seasons} 季 | "
+            f"分集 {total_eps_enriched} 集 | "
+            f"客串演员 {total_guest_stars_all} 位"
+        )
+        logger.info(
+            "✅ [BatchAudit] 任务 %s 全部完成: scanned=%d synced=%d series=%d seasons=%d eps=%d guests=%d",
+            task_id, total_scanned, total_synced,
+            len(series_with_seasons), grand_total_seasons,
+            total_eps_enriched, total_guest_stars_all,
+        )
+
+    except Exception:
+        logger.error(
+            "❌ [BatchAudit] 任务 %s 致命异常:\n%s",
+            task_id, traceback.format_exc(),
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        # ★ sentinel 保持 False，finally 块会以 error 状态调用 complete_task
+    finally:
+        db.close()
+        # ★ 无论如何都会执行，确保任务状态被终结
+        task_manager.complete_task(
+            task_id, _batch_audit_final_msg, success=_batch_audit_success,
+        )
+
+
+# ==========================================
+# ★ 统一批量汉化后台引擎
+# ==========================================
+
+def _batch_sinicize_task(
+    task_id: str,
+    item_ids: list[str],
+):
+    """后台任务核心逻辑 — 逐项调用 DoubanSinizer.sinicize()。
+
+    每个 item 独立处理（含系列剧集递归），进度按 item 粒度推进。
+    ★ 防弹级 try/except/finally 全局防线：无论任何原因崩溃，保证任务被终结。
+
+    Args:
+        task_id:  任务 ID（用于进度上报）
+        item_ids: 待汉化的 Emby Item ID 列表
+    """
+    # ★ sentinel 变量：finally 块统一调用 complete_task，
+    #    无论成功、失败、还是未捕获异常，都能保证任务被正确终结
+    _sinicize_success = False
+    _sinicize_final_msg = "❌ 批量汉化失败，请查看服务端日志"
+    total_done = 0
+    total_failed = 0
+
+    try:
+        sinizer = DoubanSinizer()
+
+        for idx, item_id in enumerate(item_ids):
+            current = idx + 1
+            task_manager.update_progress(
+                task_id, current=current - 1,
+                message=f"正在汉化 {current}/{len(item_ids)}...",
+            )
+
+            try:
+                # ★ 传入 task_id，使内部分集循环能做颗粒度进度反馈
+                result = sinizer.sinicize(item_id, task_id=task_id)
+                if result.get("success"):
+                    total_done += 1
+                    logger.info(
+                        "✅ [BatchSinicize] %s 完成: matched=%d/%d",
+                        item_id, result.get("matched", 0), result.get("total_actors", 0),
+                    )
+                else:
+                    total_failed += 1
+                    logger.warning(
+                        "⚠ [BatchSinicize] %s 失败", item_id,
+                    )
+            except Exception:
+                total_failed += 1
+                logger.error(
+                    "❌ [BatchSinicize] %s 异常:\n%s",
+                    item_id, traceback.format_exc(),
+                )
+
+            task_manager.update_progress(
+                task_id, current=current,
+                message=f"已完成 {current}/{len(item_ids)}（成功 {total_done}，失败 {total_failed}）",
+            )
+
+        _sinicize_success = True
+        _sinicize_final_msg = (
+            f"✅ 批量汉化完成: {len(item_ids)} 项 | "
+            f"成功 {total_done} | 失败 {total_failed}"
+        )
+
+    except Exception as e:
+        # ★★★ 终极防线：捕获任何穿透循环的未预期异常 ★★★
+        # 包括 DoubanSinizer 构造函数失败、迭代器异常、内存溢出等极端情况
+        logger.error(
+            "❌ [BatchSinicize] 批量汉化任务崩溃 (task=%s):\n%s",
+            task_id, traceback.format_exc(),
+        )
+        _sinicize_final_msg = f"❌ 任务崩溃: {str(e)[:200]}"
+        # ★ 先将状态置为 error，前端立刻感知异常
+        try:
+            task_manager.update_progress(
+                task_id,
+                status="error",
+                message=_sinicize_final_msg,
+            )
+        except Exception:
+            pass
+    finally:
+        # ★★★ 无论如何强制终结任务，前端轮询永远不会陷入死锁 ★★★
+        try:
+            task_manager.complete_task(
+                task_id, _sinicize_final_msg, success=_sinicize_success,
+            )
+        except Exception:
+            # 极端情况：complete_task 自身异常也确保任务被终结
+            try:
+                task_manager.complete_task(
+                    task_id, "❌ 批量汉化异常终止", success=False,
+                )
+            except Exception:
+                logger.error(
+                    "❌ [BatchSinicize] complete_task 重复失败，任务 %s 可能悬挂",
+                    task_id,
+                )
+
+
+# ==========================================
+# 接口: POST /api/douban/sinicize_selected
+# 同步选中项 → 后台异步执行 + task_id 轮询
+# ==========================================
+
+@router.post("/douban/sinicize_selected")
+def sinicize_selected(req: SinicizeSelectedRequest, background_tasks: BackgroundTasks):
+    """对选中的媒体项批量执行演员中文化（后台异步，立即返回 task_id）。
+
+    请求体:
+        {"item_ids": ["id1", "id2", "id3", ...]}
+
+    返回:
+        200: {"task_id": "abc123", "message": "批量汉化任务已启动，共 5 项"}
+        400: item_ids 为空
+    """
+    if not req.item_ids:
+        raise HTTPException(status_code=400, detail="item_ids 不能为空")
+
+    task_id = task_manager.create_task(
+        total=len(req.item_ids),
+        message=f"批量汉化任务已启动，共 {len(req.item_ids)} 项",
+        metadata={
+            "mode": "sinicize_selected",
+            "item_count": len(req.item_ids),
+        },
+    )
+
+    background_tasks.add_task(
+        _batch_sinicize_task,
+        task_id=task_id,
+        item_ids=req.item_ids,
+    )
+
+    logger.info(
+        "🚀 [SinicizeSelected] 后台任务已提交: task=%s items=%d",
+        task_id, len(req.item_ids),
+    )
+    return {
+        "task_id": task_id,
+        "message": f"批量汉化任务已启动，共 {len(req.item_ids)} 项",
+    }
+
+
+# ==========================================
+# 接口: POST /api/douban/sinicize_all
+# 全量汉化 → 自动查出所有未汉化项，后台异步执行
+# ==========================================
+
+@router.post("/douban/sinicize_all")
+def sinicize_all(req: SinicizeAllRequest, background_tasks: BackgroundTasks):
+    """对指定媒体库中所有未汉化媒体项执行全量汉化（后台异步，立即返回 task_id）。
+
+    内部自动查询 media_sync_status 表中 status='pending' 的所有项，
+    无需前端逐个传入 ID。
+
+    请求体:
+        {"library_id": "1875208"}
+
+    返回:
+        200: {"task_id": "abc123", "message": "全量汉化任务已启动，共 50 项"}
+        400: library_id 为空 / 没有未汉化项
+    """
+    if not req.library_id:
+        raise HTTPException(status_code=400, detail="library_id 不能为空")
+
+    # 从本地数据库查询所有未汉化项
+    db = SessionLocal()
+    try:
+        pending_items = db.query(MediaSyncStatus).filter(
+            MediaSyncStatus.library_id == req.library_id,
+            MediaSyncStatus.status == "pending",
+        ).all()
+
+        pending_ids = [item.emby_item_id for item in pending_items if item.emby_item_id]
+
+        if not pending_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=f"媒体库 {req.library_id} 中没有未汉化的媒体项",
+            )
+    finally:
+        db.close()
+
+    task_id = task_manager.create_task(
+        total=len(pending_ids),
+        message=f"全量汉化任务已启动，共 {len(pending_ids)} 项",
+        metadata={
+            "mode": "sinicize_all",
+            "library_id": req.library_id,
+            "item_count": len(pending_ids),
+        },
+    )
+
+    background_tasks.add_task(
+        _batch_sinicize_task,
+        task_id=task_id,
+        item_ids=pending_ids,
+    )
+
+    logger.info(
+        "🚀 [SinicizeAll] 后台任务已提交: task=%s library=%s items=%d",
+        task_id, req.library_id, len(pending_ids),
+    )
+    return {
+        "task_id": task_id,
+        "message": f"全量汉化任务已启动，共 {len(pending_ids)} 项",
+    }

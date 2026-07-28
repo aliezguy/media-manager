@@ -21,6 +21,11 @@ DEFAULT_CONFIG = {
 
     "tmdb_api_key": "",
     "tmdb_base_url": "https://api.tmdb.org/3",
+
+    # 豆瓣 API 鉴权 Cookie（用于绕过 need_login 流控限制）
+    "douban_cookie": "",
+    # 豆瓣 API 总开关（封控严重时可临时关闭，以后恢复）
+    "douban_enabled": False,
     
     # 洗版策略 (默认空)
     "wash_schemes": [],
@@ -39,6 +44,9 @@ DEFAULT_CONFIG = {
     # Emby ↔ CD2 路径映射（用于路径转换）
     "emby_prefix": "/volume3/emby影院/115网盘_3588/",
     "cd2_media_prefix": "/80003588/emby库/",
+
+    # 演职员中文化 — 每个媒体最大入库演员数（抓取全量，回写截断）
+    "max_actors_per_media": 50,
 }
 
 def load_config():
