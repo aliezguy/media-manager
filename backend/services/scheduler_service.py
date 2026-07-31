@@ -458,6 +458,13 @@ def load_all_tasks() -> None:
     except Exception as e:
         logger.error("[Scheduler] 注册超时检查任务失败: %s", e)
 
+    # ---- 注册可配置的汉化/审计定时任务（config.json 中 localization_job/audit_job）----
+    try:
+        from services.maintenance_jobs import load_maintenance_jobs
+        load_maintenance_jobs()
+    except Exception as e:
+        logger.error("[Scheduler] 注册维护任务失败: %s", e)
+
 
 async def _season_delete_timeout_job():
     """超时兜底检查 — 在线程中运行以支持同步 DB 操作。"""
@@ -476,3 +483,5 @@ async def _season_delete_timeout_job():
             db.close()
 
     await asyncio.to_thread(_run)
+
+

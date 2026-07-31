@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 from pypinyin import lazy_pinyin
 
 from config.settings import load_config
-from services.ai_translator import get_translator
+from services.ai_translator import get_translator, _is_rate_limit_error, _rate_limit_sleep
 from database import SessionLocal
 from services.db_crud import save_media_to_db, extract_provider_ids
 from services.actor_profile_service import ensure_profiles_for_people
@@ -1075,10 +1075,19 @@ class DoubanSinizer:
         if not actors_list or not title:
             return {}
 
-        translator = get_translator()
-        if not translator.is_available():
-            logger.info("   ℹ️ [AI推理] AI 不可用，跳过角色推理")
+        cfg = load_config()
+        api_key = (cfg.get("sf_api_key") or "").strip()
+        if not api_key:
+            logger.info("   ℹ️ [AI推理] 未配置 sf_api_key，跳过角色推理")
             return {}
+
+        from openai import OpenAI as OpenAIClient
+        base_url = (cfg.get("llm_base_url") or "").strip()
+        model = (cfg.get("llm_model_name") or "").strip() or "deepseek-ai/DeepSeek-V3"
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        ai_client = OpenAIClient(**client_kwargs)
 
         # 年份弱化为模糊参考，避免元数据错误（如未来年份）误导模型检索
         year_ref = f"{year}年前后" if year else ""
@@ -1118,16 +1127,30 @@ class DoubanSinizer:
 
         content = ""
         try:
-            response = translator.client.chat.completions.create(
-                model="deepseek-ai/DeepSeek-V3",
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.2,
-                max_tokens=2000,
-            )
-            content = response.choices[0].message.content or "{}"
+            # ★ 429 限流智能重试：遇限频自动冷却 5s 再试一次
+            last_exc = None
+            for attempt in (1, 2):
+                try:
+                    response = ai_client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        temperature=0.2,
+                        max_tokens=2000,
+                    )
+                    content = response.choices[0].message.content or "{}"
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if attempt == 1 and _is_rate_limit_error(e):
+                        logger.warning(
+                            "   ⚠️ [429限流] AI推理请求被限频，冷却 5s 后重试（第 1 次）…"
+                        )
+                        time.sleep(5.0)
+                        continue
+                    raise last_exc
             # ★ 打印 AI 原始返回
             #logger.info("   🧠 [AI推理] 原始返回(前500字): %s", content[:500])
             # 清理可能包裹的 Markdown 代码块
@@ -1222,10 +1245,8 @@ class DoubanSinizer:
                 e, content[:300] if content else 'N/A',
             )
             return {}
-            return {}
-        except Exception as e:
-            logger.warning("   ⚠ [AI推理] 异常: %s", e)
-            return {}
+        finally:
+            _rate_limit_sleep("[AI推理]")
 
     # ------------------------------------------------------------------
     # 5c. 分集 (Episode) 抓取与中文化

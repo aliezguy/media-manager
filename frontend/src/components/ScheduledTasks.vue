@@ -1,11 +1,11 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, onMounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Plus, Refresh, Delete, View, Edit, Timer, VideoPlay,
   Clock, CircleCheck, CircleClose, InfoFilled, WarningFilled,
-  SuccessFilled, RemoveFilled, Document, Setting,
+  SuccessFilled, RemoveFilled, Document, Setting, Brush, DataAnalysis,
 } from '@element-plus/icons-vue'
 
 // ==================== API 层 ====================
@@ -246,9 +246,119 @@ const formatDetailJson = (detail) => {
   return JSON.stringify(d, null, 2)
 }
 
+// ==================== 汉化与审计定时任务 ====================
+const activeTab = ref('scan')
+const libraries = ref([])
+
+const localizationForm = reactive({
+  library_ids: [], cron_expression: '0 3 * * *', is_active: false,
+  last_run_at: null, next_run_at: null,
+})
+const auditForm = reactive({
+  library_ids: [], cron_expression: '0 4 * * *', is_active: false,
+  last_run_at: null, next_run_at: null,
+})
+const localizationPreset = ref('daily')
+const auditPreset = ref('daily')
+const saving = reactive({ localization_job: false, audit_job: false })
+const running = reactive({ localization_job: false, audit_job: false })
+
+// 友好预设 → Cron 表达式映射
+const PRESETS = { daily: '0 3 * * *', weekly: '0 3 * * 1' }
+
+const getJobForm = (key) => (key === 'localization_job' ? localizationForm : auditForm)
+
+const fetchJobConfigs = async () => {
+  try {
+    const res = await axios.get(`${API_URL}/api/jobs/config`)
+    const data = res.data || {}
+    Object.assign(localizationForm, data.localization_job || {})
+    Object.assign(auditForm, data.audit_job || {})
+    // 反推预设：cron 命中预设值则显示 daily/weekly，否则显示自定义
+    localizationPreset.value =
+      PRESETS.daily === localizationForm.cron_expression ? 'daily'
+      : PRESETS.weekly === localizationForm.cron_expression ? 'weekly' : 'custom'
+    auditPreset.value =
+      PRESETS.daily === auditForm.cron_expression ? 'daily'
+      : PRESETS.weekly === auditForm.cron_expression ? 'weekly' : 'custom'
+  } catch (e) {
+    ElMessage.error('获取任务配置失败')
+  }
+}
+
+const saveJob = async (key) => {
+  const form = getJobForm(key)
+  if (!form.library_ids || form.library_ids.length === 0) {
+    ElMessage.warning('请先选择至少一个媒体库')
+    return
+  }
+  saving[key] = true
+  try {
+    const res = await axios.put(`${API_URL}/api/jobs/config`, {
+      [key]: {
+        library_ids: form.library_ids,
+        cron_expression: form.cron_expression,
+        is_active: form.is_active,
+      },
+    })
+    Object.assign(form, res.data[key] || {})
+    ElMessage.success('配置已保存，将按所选媒体库逐个串行执行')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '保存失败')
+  } finally {
+    saving[key] = false
+  }
+}
+
+const runJob = async (key) => {
+  running[key] = true
+  try {
+    await axios.post(`${API_URL}/api/jobs/${key}/run`)
+    ElMessage.success('任务已触发，可在大盘查看进度')
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '触发失败')
+  } finally {
+    running[key] = false
+  }
+}
+
+const toggleActive = (key) => {
+  saveJob(key)
+}
+
+const applyPreset = (key, preset) => {
+  const form = getJobForm(key)
+  if (PRESETS[preset]) form.cron_expression = PRESETS[preset]
+}
+
+const loadLibraries = async () => {
+  try {
+    const cfgRes = await axios.get(`${API_URL}/api/config`)
+    const cfg = cfgRes.data || {}
+    const libRes = await axios.post(`${API_URL}/api/libraries`, {
+      emby_host: cfg.emby_host,
+      emby_api_key: cfg.emby_api_key,
+    })
+    libraries.value = Array.isArray(libRes.data) ? libRes.data : []
+  } catch (e) {
+    libraries.value = []
+  }
+}
+
+const refreshCurrent = () => {
+  if (activeTab.value === 'scan') {
+    loadTasks()
+  } else {
+    fetchJobConfigs()
+    loadLibraries()
+  }
+}
+
 // ==================== 生命周期 ====================
 onMounted(() => {
   loadTasks()
+  fetchJobConfigs()
+  loadLibraries()
 })
 </script>
 
@@ -259,22 +369,25 @@ onMounted(() => {
       <div class="header-left">
         <h2 class="page-title">
           <el-icon :size="20"><Timer /></el-icon>
-          定时扫描
+          定时任务配置
         </h2>
-        <span class="subtitle">按 Cron 表达式定期扫描 CD2 目录，自动触发洗版流程</span>
+        <span class="subtitle">管理 CD2 定时扫描、全量汉化与全量审计任务</span>
       </div>
       <div class="header-right">
-        <el-button @click="loadTasks" :loading="tableLoading">
+        <el-button @click="refreshCurrent" :loading="tableLoading">
           <el-icon><Refresh /></el-icon>
           刷新
         </el-button>
-        <el-button type="primary" @click="openCreateDialog">
+        <el-button v-if="activeTab === 'scan'" type="primary" @click="openCreateDialog">
           <el-icon><Plus /></el-icon>
           新建任务
         </el-button>
       </div>
     </div>
 
+    <el-tabs v-model="activeTab" class="scheduler-tabs">
+      <!-- ==================== Tab 1: CD2 定时扫描 ==================== -->
+      <el-tab-pane label="CD2 定时扫描" name="scan">
     <!-- ==================== 任务列表表格 ==================== -->
     <div class="table-card">
       <el-table
@@ -346,6 +459,179 @@ onMounted(() => {
         </el-table-column>
       </el-table>
     </div>
+      </el-tab-pane>
+
+      <!-- ==================== Tab 2: 汉化与审计 ==================== -->
+      <el-tab-pane label="汉化与审计" name="maintenance">
+        <div class="maintenance-grid">
+          <!-- ① 全量汉化定时任务 -->
+          <div class="section-card">
+            <div class="section-header">
+              <span class="section-icon"><el-icon :size="18"><Brush /></el-icon></span>
+              <span class="section-title">全量汉化定时任务</span>
+              <span class="section-en">Full Localization</span>
+              <div class="section-switch">
+                <el-switch
+                  v-model="localizationForm.is_active"
+                  @change="toggleActive('localization_job')"
+                />
+              </div>
+            </div>
+
+            <div class="section-body">
+              <el-form label-position="top">
+                <el-form-item label="媒体库">
+                  <el-select
+                    v-model="localizationForm.library_ids"
+                    placeholder="选择媒体库（可多选）"
+                    clearable
+                    filterable
+                    multiple
+                    collapse-tags
+                    collapse-tags-tooltip
+                    style="width: 100%"
+                  >
+                    <el-option
+                      v-for="lib in libraries"
+                      :key="lib.ItemId"
+                      :label="lib.Name"
+                      :value="lib.ItemId"
+                    />
+                  </el-select>
+                  <div class="tip">支持多选媒体库，任务将按所选媒体库<b>逐个串行执行</b>（一个完成后再执行下一个）。对选中库中所有「未汉化」媒体项执行演员中文化。需先在「Emby」设置中配置连接。</div>
+                </el-form-item>
+
+                <el-form-item label="执行周期">
+                  <el-radio-group
+                    v-model="localizationPreset"
+                    @change="(v) => applyPreset('localization_job', v)"
+                  >
+                    <el-radio-button value="daily">每天</el-radio-button>
+                    <el-radio-button value="weekly">每周一</el-radio-button>
+                    <el-radio-button value="custom">自定义</el-radio-button>
+                  </el-radio-group>
+                  <el-input
+                    v-if="localizationPreset === 'custom'"
+                    v-model="localizationForm.cron_expression"
+                    placeholder="0 3 * * *"
+                    class="cron-input"
+                    clearable
+                  />
+                  <div class="cron-hint">
+                    格式：<strong>分 时 日 月 周</strong> · 例如 <code>0 3 * * *</code> = 每天凌晨 3:00
+                  </div>
+                </el-form-item>
+
+                <div class="run-times">
+                  <div class="run-time-item">
+                    <span class="run-label">上次执行</span>
+                    <code class="run-value">{{ formatTime(localizationForm.last_run_at) }}</code>
+                  </div>
+                  <div class="run-time-item">
+                    <span class="run-label">下次预计</span>
+                    <code class="run-value">{{ formatTime(localizationForm.next_run_at) }}</code>
+                  </div>
+                </div>
+              </el-form>
+
+              <div class="actions">
+                <el-button @click="runJob('localization_job')" :loading="running.localization_job">
+                  <el-icon><VideoPlay /></el-icon>
+                  立即执行一次
+                </el-button>
+                <el-button type="primary" :loading="saving.localization_job" @click="saveJob('localization_job')">
+                  <el-icon><Setting /></el-icon>
+                  保存配置
+                </el-button>
+              </div>
+            </div>
+          </div>
+
+          <!-- ② 全量审计定时任务 -->
+          <div class="section-card">
+            <div class="section-header">
+              <span class="section-icon"><el-icon :size="18"><DataAnalysis /></el-icon></span>
+              <span class="section-title">全量审计定时任务</span>
+              <span class="section-en">Full Audit</span>
+              <div class="section-switch">
+                <el-switch
+                  v-model="auditForm.is_active"
+                  @change="toggleActive('audit_job')"
+                />
+              </div>
+            </div>
+
+            <div class="section-body">
+              <el-form label-position="top">
+                <el-form-item label="媒体库">
+                  <el-select
+                    v-model="auditForm.library_ids"
+                    placeholder="选择媒体库（可多选）"
+                    clearable
+                    filterable
+                    multiple
+                    collapse-tags
+                    collapse-tags-tooltip
+                    style="width: 100%"
+                  >
+                    <el-option
+                      v-for="lib in libraries"
+                      :key="lib.ItemId"
+                      :label="lib.Name"
+                      :value="lib.ItemId"
+                    />
+                  </el-select>
+                  <div class="tip">支持多选媒体库，任务将按所选媒体库<b>逐个串行执行</b>（一个完成后再执行下一个）。比对所选媒体库与本地数据库，自动补齐缺失媒体项（审计入库）。</div>
+                </el-form-item>
+
+                <el-form-item label="执行周期">
+                  <el-radio-group
+                    v-model="auditPreset"
+                    @change="(v) => applyPreset('audit_job', v)"
+                  >
+                    <el-radio-button value="daily">每天</el-radio-button>
+                    <el-radio-button value="weekly">每周一</el-radio-button>
+                    <el-radio-button value="custom">自定义</el-radio-button>
+                  </el-radio-group>
+                  <el-input
+                    v-if="auditPreset === 'custom'"
+                    v-model="auditForm.cron_expression"
+                    placeholder="0 4 * * *"
+                    class="cron-input"
+                    clearable
+                  />
+                  <div class="cron-hint">
+                    格式：<strong>分 时 日 月 周</strong> · 例如 <code>0 4 * * *</code> = 每天凌晨 4:00
+                  </div>
+                </el-form-item>
+
+                <div class="run-times">
+                  <div class="run-time-item">
+                    <span class="run-label">上次执行</span>
+                    <code class="run-value">{{ formatTime(auditForm.last_run_at) }}</code>
+                  </div>
+                  <div class="run-time-item">
+                    <span class="run-label">下次预计</span>
+                    <code class="run-value">{{ formatTime(auditForm.next_run_at) }}</code>
+                  </div>
+                </div>
+              </el-form>
+
+              <div class="actions">
+                <el-button @click="runJob('audit_job')" :loading="running.audit_job">
+                  <el-icon><VideoPlay /></el-icon>
+                  立即执行一次
+                </el-button>
+                <el-button type="primary" :loading="saving.audit_job" @click="saveJob('audit_job')">
+                  <el-icon><Setting /></el-icon>
+                  保存配置
+                </el-button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
 
     <!-- ==================== 新建/编辑弹窗 ==================== -->
     <el-dialog
@@ -882,6 +1168,132 @@ onMounted(() => {
   padding: 16px 20px;
 }
 
+/* ==================== Tabs ==================== */
+.scheduler-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.scheduler-tabs :deep(.el-tabs__header) {
+  margin-bottom: 16px;
+}
+
+.scheduler-tabs :deep(.el-tabs__content) {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.scheduler-tabs :deep(.el-tab-pane) {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ==================== 汉化与审计 — 卡片网格 ==================== */
+.maintenance-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.section-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.section-icon {
+  color: var(--accent-blue);
+  display: flex;
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.section-en {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-top: 2px;
+}
+
+.section-switch {
+  margin-left: auto;
+}
+
+.section-body {
+  padding: 20px;
+}
+
+.cron-input {
+  margin-top: 12px;
+}
+
+.cron-hint {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.cron-hint code {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  color: var(--accent-purple);
+}
+
+/* 执行时间 */
+.run-times {
+  display: flex;
+  gap: 32px;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+}
+
+.run-time-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.run-label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.run-value {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.actions {
+  margin-top: 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 /* ==================== 移动端响应式 ==================== */
 @media (max-width: 768px) {
   .scheduler-root {
@@ -928,6 +1340,32 @@ onMounted(() => {
 
   .stat-value {
     font-size: 16px;
+  }
+
+  /* 汉化与审计卡片 — 移动端单列 + 按钮堆叠 */
+  .maintenance-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .section-header {
+    flex-wrap: wrap;
+  }
+
+  .section-title {
+    font-size: 14px;
+  }
+
+  .actions {
+    flex-direction: column;
+  }
+
+  .actions .el-button {
+    width: 100%;
+    margin-left: 0 !important;
+  }
+
+  .run-times {
+    gap: 20px;
   }
 }
 </style>

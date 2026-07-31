@@ -325,10 +325,11 @@ async def emby_webhook(request: Request, background_tasks: BackgroundTasks):
         # totalSize match) immediately after CD2 move — see
         # task_flow_service._verify_season_move() and handle_library_deleted_webhook().
 
-        # 监听 item.created (单集入库) 和 library.new (整季入库)
-        # TODO: 已注释自动打标签功能，如需恢复请取消注释
-        # if event in ["item.created", "library.new"]:
-        #     background_tasks.add_task(process_emby_item_added, payload)
+        # ★★★ "新增即汉化" 实时闭环 ★★★
+        # 监听 item.created (新剧集) 和 library.new (新入库媒体)
+        # 自动触发前置审计 + 演员中文化，实现零延迟汉化
+        if event in ("item.created", "library.new"):
+            background_tasks.add_task(_handle_library_new_for_sinicize, payload)
 
         return {"status": "received"}
         
@@ -745,3 +746,64 @@ async def _handle_library_deleted(payload: dict):
 
 # _handle_library_new_for_task_flow REMOVED — seed deletion is now driven by
 # file-system verification in task_flow_service, not by Emby library.new webhook.
+
+
+# ==========================================
+# ★ "新增即汉化" 实时闭环
+# ==========================================
+
+async def _handle_library_new_for_sinicize(payload: dict):
+    """Background task: 新入库媒体自动触发审计 + 汉化。
+
+    从 Emby Webhook (item.created / library.new) 提取 item_id，
+    依次执行前置审计和演员中文化，实现"新增即汉化"的实时响应。
+    """
+    from routers.sync_actions import _ensure_item_audited
+    from services.douban_service import DoubanSinizer
+
+    item = payload.get("Item", {})
+    item_id = item.get("Id", "")
+    item_name = item.get("Name", "?")
+
+    if not item_id:
+        logger.warning("⚠ [AutoSinicize] Webhook payload 中缺少 Item.Id，跳过")
+        return
+
+    logger.info(
+        "🚀 [AutoSinicize] 收到 Emby 事件: %s — %s (%s)",
+        payload.get("Event", "?"), item_name, item_id,
+    )
+
+    try:
+        # ★ 第一步：前置审计 — 确保本地有演员数据
+        logger.info("   📖 [AutoSinicize] Step 1/2: 前置审计 %s", item_id)
+        if not _ensure_item_audited(item_id):
+            logger.warning(
+                "   ⚠ [AutoSinicize] %s 审计后仍无演员数据（Emby 未刮削），跳过汉化",
+                item_name,
+            )
+            return
+
+        # ★ 第二步：演员中文化
+        logger.info("   🎬 [AutoSinicize] Step 2/2: 执行汉化 %s", item_id)
+        sinizer = DoubanSinizer()
+        result = sinizer.sinicize(item_id)
+
+        if result.get("success"):
+            logger.info(
+                "   ✅ [AutoSinicize] %s 汉化完成: matched=%d/%d",
+                item_name,
+                result.get("matched", 0),
+                result.get("total_actors", 0),
+            )
+        else:
+            logger.warning(
+                "   ⚠ [AutoSinicize] %s 汉化未成功（可能无豆瓣条目或无演员数据）",
+                item_name,
+            )
+
+    except Exception as e:
+        logger.error(
+            "❌ [AutoSinicize] %s 处理异常: %s\n%s",
+            item_name, e, traceback.format_exc(),
+        )

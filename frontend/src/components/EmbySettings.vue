@@ -11,6 +11,8 @@ const config = reactive({
   emby_api_key: '',
   emby_user_id: '',
   sf_api_key: '',
+  llm_base_url: 'https://api.siliconflow.cn/v1',
+  llm_model_name: 'deepseek-ai/DeepSeek-V3',
   max_actors_per_media: 50,
   enable_emby_avatar_first: false,
   cd2_media_dir: '',
@@ -148,14 +150,35 @@ const testConnection = async () => {
 
           <el-row :gutter="40">
             <el-col :span="24">
-              <el-form-item label="SiliconFlow (AI) API Key">
+              <el-form-item label="LLM API Key">
                 <el-input
                   v-model="config.sf_api_key"
                   type="password"
                   show-password
                   placeholder="sk-..."
                 />
-                <div class="tip">用于调用 DeepSeek V3 进行标签分析</div>
+                <div class="tip">兼容任意 OpenAI SDK 接口的大模型（SiliconFlow / DeepSeek / 阿里百炼 等）</div>
+              </el-form-item>
+            </el-col>
+          </el-row>
+
+          <el-row :gutter="40">
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="AI 接口地址 (Base URL)">
+                <el-input
+                  v-model="config.llm_base_url"
+                  placeholder="https://api.siliconflow.cn/v1"
+                />
+                <div class="tip">例如 https://api.siliconflow.cn/v1 或 https://dashscope.aliyuncs.com/compatible-mode/v1</div>
+              </el-form-item>
+            </el-col>
+            <el-col :xs="24" :sm="12">
+              <el-form-item label="AI 模型名称 (Model)">
+                <el-input
+                  v-model="config.llm_model_name"
+                  placeholder="deepseek-ai/DeepSeek-V3"
+                />
+                <div class="tip">例如 Qwen/Qwen2.5-7B-Instruct 或 deepseek-ai/DeepSeek-V3</div>
               </el-form-item>
             </el-col>
           </el-row>

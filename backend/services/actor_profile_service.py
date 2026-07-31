@@ -980,7 +980,7 @@ def resolve_actor_profile(
         profile_data["birth_place"] = existing.birth_place or ""
 
     # ---- Step 2: 前置豆瓣影人盲搜与作品溯源（仅获取 ID，不调详情/不下载图片） ----
-    if douban_enabled and not douban_id:
+    if douban_enabled and not douban_id and False:
         try:
             from services.douban_api import DoubanApi
             douban_api = DoubanApi(user_cookie=douban_cookie)
@@ -1229,7 +1229,7 @@ def resolve_actor_profile(
                 actor_name, download_url[:80],
             )
 
-    if douban_enabled and douban_id and (not download_url or force_refresh):
+    if douban_enabled and douban_id and (not download_url or force_refresh) and False:
         logger.info(
             "   🌐 [Profile] L1 豆瓣 (调 Frodo API 提取详情): %s (douban_id=%s)",
             actor_name, douban_id,

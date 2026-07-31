@@ -13,7 +13,11 @@ DEFAULT_CONFIG = {
     "emby_api_key": "",
     "emby_user_id": "",
     "sf_api_key": "",
-    
+
+    # ★ LLM 通用配置（兼容 OpenAI SDK 接口的任意大模型）
+    "llm_base_url": "https://api.siliconflow.cn/v1",
+    "llm_model_name": "deepseek-ai/DeepSeek-V3",
+
     # MP 基础配置
     "mp_host": "http://127.0.0.1:3000",
     "mp_username": "",
@@ -25,7 +29,7 @@ DEFAULT_CONFIG = {
     # 豆瓣 API 鉴权 Cookie（用于绕过 need_login 流控限制）
     "douban_cookie": "",
     # 豆瓣 API 总开关（封控严重时可临时关闭，以后恢复）
-    "douban_enabled": False,
+    "douban_enabled": True,
     
     # 洗版策略 (默认空)
     "wash_schemes": [],
@@ -47,6 +51,21 @@ DEFAULT_CONFIG = {
 
     # 演职员中文化 — 每个媒体最大入库演员数（抓取全量，回写截断）
     "max_actors_per_media": 50,
+
+    # ★ 汉化/审计可配置定时任务（next_run_at 由后端动态计算，不落盘）
+    #   library_ids: 选中的媒体库 ID 列表（多选），执行时逐个串行
+    "localization_job": {
+        "library_ids": [],
+        "cron_expression": "0 3 * * *",
+        "is_active": False,
+        "last_run_at": None,
+    },
+    "audit_job": {
+        "library_ids": [],
+        "cron_expression": "0 4 * * *",
+        "is_active": False,
+        "last_run_at": None,
+    },
 }
 
 def load_config():

@@ -31,7 +31,6 @@ router = APIRouter()
 logger = logging.getLogger("uvicorn")
 
 _CHINESE_RE = re.compile(r'[一-鿿]')
-_COMMIT_INTERVAL = 50  # 每处理 N 个未汉化顶层媒体批量提交一次
 
 
 class FullSyncRequest(BaseModel):
@@ -50,6 +49,11 @@ class SinicizeSelectedRequest(BaseModel):
 class SinicizeAllRequest(BaseModel):
     """全量汉化请求 — 按媒体库批量处理所有未汉化项。"""
     library_id: str
+
+
+class ForceTranslateBatchRequest(BaseModel):
+    """强制汉化请求 — 无视当前状态，强制将选中项重置为 pending 并重新汉化。"""
+    item_ids: list[str]
 
 
 @router.post("/sync/full")
@@ -546,13 +550,15 @@ def _audit_and_save_single_item(
                         item_name, episodes_processed,
                     )
         else:
-            # ---- 未汉化 → 仅状态记录 ----
+            # ---- 未汉化 → 状态记录 + 演员数据入库 ----
+            # ★ 即使未汉化也保存 actor_records，避免后续汉化时
+            #    因本地无演员数据而失败，消除"必须先审计再汉化"的割裂体验
             save_media_to_db(
                 db,
                 emby_item=item,
                 provider_ids=pids,
                 images=None,
-                people=None,
+                people=people,
                 library_id=library_id,
                 status=item_status,
                 matched_actors=chinese_count,
@@ -589,14 +595,133 @@ def _audit_and_save_single_item(
 
 
 # ==========================================
+# ★ 统一审计入口：_sync_and_audit_single_item
+# ==========================================
+
+def _sync_and_audit_single_item(emby_item_id: str, library_id: str = "") -> dict:
+    """★ 统一审计入口：给定 Emby Item ID，自动完成 Emby 拉取 + 本地审计。
+
+    这是所有审计路径（全量/选中项/大盘同步/巡逻/前置审计）共用的唯一入口。
+    保证无论从哪个入口触发，执行的"对账 → 拉取 → 落盘 → 刮削"逻辑完全一致。
+
+    **【关键修复】** 即使本地 DB 中没有该 Item 的记录，也会自动从 Emby 拉取并入库，
+    彻底消除"本地找不到就 404"的问题。
+
+    流程:
+    1. 检查本地 media_sync_status 是否存在（日志用途）
+    2. ★ 强制从 Emby API 拉取最新 Item 详情（含 People + ProviderIds）
+    3. 如果 Emby 中也不存在 → 返回 success=False（真正的 404）
+    4. 执行统一的审计逻辑 (_audit_and_save_single_item)
+    5. 返回结构化结果（含 tmdb_id，供上层做 TMDB 富化等后续处理）
+
+    Args:
+        emby_item_id: Emby Item ID
+        library_id:   所属媒体库 ID（可选，会自动从 Emby 数据中提取）
+
+    Returns:
+        {
+            "success": bool,
+            "synced": bool,
+            "item_type": str,
+            "item_name": str,
+            "episodes_processed": int,
+            "tmdb_id": str,
+            "error": str,
+        }
+    """
+    cfg = load_config()
+    host = cfg.get("emby_host", "").rstrip("/")
+    api_key = cfg.get("emby_api_key", "")
+    user_id = cfg.get("emby_user_id", "")
+
+    if not host or not api_key:
+        return {
+            "success": False, "error": "Emby 未配置",
+            "synced": False, "item_type": "", "item_name": "",
+            "episodes_processed": 0, "tmdb_id": "",
+        }
+
+    # ---- Step 1: 检查本地 DB 状态（纯日志用途，不影响流程） ----
+    db_check = SessionLocal()
+    try:
+        local_sync = db_check.query(MediaSyncStatus).filter(
+            MediaSyncStatus.emby_item_id == emby_item_id
+        ).first()
+        if not local_sync:
+            logger.info("🔍 [SyncAudit] Item=%s 本地缺失，将从 Emby 拉取", emby_item_id)
+        elif not local_sync.tmdb_id:
+            logger.info("🔍 [SyncAudit] Item=%s 本地缺少 TMDB ID，将从 Emby 重新拉取", emby_item_id)
+    finally:
+        db_check.close()
+
+    # ---- Step 2: ★ 强制从 Emby 拉取最新数据（关键修复） ----
+    from services.emby_service import get_item_info
+    item = get_item_info(emby_item_id)
+    if not item:
+        logger.warning("⚠ [SyncAudit] Emby 中未找到 Item=%s（可能已被删除）", emby_item_id)
+        return {
+            "success": False,
+            "error": f"Emby 中未找到 Item {emby_item_id}（可能已被删除）",
+            "synced": False, "item_type": "", "item_name": "",
+            "episodes_processed": 0, "tmdb_id": "",
+        }
+
+    item_name = item.get("Name", "?")
+    item_type = item.get("Type", "")
+
+    # ---- Step 3: 执行统一审计逻辑 (_audit_and_save_single_item) ----
+    db = SessionLocal()
+    try:
+        result = _audit_and_save_single_item(
+            db, item, host, api_key, user_id, library_id=library_id
+        )
+        db.commit()
+
+        pids = extract_provider_ids(item)
+        tmdb_id = pids.get("tmdb_id", "")
+
+        logger.info(
+            "✅ [SyncAudit] %s (%s) 审计完成: synced=%s episodes=%d tmdb=%s",
+            item_name, emby_item_id, result["synced"],
+            result["episodes_processed"], tmdb_id or "无",
+        )
+
+        return {
+            "success": True,
+            "synced": result["synced"],
+            "item_type": item_type,
+            "item_name": item_name,
+            "episodes_processed": result["episodes_processed"],
+            "tmdb_id": tmdb_id,
+            "error": "",
+        }
+    except Exception:
+        db.rollback()
+        logger.error(
+            "❌ [SyncAudit] %s (%s) 审计异常:\n%s",
+            item_name, emby_item_id, traceback.format_exc(),
+        )
+        return {
+            "success": False,
+            "error": traceback.format_exc(),
+            "synced": False, "item_type": item_type,
+            "item_name": item_name,
+            "episodes_processed": 0, "tmdb_id": "",
+        }
+    finally:
+        db.close()
+
+
+# ==========================================
 # 接口: POST /api/sync/audit_local
 # ==========================================
 
 @router.post("/sync/audit_local")
 def audit_local_sync(req: FullSyncRequest):
-    """扫描 Emby 库中已汉化的媒体并同步到本地数据库。
+    """扫描 Emby 库中全部媒体项并同步到本地数据库。
 
-    统一调用 _audit_and_save_single_item 执行深度审计。
+    ★ 统一调用 _sync_and_audit_single_item，与审计选中项逻辑完全一致。
+    流程: 获取库内全部 ID → 逐项 _sync_and_audit_single_item（自动拉取+对账+落盘+刮削）
     """
     cfg = load_config()
     host = cfg.get("emby_host", "").rstrip("/")
@@ -606,125 +731,84 @@ def audit_local_sync(req: FullSyncRequest):
     if not host or not api_key:
         raise HTTPException(status_code=400, detail="缺少 Emby 配置")
 
-    base_url = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
-
     logger.info("📁 [Audit] 数据库路径: %s", _db_path())
     logger.info("🚀 [Audit] 开始扫描库 ID=%s ...", req.library_id)
+
+    # ---- Step 1: 从 Emby 获取全部顶级媒体 ID（轻量） ----
+    item_ids = _fetch_library_item_ids(host, api_key, user_id, req.library_id)
+    if not item_ids:
+        return {
+            "message": "媒体库中没有发现任何媒体项",
+            "total_scanned": 0,
+            "marked_as_synced": 0,
+            "episodes_processed": 0,
+            "db_sync_rows": 0,
+            "db_metadata_rows": 0,
+            "db_actor_rows": 0,
+        }
 
     total_scanned = 0
     total_synced = 0
     total_episodes_processed = 0
-    total_committed = 0
 
+    # ---- Step 2: 逐项统一审计 ----
+    for idx, item_id in enumerate(item_ids):
+        try:
+            result = _sync_and_audit_single_item(item_id, library_id=req.library_id)
+            total_scanned += 1
+
+            if result["success"]:
+                if result["synced"]:
+                    total_synced += 1
+                total_episodes_processed += result["episodes_processed"]
+            else:
+                logger.warning(
+                    "   ⚠ [Audit] %s 审计失败: %s",
+                    item_id, result.get("error", ""),
+                )
+
+            # 每 50 项输出一次进度日志
+            if (idx + 1) % 50 == 0:
+                logger.info(
+                    "📋 [Audit] 进度 %d/%d | 已汉化: %d",
+                    idx + 1, len(item_ids), total_synced,
+                )
+
+        except Exception:
+            logger.warning(
+                "   ⚠ [Audit] %s 审计异常，跳过\n%s",
+                item_id, traceback.format_exc(),
+            )
+            continue
+
+    # ---- 提交后验证 ----
+    from sqlalchemy import func as _func
     db = SessionLocal()
     try:
-        start_index = 0
-        page_size = 50
-        commit_counter = 0
-
-        while True:
-            params = {
-                "api_key": api_key,
-                "ParentId": req.library_id,
-                "IncludeItemTypes": "Series,Movie",
-                "Recursive": "true",
-                "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
-                "StartIndex": start_index,
-                "Limit": page_size,
-            }
-            try:
-                resp = _requests.get(base_url, params=params, timeout=30)
-            except Exception:
-                logger.error(
-                    "❌ [Audit] Emby 请求失败 (start=%d):\n%s",
-                    start_index, traceback.format_exc(),
-                )
-                break
-
-            if resp.status_code != 200:
-                logger.error(
-                    "❌ [Audit] Emby HTTP %d (start=%d): %s",
-                    resp.status_code, start_index, resp.text[:300],
-                )
-                break
-
-            data = resp.json()
-            items = data.get("Items", [])
-            if not items:
-                break
-
-            for item in items:
-                total_scanned += 1
-
-                try:
-                    result = _audit_and_save_single_item(
-                        db, item, host, api_key, user_id,
-                        library_id=req.library_id,
-                    )
-                    if result["synced"]:
-                        total_synced += 1
-                        db.commit()  # 已汉化 + 分集立即提交
-                        total_committed += 1
-                    else:
-                        commit_counter += 1
-                        if commit_counter >= _COMMIT_INTERVAL:
-                            db.commit()
-                            total_committed += 1
-                            commit_counter = 0
-
-                    total_episodes_processed += result["episodes_processed"]
-
-                except Exception:
-                    db.rollback()
-                    logger.warning(
-                        "   ⚠ [Audit] 跳过失败项: %s, 继续下一个",
-                        item.get("Name", "?"),
-                    )
-                    continue
-
-            # 分页控制
-            total_records = data.get("TotalRecordCount", 0)
-            if start_index + page_size >= total_records:
-                break
-            start_index += page_size
-
-        # 最终提交：未汉化条目剩余部分
-        if commit_counter > 0:
-            db.commit()
-            total_committed += 1
-
-        # ---- 提交后验证 ----
-        from sqlalchemy import func as _func
         sync_count = db.query(_func.count(MediaSyncStatus.emby_item_id)).scalar() or 0
         meta_count = db.query(_func.count(MediaMetadata.emby_item_id)).scalar() or 0
         actor_count = db.query(_func.count(ActorRecord.id)).scalar() or 0
-
-        logger.info(
-            "📋 [Audit] 扫描完成 | "
-            "总计: %d | 已汉化: %d | 分集处理: %d | 提交: %d",
-            total_scanned, total_synced, total_episodes_processed, total_committed,
-        )
-        logger.info(
-            "📊 [Audit] 数据库确认: "
-            "media_sync_status=%d 行, media_metadata=%d 行, actor_records=%d 行",
-            sync_count, meta_count, actor_count,
-        )
-        return {
-            "message": "扫描完成",
-            "total_scanned": total_scanned,
-            "marked_as_synced": total_synced,
-            "episodes_processed": total_episodes_processed,
-            "db_sync_rows": sync_count,
-            "db_metadata_rows": meta_count,
-            "db_actor_rows": actor_count,
-        }
-
-    except Exception:
-        db.rollback()
-        logger.error("❌ [Audit] 未处理异常:\n%s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail=traceback.format_exc())
     finally:
         db.close()
+
+    logger.info(
+        "📋 [Audit] 扫描完成 | 总计: %d | 已汉化: %d | 分集处理: %d",
+        total_scanned, total_synced, total_episodes_processed,
+    )
+    logger.info(
+        "📊 [Audit] 数据库确认: "
+        "media_sync_status=%d 行, media_metadata=%d 行, actor_records=%d 行",
+        sync_count, meta_count, actor_count,
+    )
+    return {
+        "message": "扫描完成",
+        "total_scanned": total_scanned,
+        "marked_as_synced": total_synced,
+        "episodes_processed": total_episodes_processed,
+        "db_sync_rows": sync_count,
+        "db_metadata_rows": meta_count,
+        "db_actor_rows": actor_count,
+    }
 
 
 # ==========================================
@@ -735,12 +819,12 @@ def audit_local_sync(req: FullSyncRequest):
 def audit_selected_sync(req: AuditSelectedRequest):
     """对用户选中的特定媒体项执行汉化率审计并更新数据库。
 
-    统一调用 _audit_and_save_single_item，与 audit_local 逻辑完全一致。
+    ★ 统一调用 _sync_and_audit_single_item，与全量审计、批量审计逻辑完全一致。
+    【关键修复】即使选中项在本地 DB 中不存在，也会自动从 Emby 拉取并入库。
     """
     cfg = load_config()
     host = cfg.get("emby_host", "").rstrip("/")
     api_key = cfg.get("emby_api_key", "")
-    user_id = cfg.get("emby_user_id", "")
 
     if not host or not api_key:
         raise HTTPException(status_code=400, detail="缺少 Emby 配置")
@@ -748,93 +832,56 @@ def audit_selected_sync(req: AuditSelectedRequest):
     if not req.item_ids:
         raise HTTPException(status_code=400, detail="item_ids 不能为空")
 
-    ids_param = ",".join(req.item_ids)
-    base = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
-    # ★ 与 audit_local 使用相同的 Fields，确保拿到 RecursiveItemCount + People
-    params = {
-        "api_key": api_key,
-        "Ids": ids_param,
-        "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
-    }
-
     logger.info(
-        "🎯 [AuditSelected] 审计 %d 个选中项: %s",
-        len(req.item_ids), ids_param[:200],
+        "🎯 [AuditSelected] 审计 %d 个选中项",
+        len(req.item_ids),
     )
 
-    try:
-        resp = _requests.get(base, params=params, timeout=30)
-    except Exception:
-        logger.error(
-            "❌ [AuditSelected] Emby 批量请求失败:\n%s",
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=502, detail="Emby 批量请求失败")
-
-    if resp.status_code != 200:
-        logger.error(
-            "❌ [AuditSelected] Emby HTTP %d: %s",
-            resp.status_code, resp.text[:300],
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Emby 返回错误 HTTP {resp.status_code}",
-        )
-
-    data = resp.json()
-    items = data.get("Items", [])
-    total_checked = len(items)
+    total_checked = 0
     marked_synced = 0
     total_episodes_processed = 0
+    failed_ids: list[str] = []
 
-    db = SessionLocal()
-    try:
-        for idx, item in enumerate(items, 1):
-            item_name = item.get("Name", "?")
-            item_type = item.get("Type", "?")
-            logger.info(
-                "📋 [AuditSelected] 进度 %d/%d: %s (%s)",
-                idx, total_checked, item_name, item_type,
-            )
-            try:
-                result = _audit_and_save_single_item(
-                    db, item, host, api_key, user_id,
-                    library_id="",
-                )
-                db.commit()  # 每个选中项独立提交
+    for idx, item_id in enumerate(req.item_ids, 1):
+        logger.info(
+            "📋 [AuditSelected] 进度 %d/%d: %s",
+            idx, len(req.item_ids), item_id,
+        )
+        try:
+            # ★ 统一调用 — 自动处理 Emby 拉取 → 对账 → 落盘 → 刮削
+            result = _sync_and_audit_single_item(item_id, library_id="")
+            total_checked += 1
 
+            if result["success"]:
                 if result["synced"]:
                     marked_synced += 1
                 total_episodes_processed += result["episodes_processed"]
-
-            except Exception:
-                db.rollback()
+            else:
+                failed_ids.append(item_id)
                 logger.warning(
-                    "   ⚠ [AuditSelected] 跳过失败项: %s",
-                    item.get("Name", "?"),
+                    "   ⚠ [AuditSelected] %s 审计失败: %s",
+                    item_id, result.get("error", "?"),
                 )
-                continue
 
-        logger.info(
-            "📋 [AuditSelected] 审计完成 | 共计: %d | 标记已汉化: %d | 分集: %d",
-            total_checked, marked_synced, total_episodes_processed,
-        )
-        return {
-            "message": "局部审计完成",
-            "total_checked": total_checked,
-            "marked_synced": marked_synced,
-            "episodes_processed": total_episodes_processed,
-        }
+        except Exception:
+            failed_ids.append(item_id)
+            logger.warning(
+                "   ⚠ [AuditSelected] %s 审计异常，跳过\n%s",
+                item_id, traceback.format_exc(),
+            )
+            continue
 
-    except Exception:
-        db.rollback()
-        logger.error(
-            "❌ [AuditSelected] 未处理异常:\n%s",
-            traceback.format_exc(),
-        )
-        raise HTTPException(status_code=500, detail=traceback.format_exc())
-    finally:
-        db.close()
+    logger.info(
+        "📋 [AuditSelected] 审计完成 | 共计: %d | 标记已汉化: %d | 分集: %d | 失败: %d",
+        total_checked, marked_synced, total_episodes_processed, len(failed_ids),
+    )
+    return {
+        "message": "局部审计完成",
+        "total_checked": total_checked,
+        "marked_synced": marked_synced,
+        "episodes_processed": total_episodes_processed,
+        "failed_ids": failed_ids if failed_ids else None,
+    }
 
 
 # ==========================================
@@ -1617,6 +1664,7 @@ def _batch_audit_task(
     #    无论成功、失败、还是早期 return，都能保证任务被正确终结
     _batch_audit_success = False
     _batch_audit_final_msg = "❌ 审计任务失败，请查看服务端日志"
+    db = None  # ★ Phase 2 DB 会话，finally 块安全关闭
 
     # ---- Phase 0: 收集 ID 列表 ----
     if library_id and not item_ids:
@@ -1637,139 +1685,57 @@ def _batch_audit_task(
         message=f"开始审计 {total_items} 个媒体项...",
     )
 
-    # ---- Phase 1: 逐项状态检查 + 入库 + 发现季数 ----
-    db = SessionLocal()
-    series_queue: list[dict] = []  # [{item, tmdb_id, name, item_id}]
+    # ---- Phase 1: 逐项统一审计（通过 _sync_and_audit_single_item） ----
+    series_queue: list[dict] = []  # [{item_id, tmdb_id, name}]
     total_synced = 0
     total_scanned = 0
 
-    # 分批从 Emby 获取（Emby Ids 参数有长度限制，按 100 个一组）
-    BATCH_SIZE = 100
-    base_url = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
-
     try:
-        for batch_start in range(0, total_items, BATCH_SIZE):
-            batch_ids = item_ids[batch_start:batch_start + BATCH_SIZE]
-            ids_param = ",".join(batch_ids)
-
-            # 从 Emby 批量获取 Item 详情
-            params = {
-                "api_key": api_key,
-                "Ids": ids_param,
-                "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
-            }
+        for idx, item_id in enumerate(item_ids):
             try:
-                resp = _requests.get(base_url, params=params, timeout=60)
-                if resp.status_code != 200:
-                    logger.error(
-                        "❌ [BatchAudit] Emby 批量请求失败 HTTP %d (batch %d)",
-                        resp.status_code, batch_start,
-                    )
-                    task_manager.update_progress(
-                        task_id,
-                        current=batch_start + len(batch_ids),
-                        message=f"Emby 请求失败 (HTTP {resp.status_code})，跳过批次",
-                    )
-                    continue
-                items = resp.json().get("Items", [])
-            except Exception:
-                logger.error(
-                    "❌ [BatchAudit] Emby 批量请求异常 (batch %d):\n%s",
-                    batch_start, traceback.format_exc(),
-                )
-                task_manager.update_progress(
-                    task_id,
-                    current=batch_start + len(batch_ids),
-                    message="Emby 网络异常，跳过批次",
-                )
-                continue
+                # ★ 统一调用公共入口 — 自动处理"Emby 拉取 → 对账 → 落盘 → 分集刮削"
+                result = _sync_and_audit_single_item(item_id, library_id=library_id)
+                total_scanned += 1
 
-            for item in items:
-                item_id = item.get("Id", "")
-                item_name = item.get("Name", "")
-                item_type = item.get("Type", "")
-                people = item.get("People", []) or []
-
-                try:
-                    # ---- 汉化率判定 ----
-                    pids = extract_provider_ids(item)
-                    chinese_count, total_actors = _count_chinese_roles(people)
-                    is_synced = _is_chinese_role_synced(people)
-                    item_status = "synced" if is_synced else "pending"
-                    images = extract_external_images(item, pids, item_type)
-
-                    if is_synced:
-                        people_truncated = _truncate_actors(people, max_actors)
-                        save_media_to_db(
-                            db, emby_item=item, provider_ids=pids,
-                            images=images, people=people_truncated,
-                            library_id=library_id, status=item_status,
-                            matched_actors=chinese_count,
-                            total_actors=total_actors,
-                            parent_id=None,
-                        )
+                if result["success"]:
+                    if result["synced"]:
                         total_synced += 1
-
-                        # ★ Series 加入队列，后续通过 TMDB Season API 处理
-                        if item_type == "Series":
-                            tmdb_id = pids.get("tmdb_id", "")
-                            if tmdb_id:
-                                series_queue.append({
-                                    "item": item,
-                                    "tmdb_id": tmdb_id,
-                                    "name": item_name,
-                                    "item_id": item_id,
-                                })
-                            else:
-                                logger.warning(
-                                    "   ⚠ [BatchAudit] %s 无 TMDB ID，跳过分集处理",
-                                    item_name,
-                                )
-                    else:
-                        # 未汉化 → 仅状态记录，不存演员
-                        save_media_to_db(
-                            db, emby_item=item, provider_ids=pids,
-                            images=None, people=None,
-                            library_id=library_id, status=item_status,
-                            matched_actors=chinese_count,
-                            total_actors=total_actors,
-                            parent_id=None,
-                        )
-
-                    db.flush()
-                    total_scanned += 1
-
-                    # ★ 逐项更新进度（而非等整批完成），确保前端进度条实时递增
-                    task_manager.update_progress(
-                        task_id, current=total_scanned,
-                        message=f"已检查 {total_scanned}/{total_items} 项"
-                        + (f"，已汉化 {total_synced}" if total_synced else ""),
-                    )
-
-                except Exception:
-                    db.rollback()
+                        # 已汉化 Series → 收集到队列，Phase 2 做 TMDB 富化
+                        if result["item_type"] == "Series" and result["tmdb_id"]:
+                            series_queue.append({
+                                "item_id": item_id,
+                                "tmdb_id": result["tmdb_id"],
+                                "name": result["item_name"],
+                            })
+                else:
                     logger.warning(
-                        "   ⚠ [BatchAudit] 保存失败: %s (ID=%s)\n%s",
-                        item_name, item_id, traceback.format_exc(),
+                        "   ⚠ [BatchAudit] %s 审计失败: %s",
+                        item_id, result.get("error", "未知错误"),
                     )
-                    continue
 
-            # 每批次提交一次
-            db.commit()
+            except Exception:
+                logger.warning(
+                    "   ⚠ [BatchAudit] %s 审计异常:\n%s",
+                    item_id, traceback.format_exc(),
+                )
 
-        # ---- Phase 1 收尾 ----
-        db.commit()
+            # ★ 逐项更新进度（而非等整批完成），确保前端进度条实时递增
+            task_manager.update_progress(
+                task_id, current=idx + 1,
+                message=f"已审计 {idx + 1}/{total_items} 项"
+                + (f"，已汉化 {total_synced}" if total_synced else ""),
+            )
 
         if not series_queue:
             _batch_audit_success = True
             _batch_audit_final_msg = (
                 f"✅ 审计完成: 共 {total_scanned} 项，已汉化 {total_synced} 项"
-                f"（无 TMDB 剧集需处理）"
             )
             return
 
         # ---- Phase 2: 整季 TMDB 批处理 ----
-        # 先统计总季数，动态调整 total
+        # ★ Phase 1 已通过 _audit_and_save_single_item 完成 Emby 分集抓取入库，
+        #   此处仅做 TMDB 数据富化（简介 + 客串演员），不再重复创建分集锚点。
         series_with_seasons: list[dict] = []
         grand_total_seasons = 0
 
@@ -1794,36 +1760,13 @@ def _batch_audit_task(
         total_guest_stars_all = 0
         total_eps_enriched = 0
 
+        # ★ Phase 2 使用独立的 DB 会话（Phase 1 各调用已自行管理会话生命周期）
+        db = SessionLocal()
         for sq in series_with_seasons:
-            item = sq["item"]
             tmdb_id = sq["tmdb_id"]
             item_name = sq["name"]
             item_id = sq["item_id"]
             seasons = sq["seasons"]
-
-            # ---- 轻量级分集发现：拿 Emby Episode ID + 编号 ----
-            episodes_light = _fetch_episodes_light(host, api_key, user_id, item_id)
-
-            # 批量创建/更新 MediaMetadata 锚点记录
-            for ep in episodes_light:
-                ep_id = ep.get("Id", "")
-                if not ep_id:
-                    continue
-                existing = db.query(MediaMetadata).filter(
-                    MediaMetadata.emby_item_id == ep_id
-                ).first()
-                if not existing:
-                    db.add(MediaMetadata(
-                        emby_item_id=ep_id,
-                        parent_id=item_id,
-                        media_type="Episode",
-                        title=ep.get("Name", ""),
-                        index_number=ep.get("IndexNumber"),
-                        parent_index_number=ep.get("ParentIndexNumber"),
-                        overview="",
-                    ))
-            db.flush()
-            db.commit()
 
             # ---- 逐季 TMDB 批处理 ----
             for season_num in seasons:
@@ -1996,17 +1939,87 @@ def _batch_audit_task(
             "❌ [BatchAudit] 任务 %s 致命异常:\n%s",
             task_id, traceback.format_exc(),
         )
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        if db:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         # ★ sentinel 保持 False，finally 块会以 error 状态调用 complete_task
     finally:
-        db.close()
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
         # ★ 无论如何都会执行，确保任务状态被终结
         task_manager.complete_task(
             task_id, _batch_audit_final_msg, success=_batch_audit_success,
         )
+
+
+# ==========================================
+# ★ 前置审计辅助：确保媒体项在本地有演员数据，无则自动从 Emby 拉取
+# ==========================================
+
+def _ensure_item_audited(item_id: str) -> bool:
+    """确保媒体项在本地 actor_records 中有演员数据，无则自动触发审计。
+
+    这是批量汉化的前置步骤 — 解决"必须先手动审计再汉化"的割裂体验：
+    - 如果 actor_records 已有数据 → 直接返回 True
+    - 如果 actor_records 为空 → 自动从 Emby 拉取 Item 详情并执行审计入库
+    - 审计后仍无数据（Emby 未刮削元数据） → 返回 False，上层跳过
+
+    Args:
+        item_id: Emby Item ID
+
+    Returns:
+        True:  本地已有演员数据，或审计成功拉取到数据
+        False: Emby 中该 Item 确实没有演员，应跳过汉化
+    """
+    db = SessionLocal()
+    try:
+        # ★ 快速路径：本地已有演员数据
+        actor_count = db.query(ActorRecord).filter(
+            ActorRecord.emby_item_id == item_id
+        ).count()
+        if actor_count > 0:
+            return True
+    finally:
+        db.close()
+
+    logger.info("🔍 [PreAudit] item=%s actor_records 为空，通过统一入口触发审计...", item_id)
+
+    # ★ 调用统一审计入口 — 自动处理 Emby 拉取 → 对账 → 落盘 → 刮削
+    result = _sync_and_audit_single_item(item_id, library_id="")
+
+    if not result["success"]:
+        # Emby 中不存在或网络异常 → 不阻塞，让 sinicize 自行处理
+        logger.warning(
+            "⚠ [PreAudit] %s 审计未成功: %s（不阻塞汉化流程）",
+            item_id, result.get("error", "未知错误"),
+        )
+        return True
+
+    # ★ 再次检查 actor_records（审计后应有数据）
+    db2 = SessionLocal()
+    try:
+        actor_count = db2.query(ActorRecord).filter(
+            ActorRecord.emby_item_id == item_id
+        ).count()
+        if actor_count == 0:
+            logger.info(
+                "ℹ️ [PreAudit] %s 审计后仍无演员数据（Emby 未刮削元数据），跳过汉化",
+                result["item_name"],
+            )
+            return False
+
+        logger.info(
+            "✅ [PreAudit] %s 审计完成，actor_records=%d 条",
+            result["item_name"], actor_count,
+        )
+        return True
+    finally:
+        db2.close()
 
 
 # ==========================================
@@ -2044,6 +2057,19 @@ def _batch_sinicize_task(
             )
 
             try:
+                # ★ 前置审计：确保本地有演员数据，无则自动从 Emby 拉取
+                if not _ensure_item_audited(item_id):
+                    total_failed += 1
+                    logger.warning(
+                        "⚠ [BatchSinicize] %s 无演员数据（Emby 未刮削元数据），跳过汉化",
+                        item_id,
+                    )
+                    task_manager.update_progress(
+                        task_id, current=current,
+                        message=f"已完成 {current}/{len(item_ids)}（成功 {total_done}，失败 {total_failed}）",
+                    )
+                    continue
+
                 # ★ 传入 task_id，使内部分集循环能做颗粒度进度反馈
                 result = sinizer.sinicize(item_id, task_id=task_id)
                 if result.get("success"):
@@ -2164,20 +2190,137 @@ def sinicize_selected(req: SinicizeSelectedRequest, background_tasks: Background
 def sinicize_all(req: SinicizeAllRequest, background_tasks: BackgroundTasks):
     """对指定媒体库中所有未汉化媒体项执行全量汉化（后台异步，立即返回 task_id）。
 
-    内部自动查询 media_sync_status 表中 status='pending' 的所有项，
-    无需前端逐个传入 ID。
+    ★ 三位一体升级：内部先进行"全量大盘同步比对"——
+    1. 从 Emby 获取该库所有顶级媒体 ID
+    2. 与本地 media_sync_status 比对，找出缺失项
+    3. 缺失项自动审计入库（status=pending）
+    4. 比对完成后，再查询所有 pending 项推入后台汉化队列
 
     请求体:
         {"library_id": "1875208"}
 
     返回:
-        200: {"task_id": "abc123", "message": "全量汉化任务已启动，共 50 项"}
+        200: {"task_id": "abc123", "message": "全量汉化任务已启动，共 50 项", "new_items": 3}
         400: library_id 为空 / 没有未汉化项
     """
     if not req.library_id:
         raise HTTPException(status_code=400, detail="library_id 不能为空")
 
-    # 从本地数据库查询所有未汉化项
+    cfg = load_config()
+    host = cfg.get("emby_host", "").rstrip("/")
+    api_key = cfg.get("emby_api_key", "")
+    user_id = cfg.get("emby_user_id", "")
+    new_items_synced = 0
+
+    # ==========================================
+    # ★ 第一步：全量大盘同步比对（Emby ↔ 本地 DB）
+    # ==========================================
+    if host and api_key:
+        logger.info(
+            "🔍 [SinicizeAll] 开始全量大盘比对: library=%s", req.library_id,
+        )
+
+        # 1a. 从 Emby 获取所有顶级媒体 ID（轻量，仅 ID）
+        try:
+            emby_ids = _fetch_library_item_ids(host, api_key, user_id, req.library_id)
+        except Exception as e:
+            logger.error("❌ [SinicizeAll] 获取 Emby ID 列表异常: %s", e)
+            emby_ids = []
+
+        if emby_ids:
+            # 1b. 查询本地已有的 ID
+            db = SessionLocal()
+            try:
+                local_rows = (
+                    db.query(MediaSyncStatus.emby_item_id)
+                    .filter(MediaSyncStatus.emby_item_id.in_(emby_ids))
+                    .all()
+                )
+                local_ids = {r.emby_item_id for r in local_rows}
+
+                # 1c. 计算差集：Emby 有但本地缺失的
+                missing_ids = [eid for eid in emby_ids if eid not in local_ids]
+
+                if missing_ids:
+                    logger.info(
+                        "📊 [SinicizeAll] 大盘比对: Emby=%d 本地=%d 缺失=%d，开始自动补齐...",
+                        len(emby_ids), len(local_ids), len(missing_ids),
+                    )
+
+                    # 1d. 批量拉取缺失项详情并审计入库
+                    batch_size = 50
+                    for i in range(0, len(missing_ids), batch_size):
+                        batch = missing_ids[i:i + batch_size]
+                        ids_param = ",".join(batch)
+
+                        try:
+                            base_url = (
+                                f"{host}/emby/Users/{user_id}/Items"
+                                if user_id else f"{host}/emby/Items"
+                            )
+                            params = {
+                                "api_key": api_key,
+                                "Ids": ids_param,
+                                "Fields": "People,ProviderIds,Overview,ProductionYear,RecursiveItemCount",
+                            }
+                            resp = _requests.get(base_url, params=params, timeout=30)
+                            if resp.status_code != 200:
+                                logger.warning(
+                                    "   ⚠ [SinicizeAll] 批量获取详情失败 HTTP %d，跳过该批次",
+                                    resp.status_code,
+                                )
+                                continue
+
+                            items = resp.json().get("Items", [])
+                            for item in items:
+                                item_id = item.get("Id", "")
+                                item_name = item.get("Name", "?")
+                                try:
+                                    _audit_and_save_single_item(
+                                        db, item, host, api_key, user_id,
+                                        library_id=req.library_id,
+                                    )
+                                    new_items_synced += 1
+                                except Exception:
+                                    db.rollback()
+                                    logger.warning(
+                                        "   ⚠ [SinicizeAll] %s 审计入库异常，跳过",
+                                        item_name,
+                                    )
+                                    continue
+
+                            db.commit()
+                        except Exception as e:
+                            logger.error(
+                                "   ❌ [SinicizeAll] 批量补齐异常: %s", e,
+                            )
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
+
+                    logger.info(
+                        "✅ [SinicizeAll] 大盘比对完成: 新入库 %d 项",
+                        new_items_synced,
+                    )
+                else:
+                    logger.info(
+                        "📊 [SinicizeAll] 大盘比对: Emby=%d 本地=%d，数据完整无需补齐",
+                        len(emby_ids), len(local_ids),
+                    )
+            except Exception as e:
+                logger.error(
+                    "❌ [SinicizeAll] 大盘比对异常: %s\n%s",
+                    e, traceback.format_exc(),
+                )
+            finally:
+                db.close()
+    else:
+        logger.warning("⚠ [SinicizeAll] Emby 未配置，跳过大盘比对，仅查询本地 DB")
+
+    # ==========================================
+    # ★ 第二步：查询所有 pending 项并推入后台汉化队列
+    # ==========================================
     db = SessionLocal()
     try:
         pending_items = db.query(MediaSyncStatus).filter(
@@ -2202,6 +2345,7 @@ def sinicize_all(req: SinicizeAllRequest, background_tasks: BackgroundTasks):
             "mode": "sinicize_all",
             "library_id": req.library_id,
             "item_count": len(pending_ids),
+            "new_items_synced": new_items_synced,
         },
     )
 
@@ -2212,10 +2356,81 @@ def sinicize_all(req: SinicizeAllRequest, background_tasks: BackgroundTasks):
     )
 
     logger.info(
-        "🚀 [SinicizeAll] 后台任务已提交: task=%s library=%s items=%d",
-        task_id, req.library_id, len(pending_ids),
+        "🚀 [SinicizeAll] 后台任务已提交: task=%s library=%s items=%d new_items=%d",
+        task_id, req.library_id, len(pending_ids), new_items_synced,
     )
     return {
         "task_id": task_id,
         "message": f"全量汉化任务已启动，共 {len(pending_ids)} 项",
+        "new_items": new_items_synced,
+    }
+
+
+# ==========================================
+# 接口: POST /api/sync/force_translate_batch
+# 强制汉化 — 无视当前状态，强制覆盖重新汉化
+# ==========================================
+
+@router.post("/sync/force_translate_batch")
+def force_translate_batch(req: ForceTranslateBatchRequest, background_tasks: BackgroundTasks):
+    """对选中的媒体项强制执行汉化（无视当前状态，后台异步，立即返回 task_id）。
+
+    无论 media_sync_status 中的当前状态是 synced、failed 还是 pending，
+    全部强制 UPDATE 为 pending 并清空 error_message，然后推入后台汉化队列。
+
+    请求体:
+        {"item_ids": ["id1", "id2", "id3", ...]}
+
+    返回:
+        200: {"task_id": "abc123", "message": "强制汉化任务已启动，共 5 项"}
+        400: item_ids 为空
+    """
+    if not req.item_ids:
+        raise HTTPException(status_code=400, detail="item_ids 不能为空")
+
+    # ★ 强制重置状态：无论当前是什么状态，全部改为 pending
+    db = SessionLocal()
+    try:
+        updated_count = (
+            db.query(MediaSyncStatus)
+            .filter(MediaSyncStatus.emby_item_id.in_(req.item_ids))
+            .update(
+                {"status": "pending", "error_message": None},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        logger.info(
+            "🔧 [ForceTranslate] 强制重置 %d 条记录为 pending（共请求 %d 个 ID）",
+            updated_count, len(req.item_ids),
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error("❌ [ForceTranslate] 数据库更新失败: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"数据库更新失败: {str(e)}")
+    finally:
+        db.close()
+
+    task_id = task_manager.create_task(
+        total=len(req.item_ids),
+        message=f"强制汉化任务已启动，共 {len(req.item_ids)} 项",
+        metadata={
+            "mode": "force_translate_batch",
+            "item_count": len(req.item_ids),
+        },
+    )
+
+    background_tasks.add_task(
+        _batch_sinicize_task,
+        task_id=task_id,
+        item_ids=req.item_ids,
+    )
+
+    logger.info(
+        "🚀 [ForceTranslate] 后台任务已提交: task=%s items=%d (强制覆盖)",
+        task_id, len(req.item_ids),
+    )
+    return {
+        "task_id": task_id,
+        "message": f"强制汉化任务已启动，共 {len(req.item_ids)} 项（已强制重置状态）",
     }

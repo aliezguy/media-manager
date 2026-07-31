@@ -203,6 +203,36 @@ const handleBatchSync = async () => {
   }
 }
 
+const handleForceTranslate = async () => {
+  const ids = checkedIds.value
+  if (ids.length === 0) { ElMessage.warning('请至少勾选一个媒体项'); return }
+
+  try {
+    await ElMessageBox.confirm(
+      '此操作将强制重新汉化选中的媒体，可能会覆盖您手动修改过的中文数据！是否继续？',
+      '⚠️ 强制汉化警告',
+      { confirmButtonText: '确认强制汉化', cancelButtonText: '取消', type: 'error' }
+    )
+  } catch { return }
+
+  // ★ 打开统一汉化进度对话框
+  sinicizeTaskPercent.value = 0
+  sinicizeTaskMessage.value = '正在提交强制汉化任务...'
+  sinicizeTaskDone.value = false
+  sinicizeDialogVisible.value = true
+
+  try {
+    const res = await axios.post(API_URL + '/api/sync/force_translate_batch', { item_ids: ids })
+    sinicizeTaskId.value = res.data.task_id
+    sinicizeTaskMessage.value = res.data.message
+    startSinicizePolling(res.data.task_id)
+  } catch (e) {
+    sinicizeTaskMessage.value = '提交任务失败'
+    sinicizeTaskDone.value = true
+    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
 const handleFullSync = async () => {
   if (!selectedLibrary.value) { ElMessage.warning('请先选择媒体库'); return }
   try {
@@ -569,6 +599,7 @@ onUnmounted(() => {
       <el-checkbox v-model="isAllChecked" :indeterminate="checkedIds.length > 0 && !isAllChecked">全选 ({{ checkedIds.length }}/{{ filteredItems.length }})</el-checkbox>
       <span class="select-info">已选 {{ pendingCheckedIds.length }} 个待处理项</span>
       <el-button type="primary" size="small" class="btn-batch-inline" :disabled="pendingCheckedIds.length === 0 || systemStatus.is_running" @click="handleBatchSync">{{ pendingCheckedIds.length > 0 ? '同步选中项 (' + pendingCheckedIds.length + ')' : '批量执行中文化' }}</el-button>
+      <el-button type="danger" size="small" plain class="btn-batch-inline" :disabled="checkedIds.length === 0 || systemStatus.is_running" @click="handleForceTranslate">强制汉化(覆盖)</el-button>
       <el-button type="warning" size="small" class="btn-batch-inline" :disabled="systemStatus.is_running || !selectedLibrary" @click="handleFullSync">全量汉化</el-button>
       <el-button size="small" class="btn-audit-local" :loading="auditLoading" :disabled="systemStatus.is_running || !selectedLibrary" @click="handleAuditLocal">审计本地汉化状态</el-button>
       <el-button type="info" size="small" class="btn-audit-selected" :loading="auditingSelected" :disabled="checkedIds.length === 0 || systemStatus.is_running" @click="handleAuditSelected">审计选中项</el-button>
