@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 from pypinyin import lazy_pinyin
 
 from config.settings import load_config
-from services.ai_translator import get_translator, _is_rate_limit_error, _rate_limit_sleep
+from services.ai_translator import get_translator, get_primary_provider, _is_rate_limit_error, _rate_limit_sleep
 from database import SessionLocal
 from services.db_crud import save_media_to_db, extract_provider_ids
 from services.actor_profile_service import ensure_profiles_for_people
@@ -222,7 +222,7 @@ class DoubanSinizer:
                             a["Role"] = new_role
                             logger.info(f"   🤖 [AI翻译] 角色 {old_role} → {new_role}")
         else:
-            logger.info(f"   ℹ️ [AI翻译] 未配置 sf_api_key，跳过翻译")
+            logger.info(f"   ℹ️ [AI翻译] 未配置 AI Provider，跳过翻译")
 
         # 5b. ★ AI 批量推理缺失角色名
         # 收集 Role 为空/占位符的演员，利用 LLM 影视知识精准推理
@@ -385,6 +385,15 @@ class DoubanSinizer:
                     )
                     unique_people = list(all_ep_people_map.values())
 
+                    if task_id:
+                        try:
+                            task_manager.update_progress(
+                                task_id,
+                                message=f"正在解析全剧 {len(all_ep_people_map)} 位演员画像（首次较慢，请耐心等待）...",
+                            )
+                        except Exception:
+                            pass
+
                     ep_db = SessionLocal()
                     try:
                         ensure_profiles_for_people(ep_db, unique_people)
@@ -404,6 +413,13 @@ class DoubanSinizer:
                 # ★ 分集循环：逐集隔离 + 静音写回（skip_profiles=True）
                 ep_db = SessionLocal()
                 try:
+                    # ★ 分集进度基准：捕获当前项下标，用于按分集粒度推进进度条
+                    _ep_base, _ep_total = 0.0, 1.0
+                    if task_id:
+                        _st = task_manager.get_status(task_id) or {}
+                        _ep_base = float(_st.get("current", 0) or 0)
+                        _ep_total = max(float(_st.get("total", 1) or 1), 1)
+
                     for i, ep in enumerate(episodes):
                         ep_id = ep.get("Id", "")
                         ep_name = ep.get("Name", "")
@@ -418,6 +434,7 @@ class DoubanSinizer:
                             try:
                                 task_manager.update_progress(
                                     task_id,
+                                    current=_ep_base + (i + 1) / len(episodes) / _ep_total,
                                     message=f"正在高速回写分集: {ep_name or '未命名'} ({i+1}/{len(episodes)})",
                                 )
                             except Exception:
@@ -1075,19 +1092,23 @@ class DoubanSinizer:
         if not actors_list or not title:
             return {}
 
-        cfg = load_config()
-        api_key = (cfg.get("sf_api_key") or "").strip()
-        if not api_key:
-            logger.info("   ℹ️ [AI推理] 未配置 sf_api_key，跳过角色推理")
+        provider = get_primary_provider()
+        if not provider:
+            logger.info("   ℹ️ [AI推理] 未配置 AI Provider，跳过角色推理")
             return {}
 
         from openai import OpenAI as OpenAIClient
-        base_url = (cfg.get("llm_base_url") or "").strip()
-        model = (cfg.get("llm_model_name") or "").strip() or "deepseek-ai/DeepSeek-V3"
-        client_kwargs = {"api_key": api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        ai_client = OpenAIClient(**client_kwargs)
+        model = provider.get("model_name") or "deepseek-ai/DeepSeek-V3"
+        client_kwargs = {"api_key": provider["api_key"]}
+        if provider.get("base_url"):
+            client_kwargs["base_url"] = provider["base_url"]
+        # ★ 强制请求超时 + 关闭 SDK 内置重试：
+        #   不设的话会用 OpenAI SDK 默认 600s×2 重试，单次最坏静默阻塞 30 分钟
+        ai_client = OpenAIClient(
+            **client_kwargs,
+            timeout=provider.get("timeout") or 60,
+            max_retries=0,
+        )
 
         # 年份弱化为模糊参考，避免元数据错误（如未来年份）误导模型检索
         year_ref = f"{year}年前后" if year else ""

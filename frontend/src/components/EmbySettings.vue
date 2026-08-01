@@ -10,15 +10,18 @@ const config = reactive({
   emby_host: '',
   emby_api_key: '',
   emby_user_id: '',
-  sf_api_key: '',
-  llm_base_url: 'https://api.siliconflow.cn/v1',
-  llm_model_name: 'deepseek-ai/DeepSeek-V3',
   max_actors_per_media: 50,
   enable_emby_avatar_first: false,
   cd2_media_dir: '',
   cd2_organized_dir: '',
   emby_prefix: '',
-  cd2_media_prefix: ''
+  cd2_media_prefix: '',
+  // ★ AI 模型统一配置（首选用于所有 AI 功能；翻译时按 首选→次选→三选 瀑布降级）
+  ai_providers: [
+    { name: '首选', base_url: '', api_key: '', model_name: '' },
+    { name: '次选', base_url: '', api_key: '', model_name: '' },
+    { name: '三选', base_url: '', api_key: '', model_name: '' }
+  ]
 })
 
 onMounted(async () => {
@@ -148,40 +151,43 @@ const testConnection = async () => {
             <span class="divider-label">智能服务</span>
           </div>
 
-          <el-row :gutter="40">
-            <el-col :span="24">
-              <el-form-item label="LLM API Key">
-                <el-input
-                  v-model="config.sf_api_key"
-                  type="password"
-                  show-password
-                  placeholder="sk-..."
-                />
-                <div class="tip">兼容任意 OpenAI SDK 接口的大模型（SiliconFlow / DeepSeek / 阿里百炼 等）</div>
-              </el-form-item>
-            </el-col>
-          </el-row>
+          <div class="subsection-label">AI 模型配置（多级 Fallback）</div>
 
-          <el-row :gutter="40">
-            <el-col :xs="24" :sm="12">
-              <el-form-item label="AI 接口地址 (Base URL)">
-                <el-input
-                  v-model="config.llm_base_url"
-                  placeholder="https://api.siliconflow.cn/v1"
-                />
-                <div class="tip">例如 https://api.siliconflow.cn/v1 或 https://dashscope.aliyuncs.com/compatible-mode/v1</div>
-              </el-form-item>
-            </el-col>
-            <el-col :xs="24" :sm="12">
-              <el-form-item label="AI 模型名称 (Model)">
-                <el-input
-                  v-model="config.llm_model_name"
-                  placeholder="deepseek-ai/DeepSeek-V3"
-                />
-                <div class="tip">例如 Qwen/Qwen2.5-7B-Instruct 或 deepseek-ai/DeepSeek-V3</div>
-              </el-form-item>
-            </el-col>
-          </el-row>
+          <div
+            v-for="(p, idx) in config.ai_providers || []"
+            :key="idx"
+            class="provider-card"
+          >
+            <div class="provider-header">
+              <span class="provider-priority">{{ ['首选', '次选', '三选'][idx] || ('Provider ' + (idx + 1)) }}</span>
+              <span class="provider-tag">优先级 {{ idx + 1 }}</span>
+            </div>
+            <el-row :gutter="24">
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="名称（用于日志标识）">
+                  <el-input v-model="p.name" placeholder="如：硅基流动 / OpenAI官方" />
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="12">
+                <el-form-item label="模型名称 (Model)">
+                  <el-input v-model="p.model_name" placeholder="deepseek-ai/DeepSeek-V3" />
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="24">
+                <el-form-item label="接口地址 (Base URL)">
+                  <el-input v-model="p.base_url" placeholder="https://api.siliconflow.cn/v1（留空使用 OpenAI 默认地址）" />
+                </el-form-item>
+              </el-col>
+              <el-col :xs="24" :sm="24">
+                <el-form-item label="API Key">
+                  <el-input v-model="p.api_key" type="password" show-password placeholder="sk-..." />
+                </el-form-item>
+              </el-col>
+            </el-row>
+          </div>
+          <div class="tip multi-model-tip">
+            所有 AI 功能（翻译 / 推荐 / 推理 / 打标）统一使用<b>首选</b> Provider；翻译人名、角色名时额外按 <b>首选 → 次选 → 三选</b> 瀑布降级，当前 API 限流或报错自动切换下一个。缺少 API Key 或模型名的 Provider 会自动跳过；三项均未配置时 AI 功能将禁用。
+          </div>
 
           <el-row :gutter="40">
             <el-col :xs="24" :sm="12">
@@ -211,6 +217,7 @@ const testConnection = async () => {
           <!-- Actions -->
           <div class="actions">
             <button
+              type="button"
               class="btn-pill btn-pill-blue"
               :disabled="loading"
               @click="testConnection"
@@ -219,7 +226,7 @@ const testConnection = async () => {
               <el-icon v-else :size="15"><Connection /></el-icon>
               测试连接
             </button>
-            <button class="btn-pill btn-pill-green" @click="saveConfig">
+            <button type="button" class="btn-pill btn-pill-green" @click="saveConfig">
               <el-icon :size="15"><Setting /></el-icon>
               保存所有设置
             </button>
@@ -287,6 +294,48 @@ const testConnection = async () => {
 .switch-hint {
   font-size: 13px;
   color: var(--text-secondary);
+}
+
+/* ==================== AI 多模型 Provider 卡片 ==================== */
+.subsection-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 6px 0 14px;
+}
+
+.provider-card {
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px dashed var(--border-color);
+  border-radius: 10px;
+  padding: 16px 16px 4px;
+  margin-bottom: 14px;
+}
+
+.provider-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.provider-priority {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent-blue);
+  padding: 2px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--accent-blue);
+}
+
+.provider-tag {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.multi-model-tip {
+  margin-bottom: 22px;
+  line-height: 1.6;
 }
 
 /* ==================== Divider ==================== */

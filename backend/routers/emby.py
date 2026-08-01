@@ -12,6 +12,7 @@ import asyncio  # 👈 必须引入：用于异步延时(防抖)
 import re       # 👈 必须引入：用于正则清洗字符串
 from openai import OpenAI
 from config.settings import load_config
+from services.ai_translator import get_primary_provider
 import time
 
 # 引入服务层函数 (确保 services/emby_service.py 也是最新版)
@@ -73,16 +74,36 @@ def clean_string(s):
     if not s: return ""
     return re.sub(r'[\u200b-\u200f\ufeff]', '', s).strip()
 
-def ask_ai(items, api_key):
+def ask_ai(items, api_key=None, provider=None):
     """
-    调用 SiliconFlow (DeepSeek) AI 进行分析
+    调用 AI 分析影视作品并打标签。
     :param items: 包含 name, year, overview 的字典列表
+    :param api_key: 兼容旧调用（仅 SiliconFlow）；为空时自动解析配置首选 Provider
+    :param provider: 直接传入 Provider dict（base_url/api_key/model_name）；显式传入时优先
     :return: JSON 格式的标签字典 {"剧名": ["标签1", ...]}
     """
-    if not items or not api_key: return {}
-    
-    client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
-    
+    if not items:
+        return {}
+
+    # 统一从配置解析 Provider（首选），而非写死 SiliconFlow
+    if provider is None:
+        if api_key:
+            provider = {"name": "Legacy(req)", "api_key": api_key,
+                        "base_url": "https://api.siliconflow.cn/v1",
+                        "model_name": "deepseek-ai/DeepSeek-V3"}
+        else:
+            provider = get_primary_provider()
+
+    api_key = (provider or {}).get("api_key")
+    if not api_key:
+        logger.info("ℹ️ [AI请求] 未配置 AI Provider，跳过打标")
+        return {}
+
+    base_url = (provider or {}).get("base_url") or None   # 空 → OpenAI 默认端点
+    model = (provider or {}).get("model_name") or "deepseek-ai/DeepSeek-V3"
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
     # 构造简化版的数据发给 AI，节省 Token 且提高准确率
     simple_list = []
     for i in items:
@@ -92,7 +113,7 @@ def ask_ai(items, api_key):
             "overview": i.get("Overview", "")[:150] # 截取前150字简介，防止 Token 溢出
         })
 
-    logger.info(f"🤖 [AI请求] 正在请求 AI 分析 {len(simple_list)} 个项目...")
+    logger.info(f"🤖 [AI请求] 正在请求 AI 分析 {len(simple_list)} 个项目 (model={model})...")
 
     prompt = f"""
     请为以下影视作品打上 8-10 个精准的中文标签。
@@ -101,12 +122,12 @@ def ask_ai(items, api_key):
     1. 只返回纯 JSON 格式
     2. 不要包含 Markdown 代码块
     3. 格式示例: {{"作品名": ["标签1", "标签2"]}}
-    
+
     数据内容：{json.dumps(simple_list, ensure_ascii=False)}
     """
     try:
         response = client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V3",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2, stream=False
         )
@@ -138,10 +159,10 @@ async def analyze_series_finally(series_id: str, series_name: str):
 
         logger.info(f"⏳ [防抖结束] 开始处理整部剧集: {series_name} (ID: {series_id})")
 
-        # 2. 检查配置
-        config = load_config()
-        sf_api_key = config.get("sf_api_key")
-        if not sf_api_key: return
+        # 2. 检查配置（统一使用首选 Provider）
+        if not get_primary_provider():
+            logger.info("ℹ️ 未配置 AI Provider，跳过自动打标")
+            return
 
         # 3. 查询 Emby 获取最新状态
         # (经过 15s 等待，Emby 接口肯定通了，不用担心 404)
@@ -167,7 +188,7 @@ async def analyze_series_finally(series_id: str, series_name: str):
         logger.info(f"   🤖 正在请求 AI 分析剧集: [{clean_name}] ...")
         
         # 6. 调用 AI
-        ai_result = ask_ai([target_info], sf_api_key)
+        ai_result = ask_ai([target_info])
         
         # 7. 解析 AI 结果与匹配
         suggested_tags = []
@@ -221,10 +242,10 @@ async def process_emby_item_added(payload: dict):
         if item_type == "Movie":
             logger.info(f"🎬 [电影入库] {name}，立即开始 AI 分析...")
             
-            # 检查配置
-            config = load_config()
-            sf_api_key = config.get("sf_api_key")
-            if not sf_api_key: return
+            # 检查配置（统一使用首选 Provider）
+            if not get_primary_provider():
+                logger.info("ℹ️ 未配置 AI Provider，跳过自动打标")
+                return
 
             # 直接利用 Webhook 数据构造请求 (不回查 Emby，防止 404)
             clean_name = clean_string(name)
@@ -236,7 +257,7 @@ async def process_emby_item_added(payload: dict):
             }
             
             # 调用 AI
-            ai_result = ask_ai([target_info], sf_api_key)
+            ai_result = ask_ai([target_info])
             
             # 解析匹配逻辑
             suggested_tags = []
@@ -433,7 +454,7 @@ def ai_analyze_single(req: AISingleRequest, db: Session = Depends(get_db)):
         item['Name'] = name # 替换给 AI，提高准确度
 
         # 3. 调用 AI
-        ai_res = ask_ai([item], req.sf_api_key)
+        ai_res = ask_ai([item])
         
         # 4. 匹配结果
         if name in ai_res:
@@ -695,7 +716,7 @@ def ai_analyze_batch(req: AIBatchRequest, db: Session = Depends(get_db)):
     if not items_to_process: return {"status": "skipped"}
 
     # 2. 批量调用 AI
-    ai_results = ask_ai(items_to_process, req.sf_api_key)
+    ai_results = ask_ai(items_to_process)
     success_count = 0
     results_map = {}
 

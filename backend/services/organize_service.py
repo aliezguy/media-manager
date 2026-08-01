@@ -14,6 +14,8 @@ from typing import Optional
 import requests
 from openai import OpenAI
 
+from services.ai_translator import get_primary_provider
+
 from config.settings import load_config
 
 # Category resolution (existing project strategy)
@@ -128,11 +130,13 @@ def parse_torrent_name_mp(name: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _get_ai_client():
-    cfg = load_config()
-    api_key = cfg.get("sf_api_key", "")
-    if not api_key:
-        raise RuntimeError("sf_api_key not configured")
-    return OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
+    """从统一配置解析首选 Provider，返回 (OpenAI client, model_name)。"""
+    provider = get_primary_provider()
+    if not provider or not provider.get("api_key"):
+        raise RuntimeError("AI Provider not configured")
+    model = provider.get("model_name") or "deepseek-ai/DeepSeek-V3"
+    client = OpenAI(api_key=provider["api_key"], base_url=provider.get("base_url") or None)
+    return client, model
 
 
 AI_PARSE_PROMPT = """请从以下种子/文件名中提取影视剧信息，只返回纯 JSON，不要包含 Markdown 代码块。
@@ -152,7 +156,7 @@ def parse_torrent_name_ai(name: str) -> Optional[dict]:
     """Use AI (DeepSeek-V3 via SiliconFlow) to extract show metadata from
     a torrent name that regex couldn't handle."""
     try:
-        client = _get_ai_client()
+        client, model = _get_ai_client()
     except RuntimeError as e:
         logger.warning("AI parse skipped — %s", e)
         return None
@@ -161,7 +165,7 @@ def parse_torrent_name_ai(name: str) -> Optional[dict]:
 
     try:
         response = client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V3",
+            model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             stream=False,
