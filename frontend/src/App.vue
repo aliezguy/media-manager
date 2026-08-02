@@ -29,7 +29,7 @@ const menuItems = [
   { index: 'qb', label: '下载管理', icon: Box, component: QbManager },
   { index: 'cleanup', label: '种子清理', icon: Brush, component: TorrentCleanup },
   { index: 'dashboard', label: '大盘', icon: DataAnalysis, component: TaskDashboard },
-  { index: 'actor', label: '演员', icon: User, component: ActorLocalizationStudio },
+  { index: 'actor', label: '演员中文化', icon: User, component: ActorLocalizationStudio },
   { index: 'actorLib', label: '演员库', icon: User, component: ActorLibrary },
   { index: 'scheduler', label: '定时扫描', icon: Calendar, component: ScheduledTasks },
   { index: 'emby', label: 'Emby', icon: Connection, component: EmbySettings },
