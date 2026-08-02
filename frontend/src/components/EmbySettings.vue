@@ -927,7 +927,6 @@ const testConnection = async () => {
   justify-content: center;
   gap: 6px;
   width: 100%;
-  margin-top: 12px;
   padding: 10px 0;
   border: 1px dashed rgba(255, 255, 255, 0.15);
   border-radius: 12px;
