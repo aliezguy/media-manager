@@ -1,8 +1,11 @@
 import { defineConfig } from 'vite'
+import type { UserConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
 // https://vitejs.dev/config/
-export default defineConfig({
+// 使用 UserConfig 显式标注配置类型，获得 IDE 提示与自文档化；
+// defineConfig 负责在加载配置时注入 ConfigEnv（mode/command 等）。
+const config: UserConfig = {
   plugins: [vue()],
   server: {
     host: '0.0.0.0',
@@ -24,4 +27,6 @@ export default defineConfig({
       }
     }
   }
-})
+}
+
+export default defineConfig(config)

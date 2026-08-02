@@ -1,242 +1,357 @@
-# Session Handoff — 2026-07-08 (Session 5 + 6)
+# Emby-AI-Manager 会话交接文档 (Session Handoff)
 
-## 当前目标 (Current Goal)
+**项目背景**：本项目是一个针对 Emby 媒体库的演职员中文化治理工具。采用前后端分离架构（Vue 3 + Python FastAPI + SQLite）。核心目标是实现 Emby 演职员数据的深度刮削、基于 TMDB ID 等绝对锚点的跨库灾备恢复、以及通过 LLM 实现的智能角色补全。
 
-1. **CD2 根路径可配置化**：媒体库/已完结的根路径从硬编码改为通过配置页面设置
-2. **残缺季雷达**：在年节目录下扫描所有剧集，自动检测集数不完整的 Season 文件夹
-3. **完整性判定修复**：文件数 ≥ 预期集数应为"完整"，而非精确匹配
-4. **Emby 僵尸清理**：CD2 删除后，Emby 因缩略图错误无法正常清理残留记录的问题
-5. **路径转换可配置**：Emby ↔ CD2 路径互转的前缀从硬编码改为可配置
-6. **✅ 综艺自动洗版特殊逻辑**（已完成）：只处理已完结中存在的 Season，Season 0 忽略
+**最后更新**: 2026-07-19 (Session 3-5)
 
 ---
 
-## 已完成工作 (What's Done)
+## 0. 本次会话完成的重构（2026-07-19 Session 3-5）
 
-### 1. CD2 根路径可配置化
+### 0.8 防弹级错误兜底修复 — ★ 核心稳定性
 
-#### 前端 (`EmbySettings.vue`)
-- 新增「CD2 网盘设置」区块（Emby 连接设置与智能服务之间）
-- 两个输入框：`cd2_media_dir`（左侧根路径）、`cd2_organized_dir`（右侧根路径）
-- 新增「Emby 路径前缀」和「CD2 路径前缀」输入框（路径转换用）
+#### 0.8.1 task_manager.py 增强 (utils/task_manager.py)
 
-#### 前端 (`TorrentCleanup.vue`)
-- 硬编码常量 `CD2_MEDIA_BASE` / `CD2_ORGANIZED_BASE` → `ref()`
-- `onMounted` 中先请求 `/api/config` 获取用户配置的路径，加载失败时 fallback 到默认值
+`update_progress()` 新增 `status` 参数，支持运行中途将任务状态标记为 `"error"`，前端立即感知异常。
 
-### 2. 残缺季雷达（全栈）
+#### 0.8.2 _batch_sinicize_task 终极防线 (routers/sync_actions.py)
 
-#### 后端 (`backend/services/checker_service.py` — 新建)
-- 复用现有组件保持 DRY：
-  - `_SEASON_RE` (task_flow_service) — 提取季号
-  - `_count_files_in_cd2_dir` (task_flow_service) — 统计视频文件
-  - `get_tv_season_info` (organize_service) — TMDB 预期集数
-  - `extract_tmdb_id_from_path` (path_utils) — 提取 TMDB ID
-- 处理多版本同季号（如 `Season 1 - 4K` 和 `Season 1 - WEB` 各自独立比对）
-- 温和限速 (`time.sleep(0.3)`) 避免 CD2 压力
-- **🆕 Session 5**: 新增 `check_single_show()` 函数 — 单剧集核查，复用相同的 Season 检查逻辑
+**问题**：`_batch_sinicize_task` 没有外层 `try...except...finally`，循环中任何未捕获异常直接导致 `complete_task` 永不调用 → 前端永久轮询死锁。
 
-#### 后端 API (`cd2_router.py`)
-- `POST /api/directories/check-incomplete` — 批量扫描整个年份目录
-- **🆕 Session 5**: `POST /api/directories/check-show-incomplete` — 单剧集快速核查
-
-#### 前端 UI (`TorrentCleanup.vue` — 内联标注版)
-- **按钮**：左右两列 nav bar 中，仅在年份层级（depth=1）显示 `[🔍 核查残缺季]`
-- **🆕 Session 5**: 每个剧集行尾新增 🔍 按钮（hover 可见），支持单剧快速核查
-- **剧集级标注**：扫描完成后在目录列表项上显示 `✅ 完整`（绿色）/ `⚠️ 缺 N 季`（橙色）
-- **Season 级标注**：点进剧集后，Season 文件夹显示 `8/10 缺 2 集`（红色 badge，隐藏原始 stats）
-- **行高亮**：残缺剧集橙色左边框 + 浅橙背景
-- **清除标注**：`✕ 清除标注` 按钮，一键清除
-- 单剧核查结果与批量核查共用同一套 `seasonCheckData` 标注系统，可混合使用
-
-### 3. 完整性判定修复 (`task_flow_service.py`)
-
-- **已完结侧** (~line 750)：`count == expected_eps` → `count >= expected_eps`
-- **媒体库侧** (~line 918)：`actual_files == expected_eps` → `actual_files >= expected_eps`
-- 原因：43 > 42 时不应判定为残缺（多出的可能是第 0 集、花絮等）
-- `checker_service.py` 初始就是正确的（`actual_count < expected_count`）
-
-### 4. Emby 僵尸清理 — CD2 删除后延迟清理
-
-#### 路径转换可配置 (`settings.py` + `path_utils.py`)
-- 新增配置项 `emby_prefix`（默认 `/volume3/emby影院/115网盘_3588/`）和 `cd2_media_prefix`（默认 `/80003588/emby库/`）
-- `path_utils.py` 中硬编码前缀 → 从配置读取
-- 新增 `cd2_path_to_emby_path()` 反向转换函数
-
-#### Emby API (`emby_service.py` — 3 个新函数)
-| 函数 | 用途 |
-|------|------|
-| `search_series_by_name(name)` | GET `/emby/Items` 按名称搜索 Series |
-| `delete_emby_item(item_id)` | DELETE `/emby/Items/{id}` 删数据库记录 |
-| `cleanup_emby_zombie(cd2_path)` | 编排：路径转换 → 提取剧名 → 搜索 → 删除 |
-
-#### 延迟清理 (`cd2_router.py`)
-- CD2 删除成功后，daemon 线程 sleep 180 秒后调 `cleanup_emby_zombie`
-- 3 分钟延迟是为了让 symedia 的 webhook 通知流程有机会正常完成
-- 如果 symedia 已成功清理，Emby search 返回空，无需操作（幂等）
-
-### 5. 前端配置新增字段汇总
-
-Emby 页面新增的配置项：
-- `cd2_media_dir` — 媒体库根路径
-- `cd2_organized_dir` — 已完结根路径
-- `emby_prefix` — Emby 路径前缀
-- `cd2_media_prefix` — CD2 路径前缀
-
-### 6. 🆕 CD2 分类独立下拉框 (Session 5)
-
-#### 问题
-CD2 头部的分类显示为静态文本（`› 综艺`），无法切换。顶部筛选下拉的选项来自 qB 实例 API，未选 qB 实例时下拉为空，导致 CD2 分类也无法切换。
-
-#### 后端 (`routers/system.py`)
-- 新增 `GET /api/categories` 端点，读取 `backend/data/category.yaml`
-- 返回 `{ movie: [...], tv: [...], all: [...] }` 三级结构
-
-#### 前端 (`TorrentCleanup.vue`)
-| 变更 | 说明 |
-|------|------|
-| `presetCategories` ref | 从 `GET /api/categories` 动态获取，替代硬编码数组 |
-| `cd2Category` ref | 独立的 CD2 分类状态，与顶部 torrent 筛选解耦 |
-| `categoryOptions` | 合并「预设 + qB 动态」，未选 qB 实例也有选项 |
-| CD2 头部 `el-select` | 替换原来的静态 `› 综艺` 文本 |
-| `selectedCategory` → `cd2Category` 单向同步 | 顶部选分类 → CD2 跟随；CD2 改分类不影响顶部 |
-
-### 7. 🆕 TMDB 网络容错 (Session 5)
-
-#### 问题
-`api.themoviedb.org` 在国内频繁 SSL 中断（`SSLEOFError: EOF occurred in violation of protocol`），导致残缺季核查中大量 Season 被跳过，最终返回空结果。
-
-#### 修复
-
-| 层次 | 变更 |
-|------|------|
-| 域名 | `api.themoviedb.org` → `api.tmdb.org`（国内 CDN 路由更稳定） |
-| URL 可配置 | `settings.py` 新增 `tmdb_base_url`，默认 `https://api.tmdb.org/3` |
-| 重试机制 | `_tmdb_get()` 函数：最多 3 次尝试，指数退避（1.5s → 3s） |
-| 覆盖范围 | `organize_service.py`（search_tv / tv_details / season_info）+ `tmdb_service.py`（get_tmdb_info） |
-
-### 8. 🆕 综艺自动洗版特殊逻辑 + Season 0 豁免 (Session 6 + 修正)
-
-#### 业务背景
-综艺节目的 TMDB 季数/集数元数据经常不准确（例如实际只有 3 季，TMDB 记录 10 季；或单季集数标注错误）。如果按常规剧集逻辑走，会把用户辛苦收集的、实际完整的综艺季误判并错删。
-
-#### 核心设计：6 个精确切入点（Session 6 修正后）
-
-所有修改集中在 `backend/services/task_flow_service.py` 的 `auto_process_show()` 函数。
-
-| # | 切入点 | 变更内容 | 影响范围 |
-|---|--------|---------|---------|
-| ① | Step 1 后 | 新增 `is_variety = (category == "综艺")` 标记 | 函数级变量 |
-| ② | Step 2a 后 | **Season 0 豁免**：从 `season_dir_map` 中移除 Season 0 | **所有分类** |
-| ③ | Step 2b 前 | ★ **快照原始 Season 集合**：`_organized_season_nums_original = set(season_dir_map.keys())`，供 Step 3a 使用 | 仅综艺 |
-| ④ | Step 2b | 综艺 `seasons_to_check` 使用 `season_dir_map.keys()` 而非 TMDB range | 仅综艺 |
-| ⑤ | Step 2c | ★ 综艺 `season_dir_map` 为空时 **不提前返回**，继续进入媒体库评估 | 仅综艺 |
-| ⑥ | Step 3a | S0 跳过（通用）+ 综艺使用 `_organized_season_nums_original` 判断非对齐 Season | 所有分类 + 综艺 |
-| ⑦ | Case B | ★ **移除 `not is_variety` 守卫**，综艺同样可进入 Case B | 仅综艺 |
-
-> **关键修正 (Session 6 修订)**：初版在 Case B 前置了 `not is_variety` 一刀切守卫，导致新综艺两端仅有 Season 1 且均不完整时，无法触发整删重洗。修正后通过 ③ + ⑤ + ⑦ 三个注入点实现正确的"共享 Season 评估 → Case B 放行"链路。
-
-#### 修正后的决策树逻辑
-
-```
-Step 2b 前: 快照 _organized_season_nums_original (原始已完结 Season 集合)
-Step 2b:   综艺仅校验已完结中存在的 Season
-           不完整的 Season 从 season_dir_map 移除（但仍在快照中）
-Step 2c:   综艺 season_dir_map 为空 → 不 return，继续评估媒体库
-Step 3a:   综艺媒体库 Season:
-             - 在快照中 → 评估完整性，进入 media_season_state
-             - 不在快照中 → 跳过（不触碰、不判定、不删除）
-           → media_season_state 仅包含「两端共有」的 Season
-Case B:    无守卫，all_media_incomplete 基于两端共有 Season 判定
-           → 新综艺两端均残缺 → Case B 整删重洗 ✓
-           → 老综艺存在非对齐 Season → 已被 Step 3a 跳过，不参与判定
+**修复**：
+```python
+try:
+    sinizer = DoubanSinizer()
+    for ... in item_ids:       # 逐项 try/except 已存在
+        ...
+except Exception as e:         # ★ 终极防线
+    logger.error(完整堆栈)
+    update_progress(status="error")
+finally:
+    complete_task(...)          # ★ 无论如何强制终结任务
 ```
 
-#### 场景验证矩阵（修正后）
+#### 0.8.3 DoubanSinizer 分集循环逐集隔离 (services/douban_service.py)
 
-| 场景 | 预期行为 | 状态 |
-|------|---------|------|
-| **新综艺** organized(S1残缺) media(S1残缺) — 用户核心场景 | Case B 整删重洗，organized S1 保留 | ✅ |
-| 综艺 organized(S1完整,S3完整) media(S1残缺,S2完整,S3残缺,S4完整) | S1/S3 判定，S2/S4 跳过。Case B 整删（⚠️ S2/S4 也被删） | ⚠️ 见下方说明 |
-| 综艺 organized(S1完整) media(S1完整,S2完整非对齐) | Cases C/D 逐季对比，S2 不处理 | ✅ |
-| 综艺 organized 空 → media 有内容 | 不做任何处理 | ✅ |
-| 综艺 media 目录不存在 (Case A) | 全部 organized Season 导入 | ✅ |
-| 常规剧 + organized 有 Season 0 | S0 跳过，其余正常处理 | ✅ |
-| 非综艺 + 所有 media Season 残缺 (Case B) | 整剧目录删除，行为不变 | ✅ |
+三重加固：
 
-> ⚠️ **已知权衡**：当综艺存在非对齐的媒体库 Season（已完结中不存在的 Season）且所有对齐 Season 均残缺时，Case B 仍会删除整个媒体库目录（包括非对齐 Season）。这是因为 Case B 的操作粒度是「整个剧集目录」而非单个 Season。该场景在实际中较少见（非对齐 Season 通常意味着用户手动整理了额外的季），如需要可按 Season 粒度拆分 Case B，当前暂不处理。
+| 加固层 | 机制 |
+|--------|------|
+| 进度反馈 | `task_id` 传入 `sinicize()`，分集循环内调 `task_manager.update_progress(message="正在高速回写分集: xxx (5/50)")` |
+| 逐集隔离 | `for ep in episodes` 内部 `try/except` → 单集脏数据 rollback → `continue` 下一集 |
+| 逐集提交 | `ep_db.commit()` 每集一次 → 已成功的分集不因后续失败而丢失 |
+| 外层兜底 | Session 创建失败等基础设施异常仍被捕获 |
 
----
+#### 0.8.4 前端三种轮询全部增加异常状态阻断 (ActorLocalizationStudio.vue)
 
-## 避坑记录 (Failed Approaches)
-
-1. **残缺季核查第一版用弹窗展示结果**
-   - 用户反馈：应该内联标注到目录列表上，点进去能看到具体缺失数
-   - 解决：重构为内联标注模式，按钮放在 nav bar，结果反写到文件列表项
-
-2. **残缺季核查按钮放在 CD2 段标题右侧**
-   - 用户反馈：应该放在左侧 nav bar 的 `←上一级 📂/2026/` 位置，仅在年份层级显示
-   - 解决：移到 nav bar 中 `cd2MediaDepth === 1` 时显示
-
-3. **Emby 僵尸清理：全库扫描方案被否决**
-   - 原因：用户库很大，全扫 `POST /emby/Library/Refresh` 太慢
-   - 解决：改用精准方案 — 搜索单 Item + `DELETE /emby/Items/{id}`，不触发扫描
-
-4. **路径转换前缀硬编码**
-   - 用户要求：前缀应可配置，方便更换设备/环境
-   - 解决：在 settings.py 新增 `emby_prefix` / `cd2_media_prefix` 配置项，前端可编辑
-
-5. **操作时间线日志用 `task_id=None`（Session 3 遗留）**
-   - 预分析阶段（season validation）的 SKIP_FOLDER/KEEP_ORGANIZED/KEEP_MEDIA 共 4 处仍使用 `task_id=None`
-   - 未修复 — 信息性日志，非阻塞
-
-6. **🆕 年份跳转 `type="number"` 导致按钮永远禁用 (Session 5)**
-   - 原因：Vue 3 中 `<input type="number">` 自动将 v-model 值转为 number 类型，`.trim()` 报错
-   - 解决：改为 `type="text"` + `inputmode="numeric"`，所有 .trim() 调用前加 `String()` 安全转换
-
-7. **🆕 CD2 分类预设数据硬编码 (Session 5)**
-   - 第一版用 `PRESET_CATEGORIES = ['国产剧', '综艺', ...]` 写死在代码里
-   - 用户要求：使用 `backend/data/category.yaml` 中的分类
-   - 解决：新增 `GET /api/categories` 端点读取 YAML，前端 `onMounted` 动态获取
+审计/汉化/富化三种进度轮询统一增加 `failed` 状态匹配：
+```javascript
+} else if (s.status === 'error' || s.status === 'failed') {
+    stopPolling()
+    ElMessage.error(`任务异常终止: ${s.message || '未知错误'}`)
+    dialogVisible.value = false    // ★ 立即释放弹窗
+    await loadItems()              // ★ 刷新列表
+}
+```
 
 ---
 
-## 当前状态 (Current State)
+### 0.9 DoubanCelebrityId 数据断链修复 — ★ 打通全链路
 
-- ✅ CD2 根路径可配置化完成，前后端构建通过
-- ✅ 残缺季雷达全栈完成（批量 + 单剧核查 + 内联标注 UI）
-- ✅ 完整性判定 `>=` 修复完成
-- ✅ Emby 僵尸清理（3 分钟延迟 + 精准 Delete API）完成
-- ✅ 路径转换前缀可配置化完成
-- ✅ CD2 分类独立下拉框完成（category.yaml 驱动）
-- ✅ TMDB 网络容错（域名切换 + 重试机制）完成
-- ✅ 年份跳转按钮修复
-- ✅ **综艺自动洗版特殊逻辑 + Season 0 豁免完成**（6 个注入点 + 1 次 Case B 逻辑修正，后端语法检查通过）
-- ✅ 前端构建通过，后端语法检查通过
-- ✅ 完整扫描流程（BFS + 自动触发洗版 → 大盘时间线）基本跑通
-- ⚠️ Emby 僵尸清理尚未联调验证（需在有剧集可删除的环境下测试完整链路）
-- ⚠️ 预分析阶段 4 处日志 `task_id=None` 仍未修复（约 lines 760/767/934/941）
-- ⚠️ **综艺逻辑尚未联调验证**（需在实际综艺目录上测试完整链路）
+**问题**：汉化映射引擎匹配 Emby 演员与豆瓣演员时，只注入了 `DoubanAvatarUrl`，未注入 `DoubanCelebrityId`。导致绝大部分演员降级到 L2 TMDB 搜索而非 L1 豆瓣精准查询。
+
+**修复**：11 个注入点，覆盖从 Frodo API → 映射引擎 → 分集中文化 → L1 漏斗的全链路：
+
+| # | 位置 | 变更 |
+|---|------|------|
+| 1 | `_fetch_actors_frodo()` | ★ 新增提取 `item.get("id")` |
+| 2 | `_parse_celebrity_item()` | ★ HTML 降级从 `<a href="/celebrity/1234567/">` 提取 ID |
+| 3 | `_match_and_update()` 匹配 | 注入 `DoubanCelebrityId` |
+| 4 | `_match_and_update()` 新增 | 注入 `DoubanCelebrityId` + `DoubanAvatarUrl` |
+| 5 | `_build_douban_match_map()` | 新增 `douban_id` 字段 |
+| 6 | `sinicize()` 分集前置批处理 | 从 match_map 注入 `DoubanCelebrityId` |
+| 7 | `_localize_episode_people()` 直匹配 | 注入 `DoubanCelebrityId` |
+| 8 | `_localize_episode_people()` AI复应用 | 注入 `DoubanCelebrityId` |
+| 9 | sync_actions `_build_douban_actor_map()` | 新增 `douban_id` 字段 |
+| 10 | sync_actions `_localize_episode_people()` 直匹配 | 注入 `DoubanCelebrityId` |
+| 11 | sync_actions `_localize_episode_people()` AI复应用 | 注入 `DoubanCelebrityId` |
+
+数据流：
+```
+Frodo API (celebrity.id) → _match_and_update / _build_douban_match_map
+  → sinicize() / _localize_episode_people()
+  → save_media_to_db() → ensure_profiles_for_people()
+  → resolve_actor_profile(ctx={"douban_id": "1234567"})
+  → L1 豆瓣漏斗: DoubanApi.celebrity_details(douban_id)
+```
 
 ---
 
-## 下一步 (Next Steps)
+### 0.10 L0.5: Emby 原生头像优先 + 即时试探 + 极速熔断 — ★ 新增漏斗层
 
-### 优先级 1 — 部署验证
+#### 0.10.1 核心逻辑 (services/actor_profile_service.py)
 
-1. **部署验证**：
-   ```bash
-   cd backend && source venv/bin/activate && python main.py
-   cd frontend && npm run dev
-   ```
-   - 验证 CD2 根路径配置 → 种子清理页面路径生效
-   - 验证残缺季雷达 → 导航到某个年份目录 → 点击「核查残缺季」→ 标注正确显示
-   - 验证单剧核查 → 点击剧集行的 🔍 按钮
-   - 验证 CD2 分类下拉 → 切换分类 → CD2 目录正确跳转
-   - 验证 Emby 僵尸清理 → CD2 删除一个目录 → 等 3 分钟 → 检查 Emby
-   - **🆕 验证综艺逻辑** → 对一个综艺目录触发洗版 → 确认 Season 0 跳过 → 确认非对齐 Season 保留 → 确认仅两边共有的 Season 参与对比
+在 L0（本地缓存）之后、L1（豆瓣）之前，新增 **L0.5** 层，受配置开关 `enable_emby_avatar_first` 控制。
 
-### 优先级 2 — 可选
+完整漏斗优先级：
+```
+L0   — DB 极速查询 → 物理硬盘嗅探 → 冷却期拦截
+L0.5 — Emby 原生头像 (enable_emby_avatar_first=true 且数据齐全时)
+        即时 _download_image 试探 → 成功则阻断 L1/L2，失败则平滑降级
+L1   — 豆瓣外链 (上下文自带 或 douban_id 主动 API)
+L2   — TMDB 搜索 + 详情
+```
 
-2. **预分析阶段日志修复**（Session 3 遗留）
-3. **可选增强**：扫描任务支持多个目录路径、扫描日志清理/归档、定时扫描通知
+#### 0.10.2 即时网络试探 (Eager Download)
+
+L0.5 不是仅设置 `download_url` 然后等底部统一下载，而是**当场调用 `_download_image`**：
+- 成功 → 同时赋值 `download_url` + `local_path`，L1/L2 被 `if not download_url:` 阻断
+- 失败（跨网段不可达/无缓存）→ `download_url` 保持 `""`，平滑降级到 L1/L2
+- 底部统一下载段改为 `if download_url and not local_path:` 避免重复下载
+
+#### 0.10.3 极速熔断 (Fast-Fail)
+
+`_download_image` 新增 `connect_timeout` 和 `read_timeout` 参数（默认 10s/30s）。
+L0.5 调用时传入 `connect_timeout=2.0, read_timeout=3.0`：
+- Emby 是本地/近端服务，超过 3 秒拿不到图一律熔断
+- L1/L2 外网来源不传参数，使用默认 (10s/30s)
+- L0.5 额外包裹 `try/except Exception`，任何异常都降级不放行
+
+#### 0.10.4 上下文注入 (ensure_profiles_for_people)
+
+```python
+ctx = {
+    ...
+    "emby_person_id": p.get("Id"),
+    "emby_image_tag": p.get("PrimaryImageTag") or (
+        p.get("ImageTags", {}).get("Primary") if isinstance(...) else None
+    ),
+}
+```
+
+#### 0.10.5 前端开关 (EmbySettings.vue)
+
+"智能服务"分区新增 `el-switch`：
+- `enable_emby_avatar_first: false`（默认关闭）
+- 开关旁实时显示状态文字
+- 下方提示适用场景（TMDB 代理不稳定/503）
+
+#### 0.10.6 TMDB 函数异常双保险
+
+三条 TMDB 函数 (`_search_tmdb_person`, `_fetch_person_by_tmdb_id`, `fetch_tmdb_person_details`) 均增加显式 `except requests.exceptions.RequestException` 处理器：
+```
+except RequestException → 网络层 (ProxyError/ConnectionError/SSLError/Timeout) → 打印类型名 + 简短消息
+except Exception        → 非网络层 (JSON 解析失败等) → 完整堆栈
+```
+
+---
+
+## 1. 核心系统架构
+
+### 1.1 全维度演员数据中心 (ActorProfile)
+
+- **`actor_profiles` 表**（[models.py](backend/models.py#L189-L207)）：以演员中文名 `name` 为主键，存储全维度生平数据：
+  - `local_image_path`：本地头像相对路径（正斜杠格式，如 `张/张译-tmdb-12345/folder.png`）
+  - `image_url`：外部直链兜底（豆瓣/TMDB/Emby）
+  - `source`：数据来源（douban / tmdb / emby / local）
+  - `tmdb_id`、`imdb_id`、`douban_id`：跨平台 ID 锚点
+  - `birth_date`、`birth_place`、`overview`：生平数据
+
+- **数据库规范化**：`actor_records` 已瘦身为纯关联表（[models.py](backend/models.py#L210-L226)），仅保留 `emby_item_id`、`name`、`role`、`type`、`sort_order`、`update_time`。已彻底删除废弃的 `image_url` 列及其所有业务引用。
+
+### 1.2 超级漏斗头像解析 (actor_profile_service.py) — ★ 已重构
+
+[backend/services/actor_profile_service.py](backend/services/actor_profile_service.py) — 核心入口 `resolve_actor_profile(name, db, context_info)`：
+
+**L0 终极极速本地缓存拦截（数据库优先 → 物理硬盘兜底）**：
+
+| 步骤 | 策略 | 说明 |
+|------|------|------|
+| **1. DB 极速查询** | 主键索引查 `actor_profiles` | O(1) SQLite 查找 |
+| **2. 最快命中** | DB 有记录 + `local_image_path` + 物理文件存在 | 直接返回，零 I/O、零网络 |
+| **3. 硬盘嗅探兜底** | `_find_local_avatar()` 扫描 `people/{首字}/` | 兼容用户手动放入文件 |
+| **4. 冷却期拦截 ★** | `existing.update_time` 距当前 < 7 天 → 直接返回 | 无头像演员 7 天内不重复网络请求 |
+| **5. 冷却期已过** | 超过 7 天 → 允许重试 L0.5/L1/L2 | 给头像源足够时间更新 |
+
+**★ L0.5 Emby 原生头像优先（新增，受配置开关控制）**：
+- 读取 `ctx["emby_person_id"]` + `ctx["emby_image_tag"]` → 拼接 Emby 直链
+- **即时网络试探**：当场调 `_download_image(connect=2.0s, read=3.0s)` 下载
+- 成功 → 阻断 L1/L2，source="emby"
+- 失败/超时/异常 → 平滑降级到 L1/L2，不产生坏数据
+- 受前端 `enable_emby_avatar_first` 开关控制，默认关闭
+
+**L1 豆瓣漏斗（★ 已增强）**：
+| 条件 | 行为 |
+|------|------|
+| `douban_avatar` 上下文自带 | 直接使用，零额外网络 |
+| `douban_id` 存在 | **主动调用** `DoubanApi().celebrity_details(douban_id)` → 提取高清头像 + 生平/出生地兜底 |
+
+**L2 TMDB 兜底**：精准 ID 拦截 → 名字搜索（智能优选三级梯队）→ Get Details + external_ids
+
+**关键技术点**：
+- **L0 本地嗅探**：`_find_local_avatar(actor_name)` 缓存结果到 `_local_sniff_cache`
+- **标准化落盘**：`_build_standard_path()` — 有 TMDB ID 时目录名为 `{name}-tmdb-{id}`，仅豆瓣 ID 时为 `{name}-douban-{id}`，无 ID 时为 `{name}`
+- **三级缓存**：`_local_sniff_cache`（L0 嗅探）、`_tmdb_search_cache`（搜索）、`_tmdb_detail_cache`（详情）
+- **防盗链修复**：`_download_image()` 强制 `Referer: https://movie.douban.com/`
+- **可配置超时**：`_download_image(url, save_path, connect_timeout=10.0, read_timeout=30.0)`
+- **极速熔断**：L0.5 调用 `_download_image(connect=2.0, read=3.0)`，Emby 卡死最多等 5 秒
+- **TMDB 异常双保险**：三条 TMDB 函数均显式捕获 `RequestException` + 通用 `Exception`
+
+### 1.3 静态资源挂载与防盗链
+
+- **`main.py`**（[main.py](backend/main.py#L112-L118)）：`people/` 通过绝对路径挂载到 `/static_actors`
+- **前端修复**：`<img>` 标签使用 `:src="act.local_image_url || act.image_url"` + `referrerpolicy="no-referrer"` 彻底绕过豆瓣 403
+- **API 拼接**：`GET /api/media/{item_id}/details` 通过 `Request.base_url` 动态拼接完整的 `local_image_url`
+
+### 1.4 豆瓣 Frodo API 集成 (douban_api.py + douban_service.py)
+
+- **DoubanApi 客户端**（[douban_api.py](backend/services/douban_api.py)）：完整的 Frodo API v2 封装 — HMAC-SHA1 签名、冷却限流、Session 复用
+  - `celebrity_details(id)` — 演员详情（头像 + 生平 + 出生地）
+  - `match_info(name, imdbid, mtype, year)` — 智能匹配豆瓣条目 ID
+- **豆瓣演员 ID 全链路**（★ 已修复数据断链）：
+  - `_fetch_actors_frodo()` 提取 `item["id"]` → `_match_and_update()` 注入 `DoubanCelebrityId`
+  - `_build_douban_match_map()` 传递 `douban_id` → 分集前置批处理 + `_localize_episode_people()` 全量注入
+  - 最终流入 `resolve_actor_profile(ctx={"douban_id": ...})` → L1 豆瓣精准查询
+
+### 1.5 分集数据透视 (Episode Data Perspective)
+
+- **后端**：`GET /api/media/{item_id}/details`（[sync_actions.py](backend/routers/sync_actions.py#L818-L920)）
+  - 通过 `name` 批量 JOIN `actor_profiles`（一次 `IN` 查询）
+  - 返回 `local_image_url`（优先）、`image_url`（兜底）、生平数据
+- **前端**：`ActorLocalizationStudio.vue` — Series 卡片底部"分集透视"按钮 → 600px Drawer
+
+### 1.6 分集批量富化引擎 (Batch Enrich)
+
+- **`GET /api/tasks/{task_id}`**：前端轮询后台任务进度
+- **`POST /api/episodes/batch-enrich`**：接收 `{"item_id": "series_id"}`，立即返回 `task_id`
+- **后台引擎核心流程**：TMDB 整季 API 一次请求拿到全季数据 → guest_stars 去重 → `ensure_profiles_for_people` 批量漏斗
+
+### 1.7 任务状态管理器 (task_manager.py) — ★ 已增强
+
+- `create_task(total, message, metadata)` → `task_id`（UUID hex 12位）
+- `update_progress(task_id, current, message, increment, total, status)` — ★ 新增 `status` 参数
+- `complete_task(task_id, message, success)` → 自动将 `current` 对齐到 `total`
+- `get_status(task_id)` → `{status, total, current, message, metadata}` | None
+- `cleanup_expired()` → 已完成任务 10 分钟后自动清理
+- 所有字典操作均受 `threading.Lock()` 保护
+
+### 1.8 ★ 统一批量审计引擎 (POST /api/audit/batch)
+
+- TMDB Season API 整季批处理，绝对禁止逐集循环查询
+- sentinel 模式 + `finally` 块保证 `complete_task` 一定被调用
+- Phase 1 — 逐项状态检查 + UPSERT 入库
+- Phase 2 — 整季 TMDB 批处理（按季推进进度）
+
+### 1.9 ★ 统一批量汉化引擎 (POST /api/douban/sinicize_selected + sinicize_all)
+
+- `_batch_sinicize_task`：外层 `try/except/finally` 全局防线，保证任务永不被悬挂
+- `sinicize()` 分集循环：逐集 try/except 隔离 + 颗粒度进度反馈 + 逐集提交
+- 前端三种进度轮询统一 error/failed 异常状态阻断 + 强制关闭弹窗
+
+### 1.10 前端：防锁死弹窗 + 异步审计 — ★ 已修复
+
+- 对话框 `:show-close="true"` + 常驻关闭按钮，彻底消除用户锁死
+- 三种轮询（审计/汉化/富化）统一增加 `failed` 状态即时关闭弹窗 + 刷新列表
+- 轮询 API 异常时立即停止并释放弹窗
+
+### 1.11 入库流程 (db_crud.py)
+
+`save_media_to_db` — 新增 `skip_profiles: bool = False` 参数：
+1. `skip_profiles=False`（默认）：先调 `ensure_profiles_for_people(db, people)` → 触发超级漏斗
+2. `skip_profiles=True`：跳过漏斗（调用方已提前批量处理），仅建立 `actor_records` 关联
+
+---
+
+## 2. people/ 目录结构标准
+
+```
+people/
+  张/
+    张译-tmdb-12345/
+      folder.png     ← 演员头像
+    张颂文-tmdb-67890/
+      folder.png
+  宋/
+    宋威龙-tmdb-112233/
+      folder.png
+```
+
+**目录命名规则**：
+- 有 TMDB ID：`{actor_name}-tmdb-{tmdb_id}`
+- 仅豆瓣 ID：`{actor_name}-douban-{douban_id}`
+- 无任何 ID：`{actor_name}`
+
+**挂载**：`app.mount("/static_actors", StaticFiles(directory=PEOPLE_DIR))`
+
+---
+
+## 3. 关键文件索引
+
+| 文件 | 用途 |
+|------|------|
+| [backend/models.py](backend/models.py) | ActorProfile + ActorRecord + MediaSyncStatus + MediaMetadata |
+| [backend/services/actor_profile_service.py](backend/services/actor_profile_service.py) | ★ 超级漏斗：L0(DB/硬盘) → L0.5(Emby 即时试探+熔断) → L1(豆瓣+主动API) → L2(TMDB) |
+| [backend/services/actor_image_service.py](backend/services/actor_image_service.py) | 双源漏斗 URL 解析（已移除 Emby L3，仅保留豆瓣 + TMDB） |
+| [backend/services/douban_api.py](backend/services/douban_api.py) | DoubanApi Frodo API 客户端（HMAC-SHA1 签名、冷却限流） |
+| [backend/services/db_crud.py](backend/services/db_crud.py) | save_media_to_db — 入库 + 可选 Profile 预处理（skip_profiles） |
+| [backend/services/douban_service.py](backend/services/douban_service.py) | DoubanSinizer — ★ 豆瓣演员 ID 全链路 + 分集前置去重批处理 + 逐集隔离 |
+| [backend/routers/sync_actions.py](backend/routers/sync_actions.py) | ★ GET /details + POST /api/audit/batch + POST /api/douban/sinicize_* + ★ try/except/finally 全局防线 |
+| [backend/utils/task_manager.py](backend/utils/task_manager.py) | ★ 线程安全 TaskManager 单例，支持动态 total + status + 自动对齐 current |
+| [backend/main.py](backend/main.py) | FastAPI 入口 + /static_actors 挂载 |
+| [backend/database.py](backend/database.py) | SQLite 连接 + 增量迁移 |
+| [frontend/src/components/ActorLocalizationStudio.vue](frontend/src/components/ActorLocalizationStudio.vue) | ★ 演职员治理页面 + 分集透视 Drawer + 三重异步进度弹窗 + ★ 异常状态阻断 |
+| [frontend/src/components/EmbySettings.vue](frontend/src/components/EmbySettings.vue) | ★ Emby 连接设置 + L0.5 enable_emby_avatar_first 开关 |
+
+---
+
+## 4. 环境与配置
+
+- **后端**: Python FastAPI (port 8000)，SQLite 数据库位于 `backend/data/emby_ai.db`
+- **前端**: Vue 3 + Element Plus + Vite
+- **关键配置项** (`config.json`)：
+  - `emby_host`、`emby_api_key`、`emby_user_id`
+  - `tmdb_api_key`、`tmdb_base_url`
+  - `sf_api_key` (AI 翻译)
+  - `max_actors_per_media` (默认 50)
+  - `enable_emby_avatar_first` (★ 新增，默认 false)
+  - `cd2_media_dir`、`cd2_organized_dir`
+  - `emby_prefix`、`cd2_media_prefix`
+- **外部依赖**: httpx (0.28.1)、pypinyin、BeautifulSoup4、requests
+
+---
+
+## 5. Session 1-2 重构记录（2026-07-19 上午/中午）
+
+参见 git history 和之前的 SESSION_HANDOFF 版本。核心包括：
+- DoubanApi 正式接入
+- 图片下载器防盗链修复
+- L1 豆瓣漏斗主动抓取
+- skip_profiles 参数
+- 汉化引擎分集前置去重批处理
+- 统一批量汉化后台 API
+- 豆瓣 ID 查找引擎重构（废弃 HTML 爬虫）
+- 前端按钮异步化
+
+---
+
+## 6. 下一步开发方向
+
+### 6.1 前端增强
+- sinicize 进度弹窗增加失败项明细展示（如"3/5 成功，2 失败：id1、id2"）
+- 分集批量富化按钮增加权限校验（仅已审计且 status=synced 的 Series 可触发）
+
+### 6.2 性能优化
+- `_find_local_avatar()` 策略 2 的 `os.listdir(_PEOPLE_DIR)` 可缓存目录列表
+- TMDB API 请求考虑加入限流（rate limiter），避免触发 TMDB 429
+- DoubanApi 可考虑在 DoubanSinizer 中复用同一实例（避免重复初始化 Session）
+- L0.5 成功后可缓存 Emby URL 到 actor_profiles 避免重复试探
+
+### 6.3 功能扩展
+- 分集批量富化增加 AI 翻译 Overview 的选项（调用已有的 `ai_translator`）
+- 支持按季选择（目前全季处理），允许用户指定特定季号
+- `_batch_sinicize_task` 可考虑并行处理多个 item（当前逐项串行）
+
+### 6.4 已废弃/待清理
+- `actor_images/` 目录 — 旧的头像存储路径，确认迁移完成后可删除
+- `actor_image_service.py` — 已被 `actor_profile_service.py` 完全取代，可评估是否彻底移除
+- `DOUBAN_FRODO_*` 常量 — `_frodo_get` 中仍在使用，后续可考虑迁移至 `DoubanApi` 统一管理

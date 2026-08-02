@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
 import { Files, Connection, VideoCameraFilled, Timer, Box, EditPen, Brush, DataAnalysis, Calendar, User } from '@element-plus/icons-vue'
 
@@ -38,7 +38,7 @@ const menuItems = [
   { index: 'editor', label: '分类', icon: EditPen, component: FileEditor }
 ]
 
-const handleSelect = (index) => {
+const handleSelect = (index: string) => {
   activeMenu.value = index
   const item = menuItems.find(i => i.index === index)
   if (item) currentComponent.value = item.component

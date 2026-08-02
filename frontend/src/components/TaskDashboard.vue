@@ -1,5 +1,6 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import type { Component } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -7,6 +8,64 @@ import {
   RefreshLeft, View, Loading, WarningFilled, InfoFilled,
   Document, Delete, Close, ArrowDown, ArrowUp
 } from '@element-plus/icons-vue'
+
+// ==================== 类型定义 ====================
+interface TaskStats {
+  total: number
+  completed: number
+  failed: number
+  waiting: number
+  init: number
+}
+
+interface TaskItem {
+  id: number
+  tmdb_id: number
+  title: string
+  task_type: string
+  status: string
+  retry_count: number
+  error_message: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+interface TaskLog {
+  id: number
+  task_id: number
+  tmdb_id: number
+  title: string
+  action_type: string
+  target_name: string
+  target_path: string | null
+  reason: string | null
+  detail: Record<string, unknown> | null
+  created_at: string | null
+}
+
+interface SeasonInfo {
+  season: number
+  organized_dir_name: string
+  organized_path: string
+  organized_file_count: number
+  expected_file_count: number
+  media_path: string
+  media_file_count: number
+}
+
+interface TimelineConfig {
+  color: string
+  label: string
+}
+
+interface ApiError {
+  response?: {
+    data?: {
+      detail?: string
+    }
+  }
+  message?: string
+}
 
 // ==================== API 层 ====================
 const API_URL = ''
@@ -16,8 +75,8 @@ const fetchStats = async () => {
   return res.data
 }
 
-const fetchTasks = async (page, pageSize, statusFilterArr) => {
-  const params = { page, page_size: pageSize }
+const fetchTasks = async (page: number, pageSize: number, statusFilterArr: string[]) => {
+  const params: Record<string, number | string> = { page, page_size: pageSize }
   if (statusFilterArr && statusFilterArr.length > 0) {
     params.status = statusFilterArr.join(',')
   }
@@ -25,24 +84,24 @@ const fetchTasks = async (page, pageSize, statusFilterArr) => {
   return res.data
 }
 
-const fetchTaskLogs = async (taskId) => {
+const fetchTaskLogs = async (taskId: number) => {
   const res = await axios.get(`${API_URL}/api/tasks/${taskId}/logs`)
   return res.data
 }
 
-const fetchDeleteTask = async (taskId) => {
+const fetchDeleteTask = async (taskId: number) => {
   const res = await axios.delete(`${API_URL}/api/tasks/${taskId}`)
   return res.data
 }
 
-const fetchBatchDelete = async (taskIds) => {
+const fetchBatchDelete = async (taskIds: number[]) => {
   const res = await axios.post(`${API_URL}/api/tasks/batch-delete`, {
     task_ids: taskIds
   })
   return res.data
 }
 
-const fetchForceMoveSeason = async (taskId, season) => {
+const fetchForceMoveSeason = async (taskId: number, season: number) => {
   const res = await axios.post(`${API_URL}/api/tasks/${taskId}/force-move-season`, {
     season: season
   })
@@ -50,26 +109,26 @@ const fetchForceMoveSeason = async (taskId, season) => {
 }
 
 // ==================== 状态 ====================
-const stats = ref({ total: 0, completed: 0, failed: 0, waiting: 0, init: 0 })
-const tasks = ref([])
+const stats = ref<TaskStats>({ total: 0, completed: 0, failed: 0, waiting: 0, init: 0 })
+const tasks = ref<TaskItem[]>([])
 const totalTasks = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(20)
-const statusFilter = ref([])
+const statusFilter = ref<string[]>([])
 const tableLoading = ref(false)
 const statsLoading = ref(false)
 
 // 多选
-const selectedRows = ref([])
+const selectedRows = ref<TaskItem[]>([])
 
 // 时间线抽屉
 const drawerVisible = ref(false)
 const drawerTitle = ref('')
 const timelineLoading = ref(false)
-const timelineLogs = ref([])
-const currentTaskId = ref(null)
-const skippedIncompleteSeasons = ref([])
-const forceMovingSeason = ref(null)  // 正在执行强制移动的 season number
+const timelineLogs = ref<TaskLog[]>([])
+const currentTaskId = ref<number | null>(null)
+const skippedIncompleteSeasons = ref<SeasonInfo[]>([])
+const forceMovingSeason = ref<number | null>(null)  // 正在执行强制移动的 season number
 
 // ==================== 状态色 → Tailwind 令牌映射 ====================
 const cardTones = {
@@ -142,7 +201,7 @@ const loadTasks = async () => {
 }
 
 // ==================== 时间线抽屉 ====================
-const openTimeline = async (task) => {
+const openTimeline = async (task: TaskItem) => {
   currentTaskId.value = task.id
   drawerTitle.value = `${task.title} — 操作时间线`
   drawerVisible.value = true
@@ -164,18 +223,18 @@ const closeDrawer = () => {
 }
 
 // ESC 关闭 + 打开时锁定背景滚动
-const handleKeydown = (e) => {
+const handleKeydown = (e: KeyboardEvent) => {
   if (e.key === 'Escape' && drawerVisible.value) closeDrawer()
 }
 
 watch(drawerVisible, (v) => {
-  const scroller = document.querySelector('.app-main')
+  const scroller = document.querySelector<HTMLElement>('.app-main')
   if (scroller) scroller.style.overflow = v ? 'hidden' : ''
   else document.body.style.overflow = v ? 'hidden' : ''
 })
 
 // ==================== 删除任务 ====================
-const handleDelete = async (task) => {
+const handleDelete = async (task: TaskItem) => {
   try {
     await ElMessageBox.confirm(
       `确定要删除「${task.title}」(TMDB:${task.tmdb_id}) 的任务记录吗？关联的操作日志将一并删除，此操作不可撤销。`,
@@ -194,18 +253,18 @@ const handleDelete = async (task) => {
 }
 
 // ==================== 自定义多选 ====================
-const isSelected = (id) => selectedRows.value.some(r => r.id === id)
+const isSelected = (id: number) => selectedRows.value.some(r => r.id === id)
 
 const isAllSelected = computed(() => tasks.value.length > 0 && selectedRows.value.length === tasks.value.length)
 
 const isIndeterminate = computed(() => selectedRows.value.length > 0 && selectedRows.value.length < tasks.value.length)
 
-const toggleSelectAll = (e) => {
-  if (e.target.checked) selectedRows.value = tasks.value.slice()
+const toggleSelectAll = (e: Event) => {
+  if ((e.target as HTMLInputElement).checked) selectedRows.value = tasks.value.slice()
   else selectedRows.value = []
 }
 
-const toggleRowSelect = (row) => {
+const toggleRowSelect = (row: TaskItem) => {
   const idx = selectedRows.value.findIndex(r => r.id === row.id)
   if (idx > -1) selectedRows.value.splice(idx, 1)
   else selectedRows.value.push(row)
@@ -233,7 +292,7 @@ const handleBatchDelete = async () => {
 }
 
 // ==================== 强制移动 ====================
-const handleForceMove = async (seasonInfo) => {
+const handleForceMove = async (seasonInfo: SeasonInfo) => {
   if (!currentTaskId.value) return
   const sn = seasonInfo.season
   try {
@@ -257,7 +316,8 @@ const handleForceMove = async (seasonInfo) => {
     skippedIncompleteSeasons.value = data.skipped_incomplete_seasons || []
   } catch (e) {
     if (e !== 'cancel' && e !== 'close') {
-      const msg = e?.response?.data?.detail || e?.message || '强制移动失败'
+      const err = e as ApiError
+      const msg = err?.response?.data?.detail || err?.message || '强制移动失败'
       ElMessage.error(msg)
     }
   } finally {
@@ -266,8 +326,8 @@ const handleForceMove = async (seasonInfo) => {
 }
 
 // ==================== 状态药丸（Tailwind 令牌） ====================
-const getStatusLabel = (status) => {
-  const map = {
+const getStatusLabel = (status: string) => {
+  const map: Record<string, string> = {
     INIT: '初始化',
     COMPLETED: '已完成',
     WAITING_FOR_DELETE_WEBHOOK: '等待回调',
@@ -276,8 +336,8 @@ const getStatusLabel = (status) => {
   return map[status] || status
 }
 
-const getStatusClass = (status) => {
-  const map = {
+const getStatusClass = (status: string) => {
+  const map: Record<string, string> = {
     INIT: 'bg-electric/10 text-electric border-electric/25 shadow-[0_0_10px_rgba(59,130,246,0.12)]',
     COMPLETED: 'bg-neon/10 text-neon border-neon/25 shadow-[0_0_10px_rgba(16,185,129,0.12)]',
     WAITING_FOR_DELETE_WEBHOOK: 'bg-warn/10 text-warn border-warn/25 shadow-[0_0_10px_rgba(245,158,11,0.12)]',
@@ -287,8 +347,8 @@ const getStatusClass = (status) => {
 }
 
 // ==================== 时间线节点配置 ====================
-const getTimelineConfig = (actionType) => {
-  const configs = {
+const getTimelineConfig = (actionType: string) => {
+  const configs: Record<string, TimelineConfig> = {
     DELETE_TORRENT:  { color: '#ef4444', label: '删除种子' },
     DELETE_MEDIA:    { color: '#f97316', label: '清理媒体库' },
     DELETE_ORGANIZED:{ color: '#f97316', label: '清理已完结' },
@@ -301,8 +361,8 @@ const getTimelineConfig = (actionType) => {
   return configs[actionType] || { color: '#94a3b8', label: actionType }
 }
 
-const getTimelineIcon = (actionType) => {
-  const icons = {
+const getTimelineIcon = (actionType: string) => {
+  const icons: Record<string, Component> = {
     DELETE_TORRENT: Delete,
     DELETE_MEDIA: WarningFilled,
     DELETE_ORGANIZED: WarningFilled,
@@ -316,7 +376,7 @@ const getTimelineIcon = (actionType) => {
 }
 
 // hex (#3b82f6) → rgba(59,130,246,a)
-const hexToRgba = (hex, alpha) => {
+const hexToRgba = (hex: string, alpha: number) => {
   const h = hex.replace('#', '')
   const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h
   const n = parseInt(full, 16)
@@ -324,7 +384,7 @@ const hexToRgba = (hex, alpha) => {
 }
 
 // 预计算时间线节点的全部发光变量
-const logCfg = (log) => {
+const logCfg = (log: TaskLog) => {
   const cfg = getTimelineConfig(log.action_type)
   const color = cfg.color
   return {
@@ -339,22 +399,22 @@ const logCfg = (log) => {
 
 const timelineNodes = computed(() => timelineLogs.value.map(log => ({ log, cfg: logCfg(log) })))
 
-const formatTime = (isoStr) => {
+const formatTime = (isoStr: string | null | undefined) => {
   if (!isoStr) return '-'
   const d = new Date(isoStr)
-  const pad = (n) => String(n).padStart(2, '0')
+  const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
 // ==================== JSON 详情格式化 ====================
-const formatDetailJson = (detail) => {
+const formatDetailJson = (detail: Record<string, unknown> | null | undefined) => {
   if (!detail || (typeof detail === 'object' && Object.keys(detail).length === 0)) return null
   return JSON.stringify(detail, null, 2)
 }
 
 // 切换折叠 panel
-const expandedDetails = ref({})
-const toggleDetail = (logId) => {
+const expandedDetails = ref<Record<number, boolean>>({})
+const toggleDetail = (logId: number) => {
   expandedDetails.value[logId] = !expandedDetails.value[logId]
 }
 
@@ -367,7 +427,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
-  const scroller = document.querySelector('.app-main')
+  const scroller = document.querySelector<HTMLElement>('.app-main')
   if (scroller) scroller.style.overflow = ''
 })
 
@@ -376,12 +436,12 @@ watch(statusFilter, () => {
   loadTasks()
 })
 
-const handlePageChange = (page) => {
+const handlePageChange = (page: number) => {
   currentPage.value = page
   loadTasks()
 }
 
-const handleSizeChange = (size) => {
+const handleSizeChange = (size: number) => {
   pageSize.value = size
   currentPage.value = 1
   loadTasks()

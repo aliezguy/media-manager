@@ -1,55 +1,112 @@
-<script setup>
+<script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Plus, Refresh, Delete, View, Edit, Timer, VideoPlay,
-  Clock, CircleCheck, CircleClose, InfoFilled, WarningFilled,
-  SuccessFilled, RemoveFilled, Document, Setting, Brush, DataAnalysis,
+  Clock, CircleClose, InfoFilled,
+  SuccessFilled, Document, Setting, Brush, DataAnalysis,
 } from '@element-plus/icons-vue'
 
 // ==================== API 层 ====================
 const API_URL = ''
+
+// ==================== 类型定义 ====================
+interface ApiError {
+  response?: {
+    data?: {
+      detail?: string
+    }
+  }
+  message?: string
+}
+
+interface ScheduledTask {
+  id: number
+  directory_path: string
+  cron_expression: string
+  is_active: boolean
+  last_run_at: string | null
+  created_at: string
+}
+
+interface TaskForm {
+  directory_path: string
+  cron_expression: string
+  is_active: boolean
+}
+
+type LogStatus = 'SUCCESS' | 'FAILED' | 'RUNNING'
+type TriggerType = 'CRON' | 'MANUAL'
+
+interface LogDetailItem {
+  success: boolean
+  dir_name: string
+  stage?: string
+  message?: string
+}
+
+interface LogDetails {
+  errors?: number
+  items?: LogDetailItem[]
+}
+
+interface TaskLog {
+  id: number
+  status: LogStatus
+  trigger_type: TriggerType
+  created_at: string
+  scanned_count: number
+  processed_count: number
+  details?: LogDetails
+}
+
+interface Library {
+  ItemId: string
+  Name: string
+}
+
+type JobKey = 'localization_job' | 'audit_job'
 
 const fetchTasks = async () => {
   const res = await axios.get(`${API_URL}/api/scheduled-tasks`)
   return res.data
 }
 
-const fetchCreateTask = async (data) => {
+const fetchCreateTask = async (data: TaskForm) => {
   const res = await axios.post(`${API_URL}/api/scheduled-tasks`, data)
   return res.data
 }
 
-const fetchUpdateTask = async (id, data) => {
+const fetchUpdateTask = async (id: number, data: Partial<TaskForm>) => {
   const res = await axios.put(`${API_URL}/api/scheduled-tasks/${id}`, data)
   return res.data
 }
 
-const fetchDeleteTask = async (id) => {
+const fetchDeleteTask = async (id: number) => {
   const res = await axios.delete(`${API_URL}/api/scheduled-tasks/${id}`)
   return res.data
 }
 
-const fetchRunTask = async (id) => {
+const fetchRunTask = async (id: number) => {
   const res = await axios.post(`${API_URL}/api/scheduled-tasks/${id}/run`)
   return res.data
 }
 
-const fetchTaskLogs = async (id, limit = 50) => {
+const fetchTaskLogs = async (id: number, limit = 50) => {
   const res = await axios.get(`${API_URL}/api/scheduled-tasks/${id}/logs`, { params: { limit } })
   return res.data
 }
 
 // ==================== 状态 ====================
-const tasks = ref([])
+const tasks = ref<ScheduledTask[]>([])
 const tableLoading = ref(false)
 
 // 表单弹窗
 const dialogVisible = ref(false)
 const dialogTitle = ref('新建定时任务')
 const isEditing = ref(false)
-const editingTaskId = ref(null)
+const editingTaskId = ref<number | null>(null)
 const formLoading = ref(false)
 const form = ref({
   directory_path: '',
@@ -61,11 +118,11 @@ const form = ref({
 const logDrawerVisible = ref(false)
 const logDrawerTitle = ref('')
 const logLoading = ref(false)
-const logs = ref([])
-const currentLogTaskId = ref(null)
+const logs = ref<TaskLog[]>([])
+const currentLogTaskId = ref<number | null>(null)
 
 // 日志详情展开
-const expandedLogIds = ref({})
+const expandedLogIds = ref<Record<number, boolean>>({})
 
 // ==================== 数据加载 ====================
 const loadTasks = async () => {
@@ -97,7 +154,7 @@ const openCreateDialog = () => {
   dialogVisible.value = true
 }
 
-const openEditDialog = (task) => {
+const openEditDialog = (task: ScheduledTask) => {
   resetForm()
   dialogTitle.value = '编辑定时任务'
   isEditing.value = true
@@ -123,7 +180,7 @@ const handleFormSubmit = async () => {
   formLoading.value = true
   try {
     if (isEditing.value) {
-      await fetchUpdateTask(editingTaskId.value, form.value)
+      await fetchUpdateTask(editingTaskId.value!, form.value)
       ElMessage.success('任务已更新')
     } else {
       await fetchCreateTask(form.value)
@@ -132,7 +189,7 @@ const handleFormSubmit = async () => {
     dialogVisible.value = false
     loadTasks()
   } catch (e) {
-    const detail = e.response?.data?.detail || '操作失败'
+    const detail = (e as ApiError).response?.data?.detail || '操作失败'
     ElMessage.error(typeof detail === 'string' ? detail : '操作失败')
   } finally {
     formLoading.value = false
@@ -140,7 +197,7 @@ const handleFormSubmit = async () => {
 }
 
 // ==================== 任务操作 ====================
-const handleRun = async (task) => {
+const handleRun = async (task: ScheduledTask) => {
   try {
     await ElMessageBox.confirm(
       `确定要手动触发「${task.directory_path}」的扫描吗？`,
@@ -157,7 +214,7 @@ const handleRun = async (task) => {
   }
 }
 
-const handleDelete = async (task) => {
+const handleDelete = async (task: ScheduledTask) => {
   try {
     await ElMessageBox.confirm(
       `确定要删除「${task.directory_path}」的定时任务吗？关联的扫描日志将一并删除，此操作不可撤销。`,
@@ -175,7 +232,7 @@ const handleDelete = async (task) => {
 }
 
 // ==================== 开关切换 ====================
-const handleSwitchChange = async (task, value) => {
+const handleSwitchChange = async (task: ScheduledTask, value: boolean) => {
   try {
     await fetchUpdateTask(task.id, { is_active: value })
     task.is_active = value
@@ -188,7 +245,7 @@ const handleSwitchChange = async (task, value) => {
 }
 
 // ==================== 日志抽屉 ====================
-const openLogDrawer = async (task) => {
+const openLogDrawer = async (task: ScheduledTask) => {
   currentLogTaskId.value = task.id
   logDrawerTitle.value = `${task.directory_path} — 扫描日志`
   logDrawerVisible.value = true
@@ -204,39 +261,34 @@ const openLogDrawer = async (task) => {
   }
 }
 
-const toggleLogDetail = (logId) => {
+const toggleLogDetail = (logId: number) => {
   expandedLogIds.value[logId] = !expandedLogIds.value[logId]
 }
 
 // ==================== 格式化 ====================
-const formatTime = (isoStr) => {
+const formatTime = (isoStr: string | null | undefined) => {
   if (!isoStr) return '-'
   const d = new Date(isoStr)
-  const pad = (n) => String(n).padStart(2, '0')
+  const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-const getTriggerTypeLabel = (type) => {
-  const map = { CRON: '定时触发', MANUAL: '手动触发' }
+const getTriggerTypeLabel = (type: TriggerType) => {
+  const map: Record<TriggerType, string> = { CRON: '定时触发', MANUAL: '手动触发' }
   return map[type] || type
 }
 
-const getTriggerTypeColor = (type) => {
+const getTriggerTypeColor = (type: TriggerType) => {
   return type === 'CRON' ? '#3b82f6' : '#8b5cf6'
 }
 
-const getLogStatusType = (status) => {
-  const map = { SUCCESS: 'success', FAILED: 'danger', RUNNING: 'warning' }
-  return map[status] || 'info'
-}
-
-const getLogStatusIcon = (status) => {
+const getLogStatusIcon = (status: LogStatus) => {
   if (status === 'SUCCESS') return SuccessFilled
   if (status === 'FAILED') return CircleClose
   return Clock
 }
 
-const formatDetailJson = (detail) => {
+const formatDetailJson = (detail: LogDetails | null | undefined) => {
   if (!detail || (typeof detail === 'object' && Object.keys(detail).length === 0)) return null
   // 截断 items 数组，只展示摘要
   const d = JSON.parse(JSON.stringify(detail))
@@ -248,7 +300,7 @@ const formatDetailJson = (detail) => {
 
 // ==================== 汉化与审计定时任务 ====================
 const activeTab = ref('scan')
-const libraries = ref([])
+const libraries = ref<Library[]>([])
 
 const localizationForm = reactive({
   library_ids: [], cron_expression: '0 3 * * *', is_active: false,
@@ -264,9 +316,9 @@ const saving = reactive({ localization_job: false, audit_job: false })
 const running = reactive({ localization_job: false, audit_job: false })
 
 // 友好预设 → Cron 表达式映射
-const PRESETS = { daily: '0 3 * * *', weekly: '0 3 * * 1' }
+const PRESETS: Record<string, string> = { daily: '0 3 * * *', weekly: '0 3 * * 1' }
 
-const getJobForm = (key) => (key === 'localization_job' ? localizationForm : auditForm)
+const getJobForm = (key: JobKey) => (key === 'localization_job' ? localizationForm : auditForm)
 
 const fetchJobConfigs = async () => {
   try {
@@ -286,7 +338,7 @@ const fetchJobConfigs = async () => {
   }
 }
 
-const saveJob = async (key) => {
+const saveJob = async (key: JobKey) => {
   const form = getJobForm(key)
   if (!form.library_ids || form.library_ids.length === 0) {
     ElMessage.warning('请先选择至少一个媒体库')
@@ -304,29 +356,29 @@ const saveJob = async (key) => {
     Object.assign(form, res.data[key] || {})
     ElMessage.success('配置已保存，将按所选媒体库逐个串行执行')
   } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '保存失败')
+    ElMessage.error((e as ApiError).response?.data?.detail || '保存失败')
   } finally {
     saving[key] = false
   }
 }
 
-const runJob = async (key) => {
+const runJob = async (key: JobKey) => {
   running[key] = true
   try {
     await axios.post(`${API_URL}/api/jobs/${key}/run`)
     ElMessage.success('任务已触发，可在大盘查看进度')
   } catch (e) {
-    ElMessage.error(e.response?.data?.detail || '触发失败')
+    ElMessage.error((e as ApiError).response?.data?.detail || '触发失败')
   } finally {
     running[key] = false
   }
 }
 
-const toggleActive = (key) => {
+const toggleActive = (key: JobKey) => {
   saveJob(key)
 }
 
-const applyPreset = (key, preset) => {
+const applyPreset = (key: JobKey, preset: string) => {
   const form = getJobForm(key)
   if (PRESETS[preset]) form.cron_expression = PRESETS[preset]
 }
@@ -426,7 +478,7 @@ onMounted(() => {
                 <el-switch
                   :model-value="task.is_active"
                   size="small"
-                  @change="(val) => handleSwitchChange(task, val)"
+                  @change="(val: boolean) => handleSwitchChange(task, val)"
                 />
               </div>
 
@@ -501,7 +553,7 @@ onMounted(() => {
                 <el-form-item label="执行周期">
                   <el-radio-group
                     v-model="localizationPreset"
-                    @change="(v) => applyPreset('localization_job', v)"
+                    @change="(v: string) => applyPreset('localization_job', v)"
                   >
                     <el-radio-button value="daily">每天</el-radio-button>
                     <el-radio-button value="weekly">每周一</el-radio-button>
@@ -586,7 +638,7 @@ onMounted(() => {
                 <el-form-item label="执行周期">
                   <el-radio-group
                     v-model="auditPreset"
-                    @change="(v) => applyPreset('audit_job', v)"
+                    @change="(v: string) => applyPreset('audit_job', v)"
                   >
                     <el-radio-button value="daily">每天</el-radio-button>
                     <el-radio-button value="weekly">每周一</el-radio-button>

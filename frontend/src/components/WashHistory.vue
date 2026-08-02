@@ -1,13 +1,41 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { History, RefreshCw, Trash2, Clock, ChevronLeft, ChevronRight } from 'lucide-vue-next'
 
+// 站点选项（/api/resources 的 sites 返回项）
+interface SiteOption {
+  id: string | number
+  name: string
+}
+
+// 洗版执行参数（wash_params，字段均可选）
+interface WashParams {
+  scheme?: string
+  filter_groups?: string[]
+  downloader?: string
+  quality?: string
+  sites?: Array<string | number>
+}
+
+// 订阅任务历史记录（/api/history 返回项）
+interface WashHistoryItem {
+  id: number
+  name: string
+  season?: number
+  tmdb_id?: number
+  status: string
+  wash_type: string
+  created_at: string
+  wash_params?: WashParams
+  message?: string
+}
+
 const API_URL = ''
-const historyData = ref([])
+const historyData = ref<WashHistoryItem[]>([])
 const loading = ref(false)
-const siteOptions = ref([])
+const siteOptions = ref<SiteOption[]>([])
 
 // ==================== 客户端分页（纯 UI，不改变后端数据结构） ====================
 const pageSize = 20
@@ -56,7 +84,7 @@ const clearHistory = async () => {
   } catch {}
 }
 
-const formatDate = (dateStr) => {
+const formatDate = (dateStr: string) => {
   const d = new Date(dateStr)
   return d.toLocaleString()
 }
@@ -72,7 +100,7 @@ const fetchResources = async () => {
   }
 }
 
-const formatSiteNames = (siteIds) => {
+const formatSiteNames = (siteIds: Array<string | number>) => {
   if (!siteIds || !Array.isArray(siteIds) || siteIds.length === 0) return ''
   const names = siteIds.map(id => {
     const found = siteOptions.value.find(s => String(s.id) === String(id))

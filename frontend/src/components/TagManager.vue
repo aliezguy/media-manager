@@ -1,27 +1,58 @@
-<script setup>
+<script setup lang="ts">
 import { ref, reactive, onMounted, computed } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Search, VideoPlay, MagicStick, Check, Close, Plus, Filter, Download, Calendar, Loading } from '@element-plus/icons-vue'
+import { Search, VideoPlay, MagicStick, Check, Filter, Download, Calendar, Loading } from '@element-plus/icons-vue'
 
 const API_URL = ''
 
-const config = reactive({})
+// === 类型定义 ===
+interface Config {
+  emby_api_key?: string
+}
+
+interface Library {
+  Id: string
+  Name: string
+}
+
+interface LibraryItem {
+  id: number
+  name: string
+  year?: number
+  current_tags?: string[]
+}
+
+interface TagItem {
+  id: number
+  name: string
+  year?: number
+  current_tags?: string[]
+  suggested_tags: string[]
+  editing_tags: string[]
+  inputVisible: boolean
+  inputValue: string
+  analyzing: boolean
+  saving: boolean
+  status: string
+}
+
+const config = reactive<Config>({})
 const loading = ref(false)
-const libraries = ref([])
+const libraries = ref<Library[]>([])
 const selectedLib = ref('')
 const searchTerm = ref('')
-const tableData = ref([])
+const tableData = ref<TagItem[]>([])
 
 // 筛选与分页
 const filterStatus = ref('all')
 const filterTag = ref('')
-const filterYear = ref('')
+const filterYear = ref<string | number>('')
 const currentPage = ref(1)
 const pageSize = ref(50)
 
 // 批量状态
-const multipleSelection = ref([])
+const multipleSelection = ref<TagItem[]>([])
 const isBatchRunning = ref(false)
 const currentBatchAction = ref('')
 const batchProgress = reactive({ total: 0, finished: 0, success: 0, fail: 0 })
@@ -36,7 +67,7 @@ onMounted(async () => {
 
 // === 计算属性 ===
 const uniqueTags = computed(() => {
-  const tags = new Set()
+  const tags = new Set<string>()
   tableData.value.forEach(item => {
     if (item.current_tags) item.current_tags.forEach(t => tags.add(t))
     if (item.suggested_tags) item.suggested_tags.forEach(t => tags.add(t))
@@ -45,7 +76,7 @@ const uniqueTags = computed(() => {
 })
 
 const uniqueYears = computed(() => {
-  const years = new Set()
+  const years = new Set<number>()
   tableData.value.forEach(item => { if (item.year) years.add(item.year) })
   return Array.from(years).sort((a, b) => b - a)
 })
@@ -66,7 +97,7 @@ const pagedTableData = computed(() => {
 })
 
 // === 选择逻辑 ===
-const toggleSelect = (row) => {
+const toggleSelect = (row: TagItem) => {
   if (isBatchRunning.value) return
   const idx = multipleSelection.value.findIndex(i => i.id === row.id)
   if (idx === -1) {
@@ -76,20 +107,20 @@ const toggleSelect = (row) => {
   }
 }
 
-const isSelected = (row) => {
+const isSelected = (row: TagItem) => {
   return multipleSelection.value.some(i => i.id === row.id)
 }
 
 // === 方法 ===
-const connectEmby = async (silent=false) => {
+const connectEmby = async (silent: boolean = false) => {
   try {
     const res = await axios.post(`${API_URL}/api/libraries`, config)
     libraries.value = res.data
     if(!silent) ElMessage.success('已连接 Emby')
-  } catch (e) { if(!silent) ElMessage.error('连接失败: ' + e.message) }
+  } catch (e) { if(!silent) ElMessage.error('连接失败: ' + (e instanceof Error ? e.message : String(e))) }
 }
 
-const loadItems = async (loadAll) => {
+const loadItems = async (loadAll: boolean) => {
   if(!selectedLib.value) return ElMessage.warning('请先选择媒体库')
   loading.value = true; tableData.value = []
   currentPage.value = 1; multipleSelection.value = []
@@ -99,7 +130,7 @@ const loadItems = async (loadAll) => {
     })
     processData(res.data.items)
     ElMessage.success(`已加载 ${res.data.items.length} 条数据`)
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) { ElMessage.error(e instanceof Error ? e.message : String(e)) }
   finally { loading.value = false }
 }
 
@@ -110,30 +141,30 @@ const searchItems = async () => {
     const res = await axios.post(`${API_URL}/api/search_items`, { ...config, search_term: searchTerm.value })
     processData(res.data.items)
     if(res.data.items.length === 0) ElMessage.info('未找到相关内容')
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) { ElMessage.error(e instanceof Error ? e.message : String(e)) }
   finally { loading.value = false }
 }
 
-const processData = (items) => {
+const processData = (items: LibraryItem[]) => {
   tableData.value = items.map(item => ({
     ...item,
     editing_tags: [...(item.current_tags || [])],
-    suggested_tags: [],
+    suggested_tags: [] as string[],
     inputVisible: false, inputValue: '',
     analyzing: false, saving: false, status: ''
   }))
 }
 
 // 标签与AI逻辑
-const removeTag = (row, tag) => { row.editing_tags = row.editing_tags.filter(t => t !== tag) }
-const addTagInput = (row) => {
+const removeTag = (row: TagItem, tag: string) => { row.editing_tags = row.editing_tags.filter(t => t !== tag) }
+const addTagInput = (row: TagItem) => {
   if (row.inputValue && !row.editing_tags.includes(row.inputValue)) row.editing_tags.push(row.inputValue)
   row.inputVisible = false; row.inputValue = ''
 }
-const acceptAiTag = (row, tag) => { if (!row.editing_tags.includes(tag)) row.editing_tags.push(tag) }
-const acceptAllAi = (row) => { if(row.suggested_tags) row.suggested_tags.forEach(t => acceptAiTag(row, t)) }
+const acceptAiTag = (row: TagItem, tag: string) => { if (!row.editing_tags.includes(tag)) row.editing_tags.push(tag) }
+const acceptAllAi = (row: TagItem) => { if(row.suggested_tags) row.suggested_tags.forEach(t => acceptAiTag(row, t)) }
 
-const generateAI = async (row, force = false) => {
+const generateAI = async (row: TagItem, force = false) => {
   row.analyzing = true
   try {
     const res = await axios.post(`${API_URL}/api/ai_single`, { ...config, item_id: row.id, force_refresh: force })
@@ -142,7 +173,7 @@ const generateAI = async (row, force = false) => {
   } catch (e) { row.status = '❌失败' } finally { row.analyzing = false }
 }
 
-const saveTags = async (row) => {
+const saveTags = async (row: TagItem) => {
   row.saving = true
   try {
     const res = await axios.post(`${API_URL}/api/save_tags`, {
@@ -153,15 +184,15 @@ const saveTags = async (row) => {
 }
 
 // 批量逻辑
-const chunkArray = (arr, size) => Array.from({ length: Math.ceil(arr.length / size) }, (v, i) => arr.slice(i * size, i * size + size))
+const chunkArray = (arr: TagItem[], size: number) => Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, i * size + size))
 
-const runBatchQueue = async (tasks, taskFn, maxConcurrent, actionName) => {
+const runBatchQueue = async (tasks: TagItem[][], taskFn: (chunk: TagItem[]) => Promise<number>, maxConcurrent: number, actionName: string) => {
   isBatchRunning.value = true; currentBatchAction.value = actionName
   batchProgress.total = multipleSelection.value.length; batchProgress.finished = 0; batchProgress.success = 0; batchProgress.fail = 0
   const queue = [...tasks]
   const next = async () => {
     if (queue.length === 0) return
-    const chunk = queue.shift()
+    const chunk = queue.shift() as TagItem[]
     try { const c = await taskFn(chunk); batchProgress.success += c } catch { batchProgress.fail += chunk.length }
     finally { batchProgress.finished += chunk.length; if (isBatchRunning.value) await next() }
   }
@@ -174,7 +205,7 @@ const runBatchQueue = async (tasks, taskFn, maxConcurrent, actionName) => {
 const batchAnalyze = async () => {
   if (!multipleSelection.value.length) return ElMessage.warning('请先勾选')
   await ElMessageBox.confirm(`选中 ${multipleSelection.value.length} 部，开始 AI 分析？`, '提示', { confirmButtonText: '开始' })
-  const task = async (chunk) => {
+  const task = async (chunk: TagItem[]) => {
     const res = await axios.post(`${API_URL}/api/ai_batch`, { ...config, item_ids: chunk.map(i=>i.id) })
     chunk.forEach(r => { if(res.data.results[r.id]) { r.suggested_tags = res.data.results[r.id]; r.status = '✅批量' } })
     return chunk.length
@@ -185,7 +216,7 @@ const batchAnalyze = async () => {
 const batchSave = async () => {
   if (!multipleSelection.value.length) return ElMessage.warning('请先勾选')
   await ElMessageBox.confirm(`确定写入 ${multipleSelection.value.length} 部？`, '提示', { confirmButtonText: '写入' })
-  const task = async (row) => {
+  const task = async (row: TagItem) => {
     if (row.suggested_tags.length) acceptAllAi(row)
     await saveTags(row); return 1
   }

@@ -19,6 +19,28 @@ backend/emby_ai.db
 # 忽略数据目录
 backend/data/
 data/
+people
+actor_images
 
 # 忽略系统文件
 .DS_Storebackend/logs/
+.DS_Store
+.idea
+日志.xml
+docker_api_specs.md
+feature_log.md
+feature_scan_update.md
+feature_scheduler.md
+feature_season_checker.md
+frontend_feature.md
+.idea/emby-ai-manager.iml
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/inspectionProfiles/Project_Default.xml
+.vscode/launch.json
+backend/logs
+SESSION_HANDOFF copy.md
+SESSION_HANDOFF.md
+SESSION_HANDOFF.md

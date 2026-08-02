@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import {
   LayoutDashboard, CalendarClock, Download, Brush, Tags, Users,
   Library, FolderTree, Server, Settings, History,

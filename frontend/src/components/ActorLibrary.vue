@@ -1,17 +1,31 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { Search, Refresh, UserFilled, PictureFilled, MagicStick } from '@element-plus/icons-vue'
+import { Search, Refresh, PictureFilled, MagicStick } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 
+// 演员信息（后端 /api/actors 返回项）
+interface Actor {
+  name: string
+  local_image_path?: string
+  image_url?: string
+  tmdb_id?: number
+  douban_celebrity_id?: number | string
+  overview?: string
+  birth_date?: string
+  birth_place?: string
+  update_time?: string
+  source?: string
+}
+
 // ==================== 状态 ====================
-const actors = ref([])
+const actors = ref<Actor[]>([])
 const total = ref(0)
 const loading = ref(false)
 const searchQuery = ref('')
 const filterStatus = ref('')
 const currentPage = ref(1)
 const pageSize = ref(24)
-const refreshingActor = ref(null) // 正在刷新的演员名
+const refreshingActor = ref<string | null>(null) // 正在刷新的演员名
 
 // ==================== 批量修复状态 ====================
 const repairTaskId = ref('')
@@ -20,7 +34,7 @@ const repairDialogVisible = ref(false)
 const repairTaskPercent = ref(0)
 const repairTaskMessage = ref('')
 const repairTaskDone = ref(false)
-let _repairTimer = null
+let _repairTimer: ReturnType<typeof setInterval> | null = null
 
 // ==================== 筛选选项 ====================
 const filterOptions = [
@@ -37,8 +51,8 @@ const fetchActors = async () => {
   loading.value = true
   try {
     const params = new URLSearchParams()
-    params.set('page', currentPage.value)
-    params.set('page_size', pageSize.value)
+    params.set('page', String(currentPage.value))
+    params.set('page_size', String(pageSize.value))
     if (searchQuery.value.trim()) {
       params.set('search', searchQuery.value.trim())
     }
@@ -52,7 +66,7 @@ const fetchActors = async () => {
     actors.value = data.items || []
     total.value = data.total || 0
   } catch (e) {
-    ElMessage.error('获取演员列表失败: ' + e.message)
+    ElMessage.error('获取演员列表失败: ' + (e instanceof Error ? e.message : String(e)))
     actors.value = []
     total.value = 0
   } finally {
@@ -71,7 +85,7 @@ watch(currentPage, () => {
 })
 
 // ==================== 刷新单个演员 ====================
-const refreshActor = async (actorName) => {
+const refreshActor = async (actorName: string) => {
   if (refreshingActor.value) return // 防止重复点击
   refreshingActor.value = actorName
   try {
@@ -87,7 +101,7 @@ const refreshActor = async (actorName) => {
     // 刷新当前列表
     await fetchActors()
   } catch (e) {
-    ElMessage.error(`刷新失败: ${e.message}`)
+    ElMessage.error(`刷新失败: ${e instanceof Error ? e.message : String(e)}`)
   } finally {
     refreshingActor.value = null
   }
@@ -98,7 +112,7 @@ const stopRepairPolling = () => {
   if (_repairTimer) { clearInterval(_repairTimer); _repairTimer = null }
 }
 
-const startRepairPolling = (taskId) => {
+const startRepairPolling = (taskId: string) => {
   stopRepairPolling()
   repairTaskDone.value = false
   repairTaskPercent.value = 0
@@ -157,7 +171,7 @@ const handleRepairMissing = async () => {
     repairDialogVisible.value = true
     startRepairPolling(data.task_id)
   } catch (e) {
-    ElMessage.error(`启动批量修复失败: ${e.message}`)
+    ElMessage.error(`启动批量修复失败: ${e instanceof Error ? e.message : String(e)}`)
   } finally {
     repairing.value = false
   }
@@ -174,7 +188,7 @@ const FALLBACK_AVATAR = 'data:image/svg+xml,' + encodeURIComponent(
   '</svg>'
 )
 
-const getAvatarUrl = (actor) => {
+const getAvatarUrl = (actor: Actor) => {
   // L1: 本地图片 — 代理转发到 FastAPI /people 静态目录
   if (actor.local_image_path) {
     return `/people/${actor.local_image_path}`
@@ -187,19 +201,20 @@ const getAvatarUrl = (actor) => {
   return FALLBACK_AVATAR
 }
 
-const handleImageError = (e) => {
+const handleImageError = (e: Event) => {
   // 图片加载失败（404/跨域/超时）→ 静默降级为内联占位图
-  if (e.target.src !== FALLBACK_AVATAR) {
-    e.target.src = FALLBACK_AVATAR
+  const img = e.target as HTMLImageElement
+  if (img.src !== FALLBACK_AVATAR) {
+    img.src = FALLBACK_AVATAR
   }
 }
 
-const hasLocalImage = (actor) => {
+const hasLocalImage = (actor: Actor) => {
   return !!(actor.local_image_path && actor.local_image_path.trim() !== '')
 }
 
 // ==================== 格式化工具 ====================
-const formatDate = (isoString) => {
+const formatDate = (isoString: string) => {
   if (!isoString) return ''
   const d = new Date(isoString)
   const y = d.getFullYear()
@@ -208,7 +223,7 @@ const formatDate = (isoString) => {
   return `${y}-${m}-${day}`
 }
 
-const trimOverview = (text, maxLen = 120) => {
+const trimOverview = (text: string, maxLen = 120) => {
   if (!text) return ''
   return text.length > maxLen ? text.slice(0, maxLen) + '…' : text
 }

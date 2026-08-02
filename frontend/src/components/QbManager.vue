@@ -352,37 +352,86 @@
   </div>
 </template>
 
-<script setup>
+<script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   VideoPlay, Setting, Search, Close, Refresh, Check,
   Folder, View, Delete, DeleteFilled, Monitor,
   FolderOpened, Plus, Edit, Upload, Download, VideoPause,
-  Clock, WarningFilled, Loading, QuestionFilled, CircleCheck,
+  Clock, WarningFilled, Loading, QuestionFilled,
   Remove
 } from '@element-plus/icons-vue'
 import axios from 'axios'
 
+// ==================== Type Definitions ====================
+
+/** qBittorrent 实例配置 */
+interface QbConfig {
+  id: string
+  name: string
+  host: string
+  username: string
+  password?: string
+  active: boolean
+}
+
+/** qBittorrent 实例基础数据（标签/分类） */
+interface QbData {
+  id: string
+  name: string
+  tags: string[]
+  categories: string[]
+}
+
+/** 种子信息 */
+interface Torrent {
+  hash: string
+  name: string
+  size: number
+  progress: number
+  state: string
+  category: string
+  tags: string | string[]
+  added_on: number
+  completion_on: number
+  ratio: number
+  upspeed: number
+  dlspeed: number
+  save_path: string
+}
+
+/** 种子文件信息 */
+interface TorrentFile {
+  name: string
+  size: number
+  progress: number
+  priority: number
+  is_seed: boolean
+}
+
+/** 实例配置编辑表单（id 在编辑时才有） */
+type ConfigForm = Omit<QbConfig, 'id'> & { id?: string }
+
 // ==================== Reactive State ====================
 const activeTab = ref('torrents')
-const qbConfigs = ref([])
+const qbConfigs = ref<QbConfig[]>([])
 const loading = ref(false)
 const selectedQb = ref('')
-const torrents = ref([])
+const torrents = ref<Torrent[]>([])
 const torrentTotal = ref(0)
 const currentPage = ref(1)
 const pageSize = ref(50)
-const selectedHashes = ref([])
-const currentTags = ref([])
-const currentCategories = ref([])
+const selectedHashes = ref<string[]>([])
+const currentTags = ref<string[]>([])
+const currentCategories = ref<string[]>([])
 const filterTag = ref('')
 const filterCategory = ref('')
 const filterName = ref('')
 
 const dialogVisible = ref(false)
 const isEdit = ref(false)
-const currentConfig = ref({
+const currentConfig = ref<ConfigForm>({
   name: '',
   host: '',
   username: 'admin',
@@ -391,11 +440,11 @@ const currentConfig = ref({
 })
 
 const fileDialogVisible = ref(false)
-const fileList = ref([])
+const fileList = ref<TorrentFile[]>([])
 const filesLoading = ref(false)
 
 // ==================== State Mapping ====================
-const STATE_MAP = {
+const STATE_MAP: Record<string, string> = {
   'stalledUP': '做种中',
   'uploading': '上传中',
   'downloading': '下载中',
@@ -413,10 +462,10 @@ const STATE_MAP = {
   'unknown': '未知'
 }
 
-const formatState = (state) => STATE_MAP[state] || state
+const formatState = (state: string) => STATE_MAP[state] || state
 
 // State → icon
-const getStateIcon = (state) => {
+const getStateIcon = (state: string) => {
   if (['stalledUP', 'uploading'].includes(state)) return Upload
   if (['downloading', 'metaDL'].includes(state)) return Download
   if (['error', 'missingFiles'].includes(state)) return WarningFilled
@@ -428,7 +477,7 @@ const getStateIcon = (state) => {
 }
 
 // State → accent color
-const getStateColor = (state) => {
+const getStateColor = (state: string) => {
   if (['stalledUP', 'uploading'].includes(state)) return '#10b981'
   if (['downloading', 'metaDL'].includes(state)) return '#3b82f6'
   if (['error', 'missingFiles'].includes(state)) return '#ef4444'
@@ -440,7 +489,7 @@ const getStateColor = (state) => {
 }
 
 // State → icon circle background (with alpha)
-const getStateBg = (state) => {
+const getStateBg = (state: string) => {
   const color = getStateColor(state)
   // Convert hex to rgba with 0.15 alpha
   const r = parseInt(color.slice(1, 3), 16)
@@ -449,26 +498,15 @@ const getStateBg = (state) => {
   return `rgba(${r}, ${g}, ${b}, 0.18)`
 }
 
-// Progress bar color
-const getProgressColor = (state) => {
-  if (['stalledUP', 'uploading'].includes(state)) return 'linear-gradient(90deg, #10b981, #34d399)'
-  if (['downloading', 'metaDL'].includes(state)) return 'linear-gradient(90deg, #3b82f6, #60a5fa)'
-  if (['error', 'missingFiles'].includes(state)) return 'linear-gradient(90deg, #ef4444, #f87171)'
-  if (['pausedDL', 'pausedUP'].includes(state)) return 'linear-gradient(90deg, #f59e0b, #fbbf24)'
-  if (['queuedDL', 'queuedUP'].includes(state)) return 'linear-gradient(90deg, #f97316, #fb923c)'
-  if (['checkingUP', 'checkingDL'].includes(state)) return 'linear-gradient(90deg, #8b5cf6, #a78bfa)'
-  return 'linear-gradient(90deg, #64748b, #94a3b8)'
-}
-
 // Parse tags string to array
-const parseTags = (tags) => {
+const parseTags = (tags: string | string[]): string[] => {
   if (!tags) return []
   if (Array.isArray(tags)) return tags
   return tags.split(',').map(t => t.trim()).filter(Boolean)
 }
 
 // ==================== Selection ====================
-const toggleSelect = (hash) => {
+const toggleSelect = (hash: string) => {
   const idx = selectedHashes.value.indexOf(hash)
   if (idx === -1) {
     selectedHashes.value.push(hash)
@@ -486,12 +524,12 @@ const clearSelect = () => {
 }
 
 // ==================== File Viewer ====================
-const viewFiles = async (row) => {
+const viewFiles = async (row: Torrent) => {
   fileList.value = []
   fileDialogVisible.value = true
   filesLoading.value = true
   try {
-    const res = await axios.get(`/api/qb/${selectedQb.value}/torrents/${row.hash}/files`)
+    const res = await axios.get<TorrentFile[]>(`/api/qb/${selectedQb.value}/torrents/${row.hash}/files`)
     fileList.value = res.data
   } catch (err) {
     ElMessage.error('获取文件列表失败')
@@ -506,7 +544,7 @@ const isMobile = () => window.innerWidth < 768
 // ==================== Data Fetching ====================
 const fetchConfigs = async (autoLoad = false) => {
   try {
-    const res = await axios.get('/api/qb/configs')
+    const res = await axios.get<QbConfig[]>('/api/qb/configs')
     qbConfigs.value = res.data
     if (autoLoad && qbConfigs.value.length && !selectedQb.value) {
       selectedQb.value = qbConfigs.value[0].id
@@ -520,7 +558,7 @@ const fetchConfigs = async (autoLoad = false) => {
 const fetchQbData = async () => {
   if (!selectedQb.value) return
   try {
-    const res = await axios.get('/api/qb/data')
+    const res = await axios.get<QbData[]>('/api/qb/data')
     const data = res.data.find(d => d.id === selectedQb.value)
     if (data) {
       currentTags.value = data.tags
@@ -536,7 +574,7 @@ const fetchTorrents = async () => {
   if (!selectedQb.value) return
   loading.value = true
   try {
-    const params = {
+    const params: Record<string, number | string> = {
       page: currentPage.value,
       page_size: pageSize.value
     }
@@ -544,7 +582,7 @@ const fetchTorrents = async () => {
     if (filterName.value) params.keyword = filterName.value
     if (filterCategory.value) params.category = filterCategory.value
 
-    const res = await axios.get(`/api/qb/${selectedQb.value}/torrents`, { params })
+    const res = await axios.get<{ torrents: Torrent[]; total: number }>(`/api/qb/${selectedQb.value}/torrents`, { params })
     torrents.value = res.data.torrents || res.data
     torrentTotal.value = res.data.total || 0
     // Clear selection on refresh
@@ -556,19 +594,19 @@ const fetchTorrents = async () => {
   }
 }
 
-const handlePageChange = (page) => {
+const handlePageChange = (page: number) => {
   currentPage.value = page
   fetchTorrents()
 }
 
-const handleSizeChange = (size) => {
+const handleSizeChange = (size: number) => {
   pageSize.value = size
   currentPage.value = 1
   fetchTorrents()
 }
 
 // ==================== Delete ====================
-const batchDelete = async (deleteFiles) => {
+const batchDelete = async (deleteFiles: boolean) => {
   if (!selectedHashes.value.length) return
   try {
     await axios.post(`/api/qb/${selectedQb.value}/torrents/delete`, {
@@ -583,7 +621,7 @@ const batchDelete = async (deleteFiles) => {
   }
 }
 
-const deleteOne = (row, deleteFiles) => {
+const deleteOne = (row: Torrent, deleteFiles: boolean) => {
   ElMessageBox.confirm(
     `确定删除种子「${row.name}」${deleteFiles ? '及其文件' : ''} 吗？`,
     '提示',
@@ -609,7 +647,7 @@ const showAddDialog = () => {
   dialogVisible.value = true
 }
 
-const editConfig = (row) => {
+const editConfig = (row: QbConfig) => {
   isEdit.value = true
   currentConfig.value = { ...row }
   dialogVisible.value = true
@@ -630,7 +668,7 @@ const saveQbConfig = async () => {
   }
 }
 
-const updateConfig = async (row) => {
+const updateConfig = async (row: QbConfig) => {
   try {
     await axios.put(`/api/qb/configs/${row.id}`, row)
     ElMessage.success('更新成功')
@@ -640,7 +678,7 @@ const updateConfig = async (row) => {
   }
 }
 
-const deleteConfig = async (id) => {
+const deleteConfig = async (id: string) => {
   try {
     await axios.delete(`/api/qb/configs/${id}`)
     ElMessage.success('删除成功')
@@ -650,7 +688,7 @@ const deleteConfig = async (id) => {
   }
 }
 
-const formatBytes = (bytes, decimals = 2) => {
+const formatBytes = (bytes: number, decimals = 2) => {
   if (!+bytes) return '0 Bytes'
   const k = 1024
   const dm = decimals < 0 ? 0 : decimals

@@ -1,11 +1,159 @@
-<script setup>
+<script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Delete, CircleCheck, Loading, Monitor, Close, Filter, Setting, Right } from '@element-plus/icons-vue'
 
+// ==================== 类型定义 ====================
+// qB 实例配置（/api/qb/configs）
+interface QbInstance {
+  id: string
+  name: string
+}
+
+// qB 实例数据（/api/qb/data）— 含分类 / 标签
+interface QbData {
+  id: string
+  name: string
+  tags?: string[]
+  categories?: string[]
+}
+
+// qB 种子（/api/qb/:id/torrents）
+interface QbTorrent {
+  name: string
+  hash: string
+  size: number
+  progress: number
+  state: string
+  category?: string
+}
+
+// CD2 文件 / 目录条目（/api/cd2/directories）
+interface CD2File {
+  id: string
+  name: string
+  fullPathName: string
+  size: number
+  fileType?: string
+  isDirectory: boolean
+  createTime?: string | null
+  writeTime?: string | null
+  accessTime?: string | null
+  isForbidden?: boolean
+  isLocal?: boolean
+  readOnly?: boolean
+  thumbnailUrl?: string | null
+  originalPath?: string | null
+  cloudName?: string | null
+  cloudUserName?: string | null
+  fileCount?: number
+  folderCount?: number
+  totalSize?: number
+}
+
+// 残缺季核查：单个 Season 文件夹标注
+interface SeasonCheckSeason {
+  actual: number
+  expected: number
+  season_num?: number
+  folder_name?: string
+}
+
+// 残缺季核查：单个剧集条目标注
+interface SeasonCheckEntry {
+  status: 'complete' | 'incomplete'
+  incompleteCount: number
+  totalSeasons: number
+  seasons: Record<string, SeasonCheckSeason>
+}
+
+type SeasonCheckMap = Record<string, SeasonCheckEntry>
+
+// 残缺季核查 API 返回的单个 Season 条目
+interface SeasonCheckItem {
+  show_name: string
+  tmdb_id: number
+  season_num: number
+  folder_name: string
+  folder_path: string
+  actual_count: number
+  expected_count: number
+}
+
+// 残缺季核查 API 响应（/api/directories/check-incomplete）
+interface SeasonCheckResult {
+  error?: string
+  total_shows_scanned?: number
+  total_seasons_checked?: number
+  incomplete_seasons?: SeasonCheckItem[]
+  empty_folders?: SeasonCheckItem[]
+  complete_seasons?: SeasonCheckItem[]
+}
+
+// 整理分析结果（/api/organize/analyze）
+interface OrgResult {
+  success?: boolean
+  title?: string
+  year?: string | number
+  season?: string | number
+  total_episodes?: number
+  tmdb_id?: number
+  tmdb_name?: string
+  resolved_category?: string
+  source?: string
+}
+
+// 全自动洗版结果（/api/organize/auto_process、auto_process_batch）
+interface AutoProcessItem {
+  success: boolean
+  stage: string
+  message?: string
+  task_id?: number
+  tmdb_id?: number
+  details?: { title?: string }
+}
+
+interface AutoProcessResult {
+  ok?: number
+  errors?: number
+  success?: boolean
+  stage?: string
+  message?: string
+  task_id?: number
+  total?: number
+  details?: { title?: string }
+  results?: AutoProcessItem[]
+}
+
+// CD2 双端跳转结果
+interface JumpResult {
+  ok: boolean
+  name?: string | null
+  error?: string
+}
+
+// CD2 移动操作结果
+interface MoveResult {
+  success: boolean
+  error?: string
+  statusCode?: number
+  [key: string]: unknown
+}
+
+// 提取错误信息：优先保留 Axios 响应 detail，其次 Error.message，最后兜底
+const getErrMessage = (e: unknown, fallback = ''): string => {
+  if (axios.isAxiosError(e)) {
+    const detail = e.response?.data?.detail
+    if (typeof detail === 'string' && detail) return detail
+    return e.message || fallback
+  }
+  if (e instanceof Error) return e.message || fallback
+  return typeof e === 'string' ? e : fallback
+}
+
 // ==================== 实例数据（从 API 获取） ====================
-const instances = ref([])
+const instances = ref<QbInstance[]>([])
 const instanceLoading = ref(false)
 
 const fetchInstances = async () => {
@@ -26,11 +174,11 @@ const searchQuery = ref('')
 const selectedCategory = ref('')
 
 // 预设分类（从后端 category.yaml 获取）
-const presetCategories = ref([])
+const presetCategories = ref<string[]>([])
 
 // 分类数据 — 从 qB 实例动态获取
-const leftCategories = ref([])
-const rightCategories = ref([])
+const leftCategories = ref<string[]>([])
+const rightCategories = ref<string[]>([])
 
 // CD2 独立分类（与顶部 torrent 筛选解耦）
 const cd2Category = ref('国产剧')
@@ -45,12 +193,12 @@ const categoryOptions = computed(() => {
 })
 
 // 从 qB 实例获取分类列表
-const fetchCategories = async (side) => {
+const fetchCategories = async (side: 'left' | 'right') => {
   const instanceId = side === 'left' ? leftInstanceId.value : rightInstanceId.value
   if (!instanceId) return
   try {
     const res = await axios.get('/api/qb/data')
-    const data = res.data?.find?.(d => d.id === instanceId)
+    const data = res.data?.find?.((d: QbData) => d.id === instanceId)
     if (data?.categories) {
       if (side === 'left') leftCategories.value = data.categories
       else rightCategories.value = data.categories
@@ -65,8 +213,8 @@ const leftInstanceId = ref('')
 const rightInstanceId = ref('')
 const leftLoading = ref(false)
 const rightLoading = ref(false)
-const leftTorrents = ref([])   // 原始 API 数据
-const rightTorrents = ref([])  // 原始 API 数据
+const leftTorrents = ref<QbTorrent[]>([])   // 原始 API 数据
+const rightTorrents = ref<QbTorrent[]>([])  // 原始 API 数据
 
 // ==================== 双列独立分页状态 ====================
 const currentPageLeft = ref(1)
@@ -107,7 +255,7 @@ const fetchLeftTorrents = async () => {
     const data = res.data
     leftTorrents.value = data.torrents || data
   } catch (e) {
-    ElMessage.error(`获取左列种子失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`获取左列种子失败: ${getErrMessage(e)}`)
     leftTorrents.value = []
   } finally {
     leftLoading.value = false
@@ -124,7 +272,7 @@ const fetchRightTorrents = async () => {
     const data = res.data
     rightTorrents.value = data.torrents || data
   } catch (e) {
-    ElMessage.error(`获取右列种子失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`获取右列种子失败: ${getErrMessage(e)}`)
     rightTorrents.value = []
   } finally {
     rightLoading.value = false
@@ -210,13 +358,13 @@ watch(pageSizeLeft, () => { currentPageLeft.value = 1 })
 watch(pageSizeRight, () => { currentPageRight.value = 1 })
 
 // ==================== 批量选择 ====================
-const selectedLeftTorrents = ref([])
+const selectedLeftTorrents = ref<string[]>([])
 
 // 右列批量选择
-const selectedRightTorrents = ref([])
+const selectedRightTorrents = ref<string[]>([])
 const batchOrganizing = ref(false)
 const autoProcessing = ref(false)
-const autoProcessResult = ref(null)
+const autoProcessResult = ref<AutoProcessResult | null>(null)
 
 // 当前页是否全选
 const isAllSelected = computed(() => {
@@ -225,7 +373,7 @@ const isAllSelected = computed(() => {
 })
 
 // 全选 / 取消全选当前页
-const handleSelectAll = (val) => {
+const handleSelectAll = (val: string | number | boolean) => {
   if (val) {
     const currentHashes = paginatedLeftList.value.map(t => t.hash)
     const set = new Set([...selectedLeftTorrents.value, ...currentHashes])
@@ -243,7 +391,7 @@ const isAllSelectedRight = computed(() => {
 })
 
 // 单个勾选
-const handleCheckOne = (hash) => {
+const handleCheckOne = (hash: string) => {
   const idx = selectedLeftTorrents.value.indexOf(hash)
   if (idx === -1) {
     selectedLeftTorrents.value.push(hash)
@@ -253,7 +401,7 @@ const handleCheckOne = (hash) => {
 }
 
 // 右列全选 / 取消全选当前页
-const handleSelectAllRight = (val) => {
+const handleSelectAllRight = (val: string | number | boolean) => {
   if (val) {
     const currentHashes = paginatedRightList.value.map(t => t.hash)
     const set = new Set([...selectedRightTorrents.value, ...currentHashes])
@@ -265,7 +413,7 @@ const handleSelectAllRight = (val) => {
 }
 
 // 右列单个勾选
-const handleCheckOneRight = (hash) => {
+const handleCheckOneRight = (hash: string) => {
   const idx = selectedRightTorrents.value.indexOf(hash)
   if (idx === -1) {
     selectedRightTorrents.value.push(hash)
@@ -290,88 +438,19 @@ const handleBatchOrganize = async () => {
     }
     ElMessage.success(`已整理 ${torrents.length} 个种子`)
   } catch (e) {
-    ElMessage.error(`批量整理出错: ${e.message}`)
+    ElMessage.error(`批量整理出错: ${getErrMessage(e)}`)
   } finally {
     batchOrganizing.value = false
     selectedRightTorrents.value = []
   }
 }
 
-// 全自动洗版 — 完结校验 + 智能对比 + 删除
-const handleAutoProcess = async () => {
-  if (!selectedRightTorrents.value.length) {
-    ElMessage.warning('请先选择要自动化处理的种子')
-    return
-  }
-  const torrents = rightTorrents.value.filter(t => selectedRightTorrents.value.includes(t.hash))
-  if (!torrents.length) {
-    ElMessage.warning('未找到选中的种子')
-    return
-  }
-
-  try {
-    await ElMessageBox.confirm(
-      `将对选中的 ${torrents.length} 个种子执行全自动洗版流程：\n\n` +
-      '1. 校验「已完结」目录中所有 Season 是否真正完结\n' +
-      '2. 对比「媒体库」版本，智能决策保留/删除\n' +
-      '3. 严格四重校验（名称/数量/总大小/单文件）后清理重复\n\n' +
-      '确认开始？',
-      '全自动洗版确认',
-      { type: 'info', confirmButtonText: '开始执行', cancelButtonText: '取消' }
-    )
-  } catch {
-    return
-  }
-
-  autoProcessing.value = true
-  autoProcessResult.value = null
-
-  try {
-    const seeds = torrents.map(t => ({
-      torrent_name: t.name,
-      qb_config_id: rightInstanceId.value,
-      category: t.category || selectedCategory.value || '',
-    }))
-
-    const res = await axios.post('/api/organize/auto_process_batch', { seeds })
-    autoProcessResult.value = res.data
-
-    const okCount = res.data?.ok || 0
-    const errCount = res.data?.errors || 0
-
-    if (errCount === 0) {
-      ElMessage.success(`全自动洗版完成: ${okCount} 个成功`)
-    } else {
-      ElMessage.warning(`洗版结果: ${okCount} 成功, ${errCount} 失败 — 查看详情`)
-    }
-
-    // Show detailed results
-    const results = res.data?.results || []
-    for (const r of results) {
-      if (r.success && r.stage === 'waiting_for_delete_webhook') {
-        ElMessage.info(`「${r.details?.title || '?'}」已进入 Emby 确认阶段 — 等待自动移动 (task #${r.task_id})`)
-      } else if (r.success && r.stage === 'completed') {
-        ElMessage.success(`「${r.details?.title || '?'}」${r.message}`)
-      } else if (r.success && r.stage === 'no_action_needed') {
-        ElMessage.info(`「${r.details?.title || '?'}」${r.message}`)
-      } else if (!r.success) {
-        ElMessage.error(`「${r.details?.title || '?'}」${r.message}`)
-      }
-    }
-  } catch (e) {
-    ElMessage.error(`全自动洗版失败: ${e.response?.data?.detail || e.message}`)
-  } finally {
-    autoProcessing.value = false
-    selectedRightTorrents.value = []
-  }
-}
-
 // ==================== 右侧删除操作 ====================
-const rightDeletingHash = ref(null)
+const rightDeletingHash = ref<string | null>(null)
 const rightBatchDeleting = ref(false)
 
 // 右侧单条删除
-const handleDeleteRightTorrent = async (torrent) => {
+const handleDeleteRightTorrent = async (torrent: QbTorrent) => {
   try {
     await ElMessageBox.confirm(
       `确定删除「${torrent.name?.substring(0, 50)}」及其所有下载的源文件吗？\n实例：${rightInstanceName.value}\n此操作不可恢复！`,
@@ -392,7 +471,7 @@ const handleDeleteRightTorrent = async (torrent) => {
     if (idx !== -1) rightTorrents.value.splice(idx, 1)
     ElMessage.success('已删除种子及文件')
   } catch (e) {
-    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`删除失败: ${getErrMessage(e)}`)
   } finally {
     rightDeletingHash.value = null
   }
@@ -422,7 +501,7 @@ const handleBatchDeleteRight = async () => {
     ElMessage.success(`已删除 ${selectedRightTorrents.value.length} 个种子及文件`)
     selectedRightTorrents.value = []
   } catch (e) {
-    ElMessage.error(`批量删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`批量删除失败: ${getErrMessage(e)}`)
   } finally {
     rightBatchDeleting.value = false
   }
@@ -453,7 +532,7 @@ const handleBatchDelete = async () => {
     ElMessage.success(`已删除 ${selectedLeftTorrents.value.length} 个种子及文件`)
     selectedLeftTorrents.value = []
   } catch (e) {
-    ElMessage.error(`批量删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`批量删除失败: ${getErrMessage(e)}`)
   } finally {
     batchDeleting.value = false
   }
@@ -468,9 +547,9 @@ watch([searchQuery, selectedCategory, currentPageRight, pageSizeRight], () => {
 })
 
 // ==================== 单条删除操作 ====================
-const deletingHash = ref(null)
+const deletingHash = ref<string | null>(null)
 
-const deleteTorrent = async (torrent) => {
+const deleteTorrent = async (torrent: QbTorrent) => {
   try {
     await ElMessageBox.confirm(
       `确定删除「${torrent.name?.substring(0, 50)}」及其文件吗？\n实例：${leftInstanceName.value}`,
@@ -491,14 +570,14 @@ const deleteTorrent = async (torrent) => {
     if (idx !== -1) leftTorrents.value.splice(idx, 1)
     ElMessage.success('已删除种子及文件')
   } catch (e) {
-    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`删除失败: ${getErrMessage(e)}`)
   } finally {
     deletingHash.value = null
   }
 }
 
 // ==================== 工具函数 ====================
-const formatBytes = (bytes, decimals = 2) => {
+const formatBytes = (bytes: number, decimals = 2) => {
   if (!+bytes) return '0 Bytes'
   const k = 1024
   const dm = decimals < 0 ? 0 : decimals
@@ -507,15 +586,7 @@ const formatBytes = (bytes, decimals = 2) => {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`
 }
 
-const getProgressColor = (state) => {
-  if (['stalledUP', 'uploading'].includes(state)) return 'linear-gradient(90deg, #10b981, #34d399)'
-  if (['downloading', 'metaDL'].includes(state)) return 'linear-gradient(90deg, #3b82f6, #60a5fa)'
-  if (['pausedDL', 'pausedUP'].includes(state)) return 'linear-gradient(90deg, #f59e0b, #fbbf24)'
-  if (['error', 'missingFiles'].includes(state)) return 'linear-gradient(90deg, #ef4444, #f87171)'
-  return 'linear-gradient(90deg, #64748b, #94a3b8)'
-}
-
-const STATE_MAP = {
+const STATE_MAP: Record<string, string> = {
   'stalledUP': '做种中', 'uploading': '上传中', 'downloading': '下载中',
   'stalledDL': '等待下载', 'pausedDL': '暂停下载', 'pausedUP': '暂停上传',
   'queuedDL': '排队下载', 'queuedUP': '排队上传',
@@ -524,9 +595,9 @@ const STATE_MAP = {
   'metaDL': '获取元数据', 'moving': '移动中', 'unknown': '未知'
 }
 
-const formatState = (state) => STATE_MAP[state] || state
+const formatState = (state: string) => STATE_MAP[state] || state
 
-const getStateColor = (state) => {
+const getStateColor = (state: string) => {
   if (['stalledUP', 'uploading'].includes(state)) return '#10b981'
   if (['downloading', 'metaDL'].includes(state)) return '#3b82f6'
   if (['pausedDL', 'pausedUP'].includes(state)) return '#f59e0b'
@@ -551,15 +622,15 @@ const onWindowResize = () => {
 }
 
 // --- CD2 区域拖拽调整大小 ---
-const cd2SectionHeight = ref(null)  // null = 自动高度, number = 固定 px
+const cd2SectionHeight = ref<number | null>(null)  // null = 自动高度, number = 固定 px
 const isDraggingCD2 = ref(false)
 let dragStartY = 0
 let dragStartHeight = 0
 
-const onDragStart = (e) => {
+const onDragStart = (e: MouseEvent) => {
   isDraggingCD2.value = true
   dragStartY = e.clientY
-  const el = document.querySelector('.cd2-section')
+  const el = document.querySelector<HTMLElement>('.cd2-section')
   dragStartHeight = el ? el.offsetHeight : 300
   document.addEventListener('mousemove', onDragMove)
   document.addEventListener('mouseup', onDragEnd)
@@ -567,7 +638,7 @@ const onDragStart = (e) => {
   document.body.style.userSelect = 'none'
 }
 
-const onDragMove = (e) => {
+const onDragMove = (e: MouseEvent) => {
   if (!isDraggingCD2.value) return
   const dy = dragStartY - e.clientY  // 向上拖 = 增大 CD2 区域
   const newHeight = Math.max(120, Math.min(800, dragStartHeight + dy))
@@ -588,22 +659,22 @@ const cd2Error = ref('')
 
 // 媒体库（左列）
 const cd2MediaPath = ref('')
-const cd2MediaFiles = ref([])
+const cd2MediaFiles = ref<CD2File[]>([])
 const cd2MediaYearInput = ref('')   // 年份快捷跳转输入
 
 // 已完结整理（右列）
 const cd2OrganizedPath = ref('')
-const cd2OrganizedFiles = ref([])
+const cd2OrganizedFiles = ref<CD2File[]>([])
 
 // --- 残缺季雷达（内联标注版）---
 // seasonCheckData: { [showPath]: { status: 'complete'|'incomplete', incompleteCount, totalSeasons, seasons: { [seasonPath]: { actual, expected } } } }
-const seasonCheckData = ref({})
+const seasonCheckData = ref<SeasonCheckMap>({})
 const seasonCheckLoading = ref(false)
 const seasonCheckError = ref('')
 
 // 从扫描结果构建内联标注数据
-const buildSeasonCheckMap = (result, currentPath) => {
-  const map = {}
+const buildSeasonCheckMap = (result: SeasonCheckResult, currentPath: string): SeasonCheckMap => {
+  const map: SeasonCheckMap = {}
   // result.incomplete_seasons: [{ show_name, tmdb_id, season_num, folder_name, folder_path, actual_count, expected_count }]
   for (const item of (result.incomplete_seasons || [])) {
     const showPath = (currentPath + item.show_name).replace(/\/+$/, '')
@@ -637,7 +708,7 @@ const buildSeasonCheckMap = (result, currentPath) => {
   return map
 }
 
-const runSeasonCheck = async (side = 'media') => {
+const runSeasonCheck = async (side: 'media' | 'organized' = 'media') => {
   const scanPath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
   if (!scanPath) {
     ElMessage.warning('请先导航到年份目录（如 2026/）')
@@ -667,7 +738,7 @@ const runSeasonCheck = async (side = 'media') => {
       )
     }
   } catch (e) {
-    seasonCheckError.value = e.response?.data?.detail || e.message
+    seasonCheckError.value = getErrMessage(e)
     ElMessage.error('残缺季核查失败: ' + seasonCheckError.value)
   } finally {
     seasonCheckLoading.value = false
@@ -675,10 +746,10 @@ const runSeasonCheck = async (side = 'media') => {
 }
 
 // 单剧集核查状态（记录正在核查中的 show path）
-const checkingShows = ref(new Set())
+const checkingShows = ref<Set<string>>(new Set())
 
 // 单剧集残缺季核查
-const runSingleShowCheck = async (side, file) => {
+const runSingleShowCheck = async (side: 'media' | 'organized', file: CD2File) => {
   if (!file.isDirectory) return
   const basePath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
   const showPath = (basePath + file.name).replace(/\/+$/, '') + '/'
@@ -702,7 +773,7 @@ const runSingleShowCheck = async (side, file) => {
     const incompleteCount = (data.incomplete_seasons?.length || 0) + (data.empty_folders?.length || 0)
     const totalSeasons = data.total_seasons_checked || 0
 
-    const entry = {
+    const entry: SeasonCheckEntry = {
       status: incompleteCount > 0 ? 'incomplete' : 'complete',
       incompleteCount,
       totalSeasons,
@@ -744,7 +815,7 @@ const runSingleShowCheck = async (side, file) => {
       ElMessage.warning(`「${file.name}」: ${incompleteCount} 个残缺季 / 空目录（共 ${totalSeasons} 个 Season）`)
     }
   } catch (e) {
-    ElMessage.error(`核查失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`核查失败: ${getErrMessage(e)}`)
   } finally {
     const newSet2 = new Set(checkingShows.value)
     newSet2.delete(showPath)
@@ -759,7 +830,7 @@ const clearSeasonCheck = () => {
 }
 
 // 获取单个文件/目录的内联标注信息（用于列表渲染）
-const getShowCheckStatus = (file) => {
+const getShowCheckStatus = (file: CD2File): SeasonCheckEntry | null => {
   if (!file.isDirectory) return null
   const key = (cd2MediaPath.value + file.name).replace(/\/+$/, '')
   const entry = seasonCheckData.value[key]
@@ -767,7 +838,7 @@ const getShowCheckStatus = (file) => {
   return entry
 }
 
-const getOrganizedShowCheckStatus = (file) => {
+const getOrganizedShowCheckStatus = (file: CD2File): SeasonCheckEntry | null => {
   if (!file.isDirectory) return null
   const key = (cd2OrganizedPath.value + file.name).replace(/\/+$/, '')
   const entry = seasonCheckData.value[key]
@@ -776,14 +847,14 @@ const getOrganizedShowCheckStatus = (file) => {
 }
 
 // 检查某个 show 是否正在被单剧核查
-const isShowChecking = (side, file) => {
+const isShowChecking = (side: 'media' | 'organized', file: CD2File): boolean => {
   if (!file.isDirectory) return false
   const basePath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
   const showPath = (basePath + file.name).replace(/\/+$/, '') + '/'
   return checkingShows.value.has(showPath)
 }
 
-const getSeasonCheckDetail = (file, side) => {
+const getSeasonCheckDetail = (file: CD2File, side: 'media' | 'organized'): SeasonCheckSeason | null => {
   if (!file.isDirectory) return null
   const basePath = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
   // 构建 season 文件夹的完整路径
@@ -848,8 +919,6 @@ const cd2OrganizedDepth = computed(() => {
 // Depth 0: /80003588/.../国产剧/             → 年份列表   → NO stats
 // Depth 1: /80003588/.../国产剧/2026/        → 剧名列表   → NO stats
 // Depth 2: /80003588/.../国产剧/2026/主角/   → Season列表 → YES stats
-const cd2MediaWithStats = computed(() => cd2MediaDepth.value >= 2)
-const cd2OrganizedWithStats = computed(() => cd2OrganizedDepth.value >= 2)
 // 注意：不再使用单一 OR 合并值。改为在 loadCD2Data 中按侧独立计算并传递，
 // 防止一侧进入深层目录时另一侧年份层级被错误注入 stats。
 
@@ -883,10 +952,7 @@ const displayedOrganizedFiles = computed(() => {
 })
 
 // --- 工具：判断文件夹名是否为年份（纯 4 位数字）---
-const isYearFolder = (name) => /^\d{4}$/.test(name)
-
-// --- 工具：异步延迟（用于 CD2 缓存一致性容错）---
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+const isYearFolder = (name: string) => /^\d{4}$/.test(name)
 
 // --- 通用数据加载 ---
 // silent=true: 静默刷新，不触发 loading 遮罩、不清除错误、不弹 toast。
@@ -937,7 +1003,7 @@ const loadCD2Data = async (silent = false) => {
     }
   } catch (e) {
     if (!silent) {
-      cd2Error.value = e.response?.data?.detail || e.message || '获取CD2目录失败'
+      cd2Error.value = getErrMessage(e, '获取CD2目录失败')
       ElMessage.error(cd2Error.value)
     }
   } finally {
@@ -948,7 +1014,7 @@ const loadCD2Data = async (silent = false) => {
 }
 
 // --- 导航函数 ---
-const enterFolder = (side, folderName) => {
+const enterFolder = (side: 'media' | 'organized', folderName: string) => {
   if (side === 'media') {
     cd2MediaPath.value = cd2MediaPath.value + folderName + '/'
   } else {
@@ -957,7 +1023,7 @@ const enterFolder = (side, folderName) => {
   loadCD2Data()
 }
 
-const goBack = (side) => {
+const goBack = (side: 'media' | 'organized') => {
   if (side === 'media') {
     if (!cd2MediaCanGoBack.value) return
     const trimmed = cd2MediaPath.value.replace(/\/+$/, '')
@@ -999,7 +1065,7 @@ watch(cd2Category, () => {
 // ==================== CD2 目录识别功能 ====================
 const cd2Identifying = ref(false)
 
-const identifyCD2Directory = async (side) => {
+const identifyCD2Directory = async (side: 'media' | 'organized') => {
   const path = side === 'media' ? cd2MediaPath.value : cd2OrganizedPath.value
   const segments = path.replace(/\/+$/, '').split('/').filter(s => s.length > 0)
   const dirName = segments[segments.length - 1] || ''
@@ -1045,7 +1111,7 @@ const identifyCD2Directory = async (side) => {
     if (res.data.resolved_category) parts.push(`分类:${res.data.resolved_category}`)
     orgCD2Status.value = parts.join(' · ')
   } catch (e) {
-    orgError.value = e.response?.data?.detail || e.message || '识别失败'
+    orgError.value = getErrMessage(e, '识别失败')
     ElMessage.error(orgError.value)
   } finally {
     cd2Identifying.value = false
@@ -1053,13 +1119,8 @@ const identifyCD2Directory = async (side) => {
 }
 
 // ==================== CD2 左侧（媒体库）删除功能 ====================
-const selectedCd2MediaItems = ref([])
+const selectedCd2MediaItems = ref<string[]>([])
 const cd2Deleting = ref(false)
-
-// CD2 媒体库当前页文件标识（用于 checkbox 绑定）
-const cd2MediaFileKeys = computed(() =>
-  displayedMediaFiles.value.map(f => f.fullPathName || f.name)
-)
 
 const isAllCd2MediaSelected = computed(() => {
   if (!displayedMediaFiles.value.length) return false
@@ -1068,7 +1129,7 @@ const isAllCd2MediaSelected = computed(() => {
   )
 })
 
-const handleSelectAllCd2Media = (val) => {
+const handleSelectAllCd2Media = (val: string | number | boolean) => {
   if (val) {
     const keys = displayedMediaFiles.value.map(f => f.fullPathName || f.name)
     const set = new Set([...selectedCd2MediaItems.value, ...keys])
@@ -1079,7 +1140,7 @@ const handleSelectAllCd2Media = (val) => {
   }
 }
 
-const handleCheckOneCd2Media = (key) => {
+const handleCheckOneCd2Media = (key: string) => {
   const idx = selectedCd2MediaItems.value.indexOf(key)
   if (idx === -1) {
     selectedCd2MediaItems.value.push(key)
@@ -1089,7 +1150,7 @@ const handleCheckOneCd2Media = (key) => {
 }
 
 // 删除确认弹窗
-const confirmCd2Delete = async (count) => {
+const confirmCd2Delete = async (count: number): Promise<boolean> => {
   try {
     await ElMessageBox.confirm(
       `确定要删除选中的 ${count} 个项目吗？文件将被移动到 CD2 回收站。`,
@@ -1107,7 +1168,7 @@ const confirmCd2Delete = async (count) => {
 }
 
 // 单个删除
-const handleDeleteSingleCd2Item = async (file) => {
+const handleDeleteSingleCd2Item = async (file: CD2File) => {
   const key = file.fullPathName || file.name
   const paths = [key]
 
@@ -1124,7 +1185,7 @@ const handleDeleteSingleCd2Item = async (file) => {
     loadCD2Data()
     setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
   } catch (e) {
-    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`删除失败: ${getErrMessage(e)}`)
   } finally {
     cd2Deleting.value = false
   }
@@ -1148,7 +1209,7 @@ const handleBatchDeleteCd2Items = async () => {
     loadCD2Data()
     setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
   } catch (e) {
-    ElMessage.error(`批量删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`批量删除失败: ${getErrMessage(e)}`)
   } finally {
     cd2Deleting.value = false
   }
@@ -1163,7 +1224,7 @@ watch([cd2MediaPath, cd2MediaFiles], () => {
 const cd2Moving = ref(false)
 
 // 从已完结侧相对路径中提取 年份、剧名
-const parseOrganizedPath = () => {
+const parseOrganizedPath = (): { year: string | null; showName: string | null; category: string; depth: number } => {
   const rel = cd2OrganizedRelative.value
   const segments = rel.split('/').filter(s => s.length > 0)
   return {
@@ -1175,7 +1236,7 @@ const parseOrganizedPath = () => {
 }
 
 // 构造左侧目标父目录
-const buildMediaDestPath = (year, showName) => {
+const buildMediaDestPath = (year: string, showName: string | null) => {
   const root = cd2MediaRoot.value  // e.g. /80003588/emby库/电视剧/国产剧/
   if (!year) return root
   if (!showName) return root + year + '/'
@@ -1183,7 +1244,7 @@ const buildMediaDestPath = (year, showName) => {
 }
 
 // 核心移动函数
-const doMoveToLeft = async (sourcePaths, destPath) => {
+const doMoveToLeft = async (sourcePaths: string[], destPath: string): Promise<MoveResult> => {
   cd2Moving.value = true
   try {
     const res = await axios.post('/api/cd2/move', {
@@ -1195,8 +1256,8 @@ const doMoveToLeft = async (sourcePaths, destPath) => {
   } catch (e) {
     return {
       success: false,
-      error: e.response?.data?.detail || e.message || '移动失败',
-      statusCode: e.response?.status,
+      error: getErrMessage(e, '移动失败'),
+      statusCode: axios.isAxiosError(e) ? e.response?.status : undefined,
     }
   } finally {
     cd2Moving.value = false
@@ -1204,8 +1265,8 @@ const doMoveToLeft = async (sourcePaths, destPath) => {
 }
 
 // 移动单个 Season 文件夹 → 左侧对应剧集目录
-const handleMoveSingleToLeft = async (file) => {
-  const { year, showName, category } = parseOrganizedPath()
+const handleMoveSingleToLeft = async (file: CD2File) => {
+  const { year, showName } = parseOrganizedPath()
   const sourcePath = file.fullPathName || file.name
   const sourceName = file.name
 
@@ -1235,7 +1296,7 @@ const handleMoveSingleToLeft = async (file) => {
     setTimeout(() => loadCD2Data(true), 1000)         // 1s 后静默刷新 — 应对缓存延迟
   } else {
     // 容错：目标目录不存在 → 弹出三段式选择对话框
-    const notFound = result.statusCode === 502 || /not found|不存在|no such/i.test(result.error)
+    const notFound = result.statusCode === 502 || /not found|不存在|no such/i.test(result.error || '')
     if (notFound) {
       moveFallbackShowName.value = showName
       moveFallbackSourcePath.value = sourcePath
@@ -1249,19 +1310,22 @@ const handleMoveSingleToLeft = async (file) => {
 
 // 移动当前整个剧集目录 → 左侧年份目录（逐季移动，不碰根目录）
 const handleMoveEntireShowToLeft = async () => {
-  const { year, showName, category, depth } = parseOrganizedPath()
+  const { year, showName, depth } = parseOrganizedPath()
 
   if (depth < 2) {
     ElMessage.warning('请先进入具体的剧集目录')
     return
   }
+  // depth >= 2 时 segments[0]/segments[1] 必存在，year / showName 不可能为 null
+  const dirYear = year!
+  const dirShow = showName!
 
   const sourcePath = cd2OrganizedPath.value
-  const destPath = buildMediaDestPath(year, null)
+  const destPath = buildMediaDestPath(dirYear, null)
 
   try {
     await ElMessageBox.confirm(
-      `确定将整个剧集【${showName}】\n从：${sourcePath}\n移至左侧年份目录：${destPath}\n吗？\n\n（仅移动 Season 子文件夹，保留源根目录）`,
+      `确定将整个剧集【${dirShow}】\n从：${sourcePath}\n移至左侧年份目录：${destPath}\n吗？\n\n（仅移动 Season 子文件夹，保留源根目录）`,
       '移动整剧至媒体库',
       { type: 'warning', confirmButtonText: '确认移动整剧', cancelButtonText: '取消' }
     )
@@ -1277,14 +1341,14 @@ const handleMoveEntireShowToLeft = async () => {
       conflict_policy: 1,
     })
     const data = res.data
-    ElMessage.success(`已移动整剧: ${showName}（${data.moved_seasons || 0} 个 Season）`)
+    ElMessage.success(`已移动整剧: ${dirShow}（${data.moved_seasons || 0} 个 Season）`)
     goBack('organized')
     // 左侧导航到刚移入的剧集目录，展示 Season 及 stats
-    cd2MediaPath.value = data.target_show_path || buildMediaDestPath(year, showName)
+    cd2MediaPath.value = data.target_show_path || buildMediaDestPath(dirYear, dirShow)
     loadCD2Data()                                    // 即时加载 — 展现目录结构
     setTimeout(() => loadCD2Data(true), 2000)         // 2s 后静默重拉 — 获取 stats
   } catch (e) {
-    const errMsg = e.response?.data?.detail || e.message || '移动失败'
+    const errMsg = getErrMessage(e, '移动失败')
     ElMessage.error(`移动整剧失败: ${errMsg}`)
   } finally {
     cd2Moving.value = false
@@ -1293,29 +1357,31 @@ const handleMoveEntireShowToLeft = async () => {
 
 // 从 CD2 已完结面板直接触发自动化洗版
 const handleAutoProcessFromCD2 = async () => {
-  const { year, showName, depth } = parseOrganizedPath()
+  const { showName, depth } = parseOrganizedPath()
 
   if (depth < 2) {
     ElMessage.warning('请先进入具体的剧集目录')
     return
   }
+  // depth >= 2 时 segments[1] 必存在，showName 不可能为 null
+  const dirShow = showName!
 
   // 从文件夹名提取 tmdb_id（例如 "主角(2026) {tmdb=284110}"）
-  const tmdbMatch = showName.match(/\{tmdb=(\d+)\}/)
+  const tmdbMatch = dirShow.match(/\{tmdb=(\d+)\}/)
   const tmdbId = tmdbMatch ? parseInt(tmdbMatch[1]) : null
 
   // 尝试从右列种子中找到匹配项（用于获取 qb_config_id）
   const matchedTorrent = rightTorrents.value.find(t => {
     if (tmdbId) return t.name.includes(`{tmdb=${tmdbId}}`)
-    return t.name.includes(showName)
+    return t.name.includes(dirShow)
   })
 
-  const torrentName = matchedTorrent?.name || `${showName} {tmdb=${tmdbId || ''}}`
+  const torrentName = matchedTorrent?.name || `${dirShow} {tmdb=${tmdbId || ''}}`
   const qbConfigId = rightInstanceId.value || ''
 
   try {
     await ElMessageBox.confirm(
-      `将对【${showName}】执行全自动洗版流程：\n\n` +
+      `将对【${dirShow}】执行全自动洗版流程：\n\n` +
       '1. 校验「已完结」目录中所有 Season 是否真正完结\n' +
       '2. 对比「媒体库」版本，智能决策保留/删除\n' +
       '3. 严格四重校验（名称/数量/总大小/单文件）后清理重复\n\n' +
@@ -1342,7 +1408,7 @@ const handleAutoProcessFromCD2 = async () => {
 
     if (res.data?.success) {
       const stage = res.data.stage
-      const title = res.data.details?.title || showName
+      const title = res.data.details?.title || dirShow
       if (stage === 'waiting_for_delete_webhook') {
         ElMessage.info(`「${title}」已进入 Emby 确认阶段 — 等待自动移动 (task #${res.data.task_id})`)
       } else if (stage === 'completed') {
@@ -1354,7 +1420,7 @@ const handleAutoProcessFromCD2 = async () => {
       ElMessage.error(res.data?.message || '自动化洗版失败')
     }
   } catch (e) {
-    ElMessage.error(`自动化洗版失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`自动化洗版失败: ${getErrMessage(e)}`)
   } finally {
     autoProcessing.value = false
   }
@@ -1388,7 +1454,7 @@ const handleFallbackCreateAndMove = async () => {
     }
     ElMessage.success(`已创建目录: ${showName}`)
   } catch (e) {
-    ElMessage.error(`创建目录失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`创建目录失败: ${getErrMessage(e)}`)
     return
   } finally {
     cd2Moving.value = false
@@ -1431,7 +1497,7 @@ const handleFallbackMoveEntire = async () => {
     loadCD2Data()                                    // 即时加载 — 展现目录结构
     setTimeout(() => loadCD2Data(true), 2000)         // 2s 后静默重拉 — 获取 stats
   } catch (e) {
-    const errMsg = e.response?.data?.detail || e.message || '移动失败'
+    const errMsg = getErrMessage(e, '移动失败')
     ElMessage.error(`移动整剧失败: ${errMsg}`)
   } finally {
     cd2Moving.value = false
@@ -1447,7 +1513,7 @@ const handleFallbackCancel = () => {
 // ==================== CD2 右侧（已完结）目录删除 ====================
 
 // 删除已完结侧单个 Season 文件夹
-const handleDeleteOrganizedItem = async (file) => {
+const handleDeleteOrganizedItem = async (file: CD2File) => {
   const key = file.fullPathName || file.name
   const confirmed = await confirmCd2Delete(1)
   if (!confirmed) return
@@ -1461,7 +1527,7 @@ const handleDeleteOrganizedItem = async (file) => {
     loadCD2Data()
     setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
   } catch (e) {
-    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`删除失败: ${getErrMessage(e)}`)
   } finally {
     cd2Deleting.value = false
   }
@@ -1495,7 +1561,7 @@ const handleDeleteCurrentOrganizedDirectory = async () => {
     goBack('organized')
     setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
   } catch (e) {
-    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`删除失败: ${getErrMessage(e)}`)
   } finally {
     cd2Deleting.value = false
   }
@@ -1529,7 +1595,7 @@ const handleDeleteCurrentCd2Directory = async () => {
     goBack('media')
     setTimeout(() => loadCD2Data(true), 500)          // 0.5s 后静默刷新 — 应对缓存延迟
   } catch (e) {
-    ElMessage.error(`删除失败: ${e.response?.data?.detail || e.message}`)
+    ElMessage.error(`删除失败: ${getErrMessage(e)}`)
   } finally {
     cd2Deleting.value = false
   }
@@ -1537,12 +1603,12 @@ const handleDeleteCurrentCd2Directory = async () => {
 
 // ==================== 整理工作台 ====================
 const orgLoading = ref(false)
-const orgResult = ref(null)       // { title, year, season, total_episodes, tmdb_id, resolved_category, ... }
+const orgResult = ref<OrgResult | null>(null)       // { title, year, season, total_episodes, tmdb_id, resolved_category, ... }
 const orgError = ref('')
 const orgCD2Status = ref('')      // CD2 双端跳转结果
 
 // Helper: search for matching show folder in a directory listing
-const findShowFolder = (files, tmdbId, title) => {
+const findShowFolder = (files: CD2File[] | null, tmdbId?: number, title?: string): CD2File | null => {
   if (!files || !files.length) return null
   const tmdbTag = tmdbId ? `{tmdb=${tmdbId}}` : ''
   if (tmdbTag) {
@@ -1557,7 +1623,7 @@ const findShowFolder = (files, tmdbId, title) => {
 }
 
 // Helper: try to jump one CD2 side to the show folder
-const jumpCD2Side = async (side, yearPath) => {
+const jumpCD2Side = async (side: 'media' | 'organized', yearPath: string): Promise<JumpResult> => {
   try {
     const res = await axios.get('/api/cd2/directories', {
       params: {
@@ -1577,11 +1643,11 @@ const jumpCD2Side = async (side, yearPath) => {
     }
     return { ok: false, name: null }
   } catch (e) {
-    return { ok: false, error: e.response?.data?.detail || e.message }
+    return { ok: false, error: getErrMessage(e) }
   }
 }
 
-const startOrganize = async (torrent) => {
+const startOrganize = async (torrent: QbTorrent) => {
   orgLoading.value = true
   orgResult.value = null
   orgError.value = ''
@@ -1606,8 +1672,6 @@ const startOrganize = async (torrent) => {
 
     // 4 — Dual CD2 jump (both sides)
     const year = res.data.year
-    const tmdbId = res.data.tmdb_id
-    const title = res.data.title
     const cat = selectedCategory.value || category || ''
 
     if (!year || !cat) {
@@ -1641,7 +1705,7 @@ const startOrganize = async (torrent) => {
     )
     orgCD2Status.value = parts.join(' | ')
   } catch (e) {
-    orgError.value = e.response?.data?.detail || e.message || '解析失败'
+    orgError.value = getErrMessage(e, '解析失败')
     ElMessage.error(orgError.value)
   } finally {
     orgLoading.value = false
@@ -2143,7 +2207,7 @@ onUnmounted(() => {
           >
             {{ showCD2 ? '收起 ▲' : '展开 ▼' }}
           </button>
-          <button class="cd2-refresh-btn" :disabled="cd2Loading" @click="loadCD2Data">
+          <button class="cd2-refresh-btn" :disabled="cd2Loading" @click="loadCD2Data()">
             <el-icon :size="14" :class="{ 'is-loading': cd2Loading }"><Loading /></el-icon>
             {{ cd2Loading ? '加载中...' : '刷新' }}
           </button>
@@ -2313,9 +2377,9 @@ onUnmounted(() => {
                   <span
                     v-if="file.isDirectory && cd2MediaDepth === 1 && getShowCheckStatus(file)"
                     class="sc-inline-badge"
-                    :class="getShowCheckStatus(file).status === 'incomplete' ? 'sc-badge-warn' : 'sc-badge-ok'"
+                    :class="getShowCheckStatus(file)!.status === 'incomplete' ? 'sc-badge-warn' : 'sc-badge-ok'"
                   >
-                    {{ getShowCheckStatus(file).status === 'incomplete' ? `⚠️ 缺 ${getShowCheckStatus(file).incompleteCount} 季` : '✅ 完整' }}
+                    {{ getShowCheckStatus(file)!.status === 'incomplete' ? `⚠️ 缺 ${getShowCheckStatus(file)!.incompleteCount} 季` : '✅ 完整' }}
                   </span>
                   <!-- 单剧核查按钮（depth=1 剧集层级） -->
                   <button
@@ -2334,11 +2398,11 @@ onUnmounted(() => {
                     class="sc-inline-badge sc-badge-season"
                   >
                     <span class="sc-season-nums">
-                      <span class="sc-season-actual">{{ getSeasonCheckDetail(file, 'media').actual }}</span>
+                      <span class="sc-season-actual">{{ getSeasonCheckDetail(file, 'media')!.actual }}</span>
                       <span class="sc-season-sep">/</span>
-                      <span class="sc-season-expected">{{ getSeasonCheckDetail(file, 'media').expected }}</span>
+                      <span class="sc-season-expected">{{ getSeasonCheckDetail(file, 'media')!.expected }}</span>
                     </span>
-                    <span class="sc-season-missing">缺 {{ getSeasonCheckDetail(file, 'media').expected - getSeasonCheckDetail(file, 'media').actual }} 集</span>
+                    <span class="sc-season-missing">缺 {{ getSeasonCheckDetail(file, 'media')!.expected - getSeasonCheckDetail(file, 'media')!.actual }} 集</span>
                   </span>
                   <!-- 目录：显示文件数和大小（年份文件夹强制屏蔽，有标注时隐藏原始 stats） -->
                   <span v-if="file.isDirectory && file.fileCount != null && !isYearFolder(file.name) && !getSeasonCheckDetail(file, 'media')" class="cd2-dir-stats">
@@ -2478,9 +2542,9 @@ onUnmounted(() => {
                 <span
                   v-if="file.isDirectory && cd2OrganizedDepth === 1 && getOrganizedShowCheckStatus(file)"
                   class="sc-inline-badge"
-                  :class="getOrganizedShowCheckStatus(file).status === 'incomplete' ? 'sc-badge-warn' : 'sc-badge-ok'"
+                  :class="getOrganizedShowCheckStatus(file)!.status === 'incomplete' ? 'sc-badge-warn' : 'sc-badge-ok'"
                 >
-                  {{ getOrganizedShowCheckStatus(file).status === 'incomplete' ? `⚠️ 缺 ${getOrganizedShowCheckStatus(file).incompleteCount} 季` : '✅ 完整' }}
+                  {{ getOrganizedShowCheckStatus(file)!.status === 'incomplete' ? `⚠️ 缺 ${getOrganizedShowCheckStatus(file)!.incompleteCount} 季` : '✅ 完整' }}
                 </span>
                 <!-- 单剧核查按钮（depth=1 剧集层级） -->
                 <button
@@ -2499,11 +2563,11 @@ onUnmounted(() => {
                   class="sc-inline-badge sc-badge-season"
                 >
                   <span class="sc-season-nums">
-                    <span class="sc-season-actual">{{ getSeasonCheckDetail(file, 'organized').actual }}</span>
+                    <span class="sc-season-actual">{{ getSeasonCheckDetail(file, 'organized')!.actual }}</span>
                     <span class="sc-season-sep">/</span>
-                    <span class="sc-season-expected">{{ getSeasonCheckDetail(file, 'organized').expected }}</span>
+                    <span class="sc-season-expected">{{ getSeasonCheckDetail(file, 'organized')!.expected }}</span>
                   </span>
-                  <span class="sc-season-missing">缺 {{ getSeasonCheckDetail(file, 'organized').expected - getSeasonCheckDetail(file, 'organized').actual }} 集</span>
+                  <span class="sc-season-missing">缺 {{ getSeasonCheckDetail(file, 'organized')!.expected - getSeasonCheckDetail(file, 'organized')!.actual }} 集</span>
                 </span>
                 <!-- 目录：显示文件数和大小（有标注时隐藏原始 stats） -->
                 <span v-if="file.isDirectory && file.fileCount != null && !isYearFolder(file.name) && !getSeasonCheckDetail(file, 'organized')" class="cd2-dir-stats">

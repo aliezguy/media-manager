@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -7,13 +7,151 @@ import {
   Tickets, DataAnalysis, MagicStick, Connection, Compass
 } from '@element-plus/icons-vue'
 
+// ==================== 类型定义 ====================
+
+// 全局配置（来自 GET /api/config）
+interface Config {
+  emby_host?: string
+  emby_api_key?: string
+  emby_user_id?: string
+}
+
+// Emby 媒体库（来自 POST /api/libraries，Emby VirtualFolders）
+interface Library {
+  Name: string
+  ItemId?: string
+  Id?: string
+}
+
+// 媒体汉化状态
+type MediaStatus = 'pending' | 'synced' | 'locked' | 'syncing'
+
+// Emby 演员（People 结构，兼容大小写字段）
+interface ActorPerson {
+  Name: string
+  name?: string
+  Role?: string
+  role?: string
+  Id?: string
+  Type?: string
+}
+
+// 后端 POST /api/actor_items 返回的原始媒体项
+interface RawActorItem {
+  id: string
+  name: string
+  year?: number | null
+  type: string
+  library?: string
+  actors?: ActorPerson[]
+  poster_url?: string | null
+  provider_ids?: Record<string, string>
+  sync_status?: MediaStatus
+  sync_matched?: number
+  sync_total?: number
+}
+
+// 单个演员汉化同步结果
+interface SyncDetail {
+  new_name: string
+  emby_name: string
+  new_role?: string
+  old_name?: string
+  old_role?: string
+  matched?: boolean
+  level?: string
+}
+
+interface SyncResult {
+  success: boolean
+  matched?: number
+  total_actors?: number
+  details?: SyncDetail[]
+  error?: string
+}
+
+// 前端列表展示用的媒体项
+interface MediaItem {
+  id: string
+  name: string
+  year?: number | null
+  type: string
+  actors: ActorPerson[]
+  poster_url?: string | null
+  provider_ids: Record<string, string>
+  status: MediaStatus
+  sync_matched: number
+  sync_total: number
+  checked: boolean
+  syncing: boolean
+  syncResult: SyncResult | null
+}
+
+// 分集数据透视（GET /api/media/{id}/details）
+interface ActorDetail {
+  name: string
+  role?: string
+  type?: string
+  image_url?: string
+  local_image_url?: string
+  birth_date?: string
+  birth_place?: string
+  overview?: string
+  sort_order?: number
+}
+
+interface SeriesDetail {
+  emby_item_id?: string
+  title: string
+  overview?: string
+  recursive_item_count?: number
+  actors: ActorDetail[]
+}
+
+interface EpisodeDetail {
+  emby_item_id?: string
+  title?: string
+  overview?: string
+  index_number?: number
+  parent_index_number?: number
+  poster_url?: string
+  actors: ActorDetail[]
+}
+
+interface MediaDetails {
+  series: SeriesDetail | null
+  episodes: EpisodeDetail[]
+}
+
+// 演员展示行（统一“名 饰 角色”格式）
+interface ActorDisplayRow {
+  name: string
+  role?: string
+}
+
+// 服务端全局搜索请求体（POST /api/actor_items）
+interface ActorItemsPayload {
+  library_id: string
+  limit: number
+  start_index: number
+  status_filter?: string
+  search?: string
+}
+
+// ★ 统一错误消息提取：优先取后端返回的 detail，回退到 Error.message / String(e)
+const getErrorMsg = (e: unknown): string => {
+  if (typeof e === 'object' && e !== null && 'response' in e) {
+    const detail = (e as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+    if (detail) return String(detail)
+  }
+  return e instanceof Error ? e.message : String(e)
+}
+
 const API_URL = ''
-const config = reactive({})
-const libraries = ref([])
-const items = ref([])
+const config = reactive<Config>({})
+const libraries = ref<Library[]>([])
+const items = ref<MediaItem[]>([])
 const loading = ref(false)
-const batchLoading = ref(false)
-const fullSyncLoading = ref(false)
 const auditLoading = ref(false)
 const auditingSelected = ref(false)
 const autoUpdateEnabled = ref(false)
@@ -22,36 +160,19 @@ const autoUpdating = ref(false)
 // 分集数据透视
 const detailsDrawerVisible = ref(false)
 const detailsLoading = ref(false)
-const detailsData = ref({ series: null, episodes: [] })
+const detailsData = ref<MediaDetails>({ series: null, episodes: [] })
 
-// 系统状态轮询
+// 系统状态轮询（stopPolling 在 onUnmounted 中统一清理）
 const systemStatus = ref({ is_running: false, progress: 0, total: 0, current_task: '' })
-let _pollTimer = null
-const pollSystemStatus = async () => {
-  try {
-    const res = await axios.get(API_URL + '/api/system_status')
-    const data = res.data || {}
-    systemStatus.value = {
-      is_running: data.is_running || false,
-      progress: data.progress || 0,
-      total: data.total || 0,
-      current_task: data.current_task || ''
-    }
-  } catch (e) { /* silent */ }
-}
-const startPolling = () => {
-  if (_pollTimer) return
-  pollSystemStatus()
-  _pollTimer = setInterval(pollSystemStatus, 3000)
-}
+let _pollTimer: ReturnType<typeof setInterval> | null = null
 const stopPolling = () => {
   if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null }
 }
 const searchQuery = ref('')
-let _searchTimer = null
+let _searchTimer: ReturnType<typeof setTimeout> | null = null
 
 // ★ 服务端全局搜索：输入防抖 350ms 后自动触发 loadItems
-watch(searchQuery, (newVal) => {
+watch(searchQuery, () => {
   if (_searchTimer) clearTimeout(_searchTimer)
   _searchTimer = setTimeout(() => {
     currentPage.value = 1
@@ -65,8 +186,8 @@ const enrichTaskId = ref('')
 const enrichTaskPercent = ref(0)
 const enrichTaskMessage = ref('')
 const enrichTaskDone = ref(false)
-const enrichTargetItem = ref(null)
-let _enrichTimer = null
+const enrichTargetItem = ref<MediaItem | null>(null)
+let _enrichTimer: ReturnType<typeof setInterval> | null = null
 
 // ★ 统一审计进度对话框（审计选中项 + 审计本地汉化状态共用）
 const auditDialogVisible = ref(false)
@@ -74,7 +195,7 @@ const auditTaskId = ref('')
 const auditTaskPercent = ref(0)
 const auditTaskMessage = ref('')
 const auditTaskDone = ref(false)
-let _auditTimer = null
+let _auditTimer: ReturnType<typeof setInterval> | null = null
 
 // ★ 统一汉化进度对话框（同步选中项 + 全量汉化共用）
 const sinicizeDialogVisible = ref(false)
@@ -82,7 +203,7 @@ const sinicizeTaskId = ref('')
 const sinicizeTaskPercent = ref(0)
 const sinicizeTaskMessage = ref('')
 const sinicizeTaskDone = ref(false)
-let _sinicizeTimer = null
+let _sinicizeTimer: ReturnType<typeof setInterval> | null = null
 
 const selectedLibrary = ref('')
 const selectedStatus = ref('')
@@ -126,7 +247,7 @@ const connectEmby = async () => {
     const res = await axios.post(API_URL + '/api/libraries', config)
     libraries.value = res.data || []
   } catch (e) {
-    ElMessage.error('连接 Emby 失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('连接 Emby 失败: ' + getErrorMsg(e))
   }
 }
 
@@ -136,13 +257,13 @@ const loadItems = async () => {
   items.value = []
   try {
     const startIndex = (currentPage.value - 1) * pageSize.value
-    const payload = {
+    const payload: ActorItemsPayload = {
       ...config, library_id: selectedLibrary.value, limit: pageSize.value, start_index: startIndex
     }
     if (selectedStatus.value) payload.status_filter = selectedStatus.value
     if (searchQuery.value) payload.search = searchQuery.value
     const res = await axios.post(API_URL + '/api/actor_items', payload)
-    items.value = (res.data.items || []).map(item => ({
+    items.value = (res.data.items || []).map((item: RawActorItem) => ({
       id: item.id, name: item.name, year: item.year, type: item.type,
       actors: item.actors || [], poster_url: item.poster_url || null, provider_ids: item.provider_ids || {},
       status: item.sync_status || 'pending',
@@ -153,32 +274,10 @@ const loadItems = async () => {
     totalItems.value = res.data.total || 0
     ElMessage.success('已加载 ' + items.value.length + ' 个媒体项（共 ' + totalItems.value + '）')
   } catch (e) {
-    ElMessage.error('加载失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('加载失败: ' + getErrorMsg(e))
   } finally {
     loading.value = false
   }
-}
-
-const handleSyncItem = async (item) => {
-  if (item.status === 'locked') { ElMessage.warning('该项目已锁定，无法同步'); return }
-  item.syncing = true; item.syncResult = null
-  try {
-    const res = await axios.post(API_URL + '/api/douban/sinicize', { item_id: item.id })
-    if (res.data.success) {
-      item.status = 'synced'; item.syncResult = res.data
-      try {
-        const dr = await axios.post(API_URL + '/api/actor_items', { ...config, library_id: selectedLibrary.value, limit: 20 })
-        const ref = (dr.data.items || []).find(i => i.id === item.id)
-        if (ref) { item.actors = ref.actors || []; item.provider_ids = ref.provider_ids || {} }
-      } catch (e) {}
-      ElMessage.success('《' + item.name + '》同步成功：匹配 ' + res.data.matched + '/' + res.data.total_actors + ' 位演员')
-    } else {
-      ElMessage.error('《' + item.name + '》同步失败')
-    }
-  } catch (e) {
-    item.syncResult = { success: false, error: e.response?.data?.detail || e.message }
-    ElMessage.error('《' + item.name + '》同步异常')
-  } finally { item.syncing = false }
 }
 
 const handleBatchSync = async () => {
@@ -199,7 +298,7 @@ const handleBatchSync = async () => {
   } catch (e) {
     sinicizeTaskMessage.value = '提交任务失败'
     sinicizeTaskDone.value = true
-    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
   }
 }
 
@@ -229,7 +328,7 @@ const handleForceTranslate = async () => {
   } catch (e) {
     sinicizeTaskMessage.value = '提交任务失败'
     sinicizeTaskDone.value = true
-    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
   }
 }
 
@@ -257,7 +356,7 @@ const handleFullSync = async () => {
   } catch (e) {
     sinicizeTaskMessage.value = '提交任务失败'
     sinicizeTaskDone.value = true
-    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
   }
 }
 
@@ -269,7 +368,7 @@ const stopAuditPolling = () => {
   if (_auditTimer) { clearInterval(_auditTimer); _auditTimer = null }
 }
 
-const startAuditPolling = (taskId) => {
+const startAuditPolling = (taskId: string) => {
   stopAuditPolling()
   _auditTimer = setInterval(async () => {
     try {
@@ -323,7 +422,7 @@ const stopSinicizePolling = () => {
   if (_sinicizeTimer) { clearInterval(_sinicizeTimer); _sinicizeTimer = null }
 }
 
-const startSinicizePolling = (taskId) => {
+const startSinicizePolling = (taskId: string) => {
   stopSinicizePolling()
   _sinicizeTimer = setInterval(async () => {
     try {
@@ -392,7 +491,7 @@ const handleAuditLocal = async () => {
   } catch (e) {
     auditTaskMessage.value = '提交任务失败'
     auditTaskDone.value = true
-    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
   }
 }
 
@@ -417,11 +516,11 @@ const handleAuditSelected = async () => {
   } catch (e) {
     auditTaskMessage.value = '提交任务失败'
     auditTaskDone.value = true
-    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
   }
 }
 
-const handleToggleAuto = async (val) => {
+const handleToggleAuto = async (val: boolean) => {
   autoUpdating.value = true
   try {
     autoUpdateEnabled.value = val
@@ -430,15 +529,15 @@ const handleToggleAuto = async (val) => {
   finally { autoUpdating.value = false }
 }
 
-const statusLabel = (s) => ({ pending: '未汉化', synced: '已汉化', locked: '已锁定', syncing: '汉化中' }[s] || s)
-const statusPillClass = (s) => ({
+const statusLabel = (s: MediaStatus): string => ({ pending: '未汉化', synced: '已汉化', locked: '已锁定', syncing: '汉化中' }[s] || s)
+const statusPillClass = (s: MediaStatus): string => ({
   pending: 'pill-pending',
   synced: 'pill-synced',
   locked: 'pill-locked',
   syncing: 'pill-syncing',
 }[s] || 'pill-locked')
 
-const getPosterGradient = (name) => {
+const getPosterGradient = (name: string) => {
   const g = [
     'linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%)',
     'linear-gradient(135deg, #1a1a2e 0%, #1a1a2e 50%, #533483 100%)',
@@ -451,27 +550,27 @@ const getPosterGradient = (name) => {
   return g[Math.abs(h) % g.length]
 }
 
-const getPosterUrl = (item) => {
+const getPosterUrl = (item: MediaItem) => {
   if (!config.emby_host || !config.emby_api_key || !item.id) return null
   return config.emby_host + '/emby/Items/' + item.id + '/Images/Primary?api_key=' + config.emby_api_key
 }
 
-const getSyncTag = (item) => {
+const getSyncTag = (item: MediaItem) => {
   if (!item.syncResult) return null
   if (item.syncResult.success) return '✓ 匹配 ' + item.syncResult.matched + '/' + item.syncResult.total_actors
   return '✘ 失败'
 }
 
 // ★ 最终展示行：演员名（已汉化优先取新名）+ 角色名，统一“名 饰 角色”格式（纯展示层，不改动业务逻辑）
-const actorDisplayRows = (item) => {
+const actorDisplayRows = (item: MediaItem): ActorDisplayRow[] => {
   const details = (item.status === 'synced' && item.syncResult) ? (item.syncResult.details || []) : []
   if (details.length) {
     return details.map(d => ({ name: d.new_name || d.emby_name, role: d.new_role || '' }))
   }
-  return (item.actors || []).map(a => ({ name: a.Name || a.name, role: a.Role || a.role }))
+  return (item.actors || []).map(a => ({ name: a.Name || a.name, role: a.Role || a.role })) as ActorDisplayRow[]
 }
 
-const openDetailsDrawer = async (itemId) => {
+const openDetailsDrawer = async (itemId: string) => {
   detailsDrawerVisible.value = true
   detailsLoading.value = true
   detailsData.value = { series: null, episodes: [] }
@@ -479,7 +578,7 @@ const openDetailsDrawer = async (itemId) => {
     const res = await axios.get(API_URL + '/api/media/' + itemId + '/details')
     detailsData.value = res.data
   } catch (e) {
-    ElMessage.error('加载分集详情失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('加载分集详情失败: ' + getErrorMsg(e))
     detailsDrawerVisible.value = false
   } finally {
     detailsLoading.value = false
@@ -494,7 +593,7 @@ const stopEnrichPolling = () => {
   if (_enrichTimer) { clearInterval(_enrichTimer); _enrichTimer = null }
 }
 
-const handleBatchEnrichEpisodes = async (item) => {
+const handleBatchEnrichEpisodes = async (item: MediaItem) => {
   if (!item || item.type !== 'Series') {
     ElMessage.warning('仅剧集 (Series) 支持分集批量富化')
     return
@@ -557,7 +656,7 @@ const handleBatchEnrichEpisodes = async (item) => {
   } catch (e) {
     enrichTaskMessage.value = '提交任务失败'
     enrichTaskDone.value = true
-    ElMessage.error('提交失败: ' + (e.response?.data?.detail || e.message))
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
   }
 }
 

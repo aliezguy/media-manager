@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { reactive, ref, onMounted } from 'vue'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
@@ -8,10 +8,19 @@ import {
   FolderTree, Folder, HardDrive, Cpu, CheckCircle2, XCircle
 } from 'lucide-vue-next'
 
+// AI Provider 配置项（与后端 config.json 的 ai_providers 结构保持一致）
+interface AIProvider {
+  name: string
+  base_url: string
+  alt_base_url: string
+  api_key: string
+  model_name: string
+}
+
 const API_URL = ''
 const loading = ref(false)
 // null | 'testing' | 'ok' | 'fail' —— 连接状态指示（纯前端 UI 状态，不影响数据结构）
-const connState = ref(null)
+const connState = ref<'testing' | 'ok' | 'fail' | null>(null)
 // 哪些 AI Provider 子卡片处于展开状态（默认全部展开，可折叠）
 const openIdx = ref([0, 1, 2])
 
@@ -34,17 +43,17 @@ const config = reactive({
   ]
 })
 
-const priorityLabel = (idx) => ['首选', '次选', '三选'][idx] || ('Provider ' + (idx + 1))
+const priorityLabel = (idx: number) => ['首选', '次选', '三选'][idx] || ('Provider ' + (idx + 1))
 
-const providerStatus = (p) => {
+const providerStatus = (p: AIProvider | null | undefined) => {
   if (!p) return { text: '未配置', tone: 'off' }
   if (p.model_name && p.api_key) return { text: '已就绪', tone: 'ok' }
   if (p.model_name || p.api_key) return { text: '配置不完整', tone: 'warn' }
   return { text: '未配置', tone: 'off' }
 }
 
-const isOpen = (idx) => openIdx.value.includes(idx)
-const toggleProvider = (idx) => {
+const isOpen = (idx: number) => openIdx.value.includes(idx)
+const toggleProvider = (idx: number) => {
   const i = openIdx.value.indexOf(idx)
   openIdx.value = i >= 0
     ? openIdx.value.filter((x) => x !== idx)
@@ -83,7 +92,7 @@ const testConnection = async () => {
     await saveConfig()
   } catch (e) {
     connState.value = 'fail'
-    ElMessage.error('连接失败: ' + e.message)
+    ElMessage.error('连接失败: ' + (e instanceof Error ? e.message : String(e)))
   } finally {
     loading.value = false
   }

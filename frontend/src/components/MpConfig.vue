@@ -1,4 +1,4 @@
-<script setup>
+<script setup lang="ts">
 import { reactive, onMounted, ref, computed } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -8,12 +8,35 @@ import {
 } from 'lucide-vue-next'
 import draggable from 'vuedraggable'
 
+// MP 站点选项（/api/resources 的 sites 返回项）
+interface MpSite {
+  id: string | number
+  name: string
+}
+
+// MP 资源项（filter_groups / downloaders 返回项，仅 name）
+interface MpResource {
+  name: string
+}
+
+// 洗版/订阅策略（与后端 config.json wash_schemes / subscribe_schemes 结构一致）
+interface MpScheme {
+  _dragId?: number
+  name: string
+  keywords: string[]
+  sites: Array<string | number>
+  filter_groups: string[]
+  downloader: string
+  quality: string
+  active: boolean
+}
+
 // 本地开发用空字符串，自动适配
 const API_URL = ''
 
 // 拖拽排序 — 为每个策略生成唯一 key
 let _uidCounter = 0
-const getItemKey = (item) => {
+const getItemKey = (item: MpScheme) => {
   if (!item._dragId) item._dragId = ++_uidCounter
   return item._dragId
 }
@@ -29,13 +52,17 @@ const config = reactive({
   mp_username: '',
   mp_password: '',
   tmdb_api_key: '',
-  wash_schemes: [],
-  subscribe_schemes: []
+  wash_schemes: [] as MpScheme[],
+  subscribe_schemes: [] as MpScheme[]
 })
 
 // UI 状态
 const activeTab = ref('subscribe')
-const options = reactive({ sites: [], filter_groups: [], downloaders: [] })
+const options = reactive({
+  sites: [] as MpSite[],
+  filter_groups: [] as MpResource[],
+  downloaders: [] as MpResource[]
+})
 const loadingRes = ref(false)
 const qualityOptions = ['全部','蓝光原盘', 'WEB-DL', 'BluRay', 'UHD', 'Remux', 'HDTV', 'H265', 'H264']
 
@@ -47,7 +74,10 @@ const inputKeyword = ref('')
 
 // 编辑中的策略对象
 const editingScheme = reactive({
-  name: '', keywords: [], sites: [], filter_groups: [],
+  name: '',
+  keywords: [] as string[],
+  sites: [] as Array<string | number>,
+  filter_groups: [] as string[],
   downloader: '', quality: '', active: true
 })
 
@@ -106,7 +136,7 @@ const fetchResources = async (silent=false) => {
   finally { loadingRes.value = false }
 }
 
-const getSiteName = (id) => {
+const getSiteName = (id: string | number) => {
   const s = options.sites.find(item => item.id === id)
   return s ? s.name : id
 }
@@ -122,14 +152,14 @@ const openAddDialog = () => {
   if (options.filter_groups.length === 0) fetchResources(true)
 }
 
-const openEditDialog = (index, row) => {
+const openEditDialog = (index: number, row: MpScheme) => {
   isEditMode.value = true
   editIndex.value = index
   Object.assign(editingScheme, JSON.parse(JSON.stringify(row)))
   dialogVisible.value = true
 }
 
-const deleteScheme = async (index) => {
+const deleteScheme = async (index: number) => {
   await ElMessageBox.confirm('确定删除该策略吗？', '提示', { type: 'warning' })
   currentSchemes.value.splice(index, 1)
   saveConfig()
@@ -146,7 +176,7 @@ const confirmScheme = () => {
   saveConfig()
 }
 
-const moveScheme = (index, direction) => {
+const moveScheme = (index: number, direction: 'up' | 'down') => {
   const arr = currentSchemes.value
   if (direction === 'up' && index > 0) {
     [arr[index], arr[index - 1]] = [arr[index - 1], arr[index]]
@@ -162,7 +192,7 @@ const addKeyword = () => {
     inputKeyword.value = ''
   }
 }
-const removeKeyword = (tag) => {
+const removeKeyword = (tag: string) => {
   editingScheme.keywords = editingScheme.keywords.filter(k => k !== tag)
 }
 </script>
