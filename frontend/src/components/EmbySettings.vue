@@ -2,10 +2,12 @@
 import { reactive, ref, onMounted } from 'vue'
 import axios from 'axios'
 import { ElMessage } from 'element-plus'
+import draggable from 'vuedraggable'
 import {
   Server, Cloud, Sparkles, Save, PlugZap, Loader2,
   ChevronDown, KeyRound, UserRound, Globe, Link2,
-  FolderTree, Folder, HardDrive, Cpu, CheckCircle2, XCircle
+  FolderTree, Folder, HardDrive, Cpu, CheckCircle2, XCircle,
+  GripVertical, Plus, Trash2
 } from 'lucide-vue-next'
 
 // AI Provider 配置项（与后端 config.json 的 ai_providers 结构保持一致）
@@ -15,15 +17,20 @@ interface AIProvider {
   alt_base_url: string
   api_key: string
   model_name: string
+  _dragId?: number  // UI 临时字段：vuedraggable 稳定 key + 展开状态锚点；保存前剥离，不落盘
 }
+
+const MAX_PROVIDERS = 6
+const ORDINAL_LABELS = ['首选', '次选', '三选', '四选', '五选', '六选']
+
+// UI 临时唯一 id 生成（镜像 MpConfig.vue 的 _dragId 模式）
+let _uidCounter = 0
+const genDragId = () => ++_uidCounter
 
 const API_URL = ''
 const loading = ref(false)
 // null | 'testing' | 'ok' | 'fail' —— 连接状态指示（纯前端 UI 状态，不影响数据结构）
 const connState = ref<'testing' | 'ok' | 'fail' | null>(null)
-// 哪些 AI Provider 子卡片处于展开状态（默认全部展开，可折叠）
-const openIdx = ref([0, 1, 2])
-
 const config = reactive({
   emby_host: '',
   emby_api_key: '',
@@ -40,10 +47,10 @@ const config = reactive({
     { name: '首选', base_url: '', alt_base_url: '', api_key: '', model_name: '' },
     { name: '次选', base_url: '', alt_base_url: '', api_key: '', model_name: '' },
     { name: '三选', base_url: '', alt_base_url: '', api_key: '', model_name: '' }
-  ]
+  ] as AIProvider[]
 })
 
-const priorityLabel = (idx: number) => ['首选', '次选', '三选'][idx] || ('Provider ' + (idx + 1))
+const priorityLabel = (idx: number) => ORDINAL_LABELS[idx] || ('Provider ' + (idx + 1))
 
 const providerStatus = (p: AIProvider | null | undefined) => {
   if (!p) return { text: '未配置', tone: 'off' }
@@ -52,32 +59,92 @@ const providerStatus = (p: AIProvider | null | undefined) => {
   return { text: '未配置', tone: 'off' }
 }
 
-const isOpen = (idx: number) => openIdx.value.includes(idx)
-const toggleProvider = (idx: number) => {
-  const i = openIdx.value.indexOf(idx)
-  openIdx.value = i >= 0
-    ? openIdx.value.filter((x) => x !== idx)
-    : [...openIdx.value, idx]
+// 展开状态按 _dragId 锚定（重排 / 删除后不错位）
+const openIds = ref<Set<number>>(new Set())
+const isOpen = (p: AIProvider) => p._dragId != null && openIds.value.has(p._dragId)
+const toggleProvider = (p: AIProvider) => {
+  if (p._dragId == null) return
+  const next = new Set(openIds.value)
+  if (next.has(p._dragId)) next.delete(p._dragId)
+  else next.add(p._dragId)
+  openIds.value = next
+}
+const openAll = () => {
+  openIds.value = new Set(
+    (config.ai_providers as AIProvider[])
+      .map((p) => p._dragId)
+      .filter((id): id is number => id != null)
+  )
 }
 
 onMounted(async () => {
   try {
     const res = await axios.get(`${API_URL}/api/config`)
     Object.assign(config, res.data)
-    // 归一化 Provider 列表：兼容旧配置数据，为每个 Provider backfill 新增的 alt_base_url 字段（避免 undefined 落盘）
+    // 归一化 Provider 列表：兼容旧配置数据，backfill alt_base_url 与 UI 临时 _dragId
     if (!Array.isArray(config.ai_providers)) config.ai_providers = []
-    config.ai_providers = config.ai_providers.map((p) => ({
+    config.ai_providers = (config.ai_providers as AIProvider[]).map((p) => ({
       ...p,
-      alt_base_url: p.alt_base_url || ''
+      alt_base_url: p.alt_base_url || '',
+      _dragId: p._dragId ?? genDragId()
     }))
-    // 后端返回几个 Provider 就默认展开几个
-    openIdx.value = config.ai_providers.map((_, i) => i)
+    openAll()
   } catch (e) {}
 })
 
+const atCap = () => (config.ai_providers || []).length >= MAX_PROVIDERS
+
+const addProvider = () => {
+  if (atCap()) {
+    ElMessage.warning(`最多支持 ${MAX_PROVIDERS} 个模型，请先删除再添加`)
+    return
+  }
+  const dragId = genDragId()
+  config.ai_providers.push({
+    name: priorityLabel(config.ai_providers.length),
+    base_url: '',
+    alt_base_url: '',
+    api_key: '',
+    model_name: '',
+    _dragId: dragId
+  })
+  openIds.value = new Set(openIds.value).add(dragId)
+}
+
+const removeProvider = (p: AIProvider) => {
+  if (p._dragId != null) {
+    const next = new Set(openIds.value)
+    next.delete(p._dragId)
+    openIds.value = next
+  }
+  const i = config.ai_providers.findIndex((x) => x._dragId === p._dragId)
+  if (i >= 0) config.ai_providers.splice(i, 1)
+}
+
+// 重排后：默认序数名称跟随新位置；用户自定义名称（如"硅基流动"）不动
+const onDragChange = () => {
+  config.ai_providers.forEach((p, idx) => {
+    if (typeof p.name === 'string' && ORDINAL_LABELS.includes(p.name)) {
+      p.name = priorityLabel(idx)
+    }
+  })
+}
+
+// vuedraggable 稳定 key（onMounted / addProvider 保证每项都有 _dragId）
+const getProviderKey = (p: AIProvider) => p._dragId ?? -1
+
+// 保存前剥离 UI 临时字段 _dragId，避免污染 config.json
+const cleanPayload = () => {
+  const { ai_providers, ...rest } = config
+  return {
+    ...rest,
+    ai_providers: (ai_providers || []).map(({ _dragId, ...p }) => p)
+  }
+}
+
 const saveConfig = async () => {
   try {
-    await axios.post(`${API_URL}/api/config`, config)
+    await axios.post(`${API_URL}/api/config`, cleanPayload())
     ElMessage.success('配置已保存')
   } catch (e) { ElMessage.error('保存失败') }
 }
@@ -242,55 +309,86 @@ const testConnection = async () => {
         </header>
 
         <div class="card-body">
-          <!-- Provider 可折叠子卡片 -->
+          <!-- Provider 可折叠子卡片（拖拽排序 + 增删，上限 6 个） -->
           <div class="provider-list">
-            <div
-              v-for="(p, idx) in config.ai_providers || []"
-              :key="idx"
-              class="provider-card"
-              :class="{ 'is-open': isOpen(idx) }"
-            >
-              <div class="provider-head" @click="toggleProvider(idx)">
-                <span class="priority-badge" :class="'badge-' + (idx % 3)">
-                  <i></i>{{ priorityLabel(idx) }}
-                </span>
-                <span class="provider-model">{{ p.model_name || '未配置模型' }}</span>
-                <span class="provider-state" :class="'st-' + providerStatus(p).tone">
-                  <i></i>{{ providerStatus(p).text }}
-                </span>
-                <span class="chevron" :class="{ rotated: isOpen(idx) }">
-                  <ChevronDown :size="16" />
-                </span>
-              </div>
+            <!-- 空态：未配置任何模型 -->
+            <div v-if="!(config.ai_providers || []).length" class="provider-empty">
+              <p class="provider-empty-title">尚未配置任何 AI 模型</p>
+              <p class="provider-empty-sub">所有 AI 功能（翻译 / 推荐 / 推理 / 打标）将禁用。点击下方「添加模型」开始配置。</p>
+            </div>
 
-              <div class="provider-body" :class="{ hidden: !isOpen(idx) }">
-                <div class="provider-body-inner">
-                  <div class="grid grid-cols-1 gap-x-6 gap-y-4.5 md:grid-cols-2">
-                    <div>
-                      <label class="field-label">名称（用于日志标识）</label>
-                      <el-input v-model="p.name" placeholder="如：硅基流动 / OpenAI官方" />
+            <draggable
+              v-if="(config.ai_providers || []).length"
+              v-model="config.ai_providers"
+              :animation="250"
+              ghost-class="drag-ghost"
+              drag-class="drag-live"
+              handle=".drag-handle"
+              :item-key="getProviderKey"
+              @change="onDragChange"
+            >
+              <template #item="{ element: p, index }">
+                <div class="provider-card" :class="{ 'is-open': isOpen(p) }">
+                  <div class="provider-head" @click="toggleProvider(p)">
+                    <span class="drag-handle" title="拖拽调整优先级" @click.stop>
+                      <GripVertical :size="15" />
+                    </span>
+                    <span class="priority-badge" :class="'badge-' + (index % 3)">
+                      <i></i>{{ priorityLabel(index) }}
+                    </span>
+                    <span class="provider-model">{{ p.model_name || '未配置模型' }}</span>
+                    <span class="provider-state" :class="'st-' + providerStatus(p).tone">
+                      <i></i>{{ providerStatus(p).text }}
+                    </span>
+                    <span class="provider-remove" title="删除该模型" @click.stop="removeProvider(p)">
+                      <Trash2 :size="14" />
+                    </span>
+                    <span class="chevron" :class="{ rotated: isOpen(p) }">
+                      <ChevronDown :size="16" />
+                    </span>
+                  </div>
+
+                  <div class="provider-body" :class="{ hidden: !isOpen(p) }">
+                    <div class="provider-body-inner">
+                      <div class="grid grid-cols-1 gap-x-6 gap-y-4.5 md:grid-cols-2">
+                        <div>
+                          <label class="field-label">名称（用于日志标识）</label>
+                          <el-input v-model="p.name" placeholder="如：硅基流动 / OpenAI官方" />
+                        </div>
+                        <div>
+                          <label class="field-label"><Cpu :size="13" />模型名称 (Model)</label>
+                          <el-input v-model="p.model_name" placeholder="deepseek-ai/DeepSeek-V3" />
+                        </div>
+                      </div>
+                      <div class="mt-5">
+                        <label class="field-label"><Link2 :size="13" />接口地址 (Base URL)</label>
+                        <el-input v-model="p.base_url" placeholder="https://api.siliconflow.cn/v1（留空使用 OpenAI 默认地址）" />
+                      </div>
+                      <div class="mt-5">
+                        <label class="field-label"><Globe :size="13" />备选接口地址 (Alt Base URL)</label>
+                        <el-input v-model="p.alt_base_url" placeholder="例如：http://host.docker.internal:11434/v1 (用于 Docker 兜底)" />
+                        <p class="field-tip">非必填。主地址网络连接不通时（本地调试 vs Docker 部署）自动切换到此地址重试</p>
+                      </div>
+                      <div class="mt-5">
+                        <label class="field-label"><KeyRound :size="13" />API Key</label>
+                        <el-input v-model="p.api_key" type="password" show-password placeholder="sk-..." />
+                      </div>
                     </div>
-                    <div>
-                      <label class="field-label"><Cpu :size="13" />模型名称 (Model)</label>
-                      <el-input v-model="p.model_name" placeholder="deepseek-ai/DeepSeek-V3" />
-                    </div>
-                  </div>
-                  <div class="mt-5">
-                    <label class="field-label"><Link2 :size="13" />接口地址 (Base URL)</label>
-                    <el-input v-model="p.base_url" placeholder="https://api.siliconflow.cn/v1（留空使用 OpenAI 默认地址）" />
-                  </div>
-                  <div class="mt-5">
-                    <label class="field-label"><Globe :size="13" />备选接口地址 (Alt Base URL)</label>
-                    <el-input v-model="p.alt_base_url" placeholder="例如：http://host.docker.internal:11434/v1 (用于 Docker 兜底)" />
-                    <p class="field-tip">非必填。主地址网络连接不通时（本地调试 vs Docker 部署）自动切换到此地址重试</p>
-                  </div>
-                  <div class="mt-5">
-                    <label class="field-label"><KeyRound :size="13" />API Key</label>
-                    <el-input v-model="p.api_key" type="password" show-password placeholder="sk-..." />
                   </div>
                 </div>
-              </div>
-            </div>
+              </template>
+            </draggable>
+
+            <!-- 添加模型按钮（达上限禁用） -->
+            <button
+              type="button"
+              class="provider-add"
+              :disabled="atCap()"
+              @click="addProvider"
+            >
+              <Plus :size="15" />
+              {{ atCap() ? `已达上限（${MAX_PROVIDERS} 个）` : '添加模型' }}
+            </button>
           </div>
 
           <!-- 多模型降级说明 -->
@@ -332,7 +430,7 @@ const testConnection = async () => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="postcss">
 /* ==================== 根容器 ==================== */
 .settings-root {
   position: relative;
@@ -784,5 +882,86 @@ const testConnection = async () => {
   }
   /* fade-up 基础态为透明，禁用动画时必须强制可见，否则内容会消失 */
   .fade-up { opacity: 1; }
+}
+
+/* ==================== AI Provider 拖拽排序 + 增删 ==================== */
+.drag-handle {
+  display: inline-flex;
+  align-items: center;
+  color: rgba(255, 255, 255, 0.35);
+  cursor: grab;
+  user-select: none;
+  transition: color 0.2s ease;
+}
+.drag-handle:hover { color: rgba(255, 255, 255, 0.7); }
+.drag-handle:active { cursor: grabbing; }
+
+.provider-remove {
+  display: inline-flex;
+  align-items: center;
+  color: rgba(255, 255, 255, 0.35);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.provider-remove:hover { color: #f87171; }
+
+:deep(.drag-ghost) {
+  opacity: 0.3;
+  background: rgba(59, 130, 246, 0.12) !important;
+  border: 1px dashed #3b82f6 !important;
+  border-radius: 16px;
+}
+:deep(.drag-live) {
+  transform: scale(1.04) !important;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5), 0 0 20px rgba(59, 130, 246, 0.3) !important;
+  z-index: 1000 !important;
+  cursor: grabbing !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+  border-color: #3b82f6 !important;
+}
+
+.provider-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px 0;
+  border: 1px dashed rgba(255, 255, 255, 0.15);
+  border-radius: 12px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.provider-add:hover:not(:disabled) {
+  border-color: rgba(59, 130, 246, 0.6);
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(59, 130, 246, 0.08);
+}
+.provider-add:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.provider-empty {
+  padding: 24px 0;
+  text-align: center;
+  border: 1px dashed rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.provider-empty-title {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.8);
+}
+.provider-empty-sub {
+  margin: 0;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.4);
 }
 </style>
