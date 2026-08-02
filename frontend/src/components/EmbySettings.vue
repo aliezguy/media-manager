@@ -320,6 +320,7 @@ const testConnection = async () => {
             <draggable
               v-if="(config.ai_providers || []).length"
               v-model="config.ai_providers"
+              class="flex flex-col gap-3"
               :animation="250"
               ghost-class="drag-ghost"
               drag-class="drag-live"
