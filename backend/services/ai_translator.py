@@ -1,10 +1,14 @@
 """
 AI 翻译服务 — 通用 LLM 翻译，兼容任意 OpenAI SDK 接口的大模型。
 
-【核心能力：多级 API 瀑布流 Fallback】
+【核心能力：地址级 + 模型级 双重高可用降级】
 - 每次调用动态读取系统最新配置（支持热切换，无需重启服务）。
-- 配置化读取多个优先级的 Provider（Primary / Secondary / Tertiary …），
-  按顺序逐级尝试：当前 Provider 内部先做指数退避重试，重试耗尽后自动无缝降级到下一个 API。
+- 「地址级」：每个 Provider 可配置主地址 base_url + 备选地址 alt_base_url，
+  发起请求前自动组成 [主地址, 备选地址] 候选列表。主地址纯粹网络连接失败
+  （openai.APIConnectionError / httpx.ConnectError，即地址不可达）→ 无缝切换到备选地址；
+  业务错误（429 限流 / 5xx，说明地址可达但被拒绝）→ 不试备选，直接交给指数退避 / 模型级降级。
+- 「模型级」：配置化读取多个优先级的 Provider（Primary / Secondary / Tertiary …），
+  按顺序逐级尝试：当前 Provider 内「地址级降级 → 指数退避重试」全部耗尽后，自动无缝降级到下一个 API。
 - 空值防御：某个优先级的配置为空、或缺失 api_key / model_name 等核心字段时，优雅跳过，直接尝试下一个。
 
 【配置 Schema（config.json）】
@@ -12,6 +16,7 @@ AI 翻译服务 — 通用 LLM 翻译，兼容任意 OpenAI SDK 接口的大模�
         {
             "name": "硅基流动",              # 可选，仅用于日志标识
             "base_url": "https://api.siliconflow.cn/v1",
+            "alt_base_url": "http://host.docker.internal:8000/v1",  # 可选，主地址网络不通时自动切换（本地调试/Docker 兜底）
             "api_key": "sk-xxx",
             "model_name": "deepseek-ai/DeepSeek-V3",
             "timeout": 60,                   # 可选，单次请求超时（秒）
@@ -87,6 +92,13 @@ try:
 except ImportError:  # pragma: no cover
     OPENAI_AVAILABLE = False
     _API_TIMEOUT_EXC = _API_CONN_EXC = _INTERNAL_SERVER_EXC = _RATE_LIMIT_EXC = None
+
+# httpx 底层连接异常（openai SDK 依赖 httpx，通常可用；失败仅影响「网络错误精准识别」降级）
+try:
+    import httpx
+    _HTTPX_CONNECT_EXC: Optional[type] = httpx.ConnectError
+except ImportError:  # pragma: no cover
+    _HTTPX_CONNECT_EXC = None
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +247,37 @@ def _is_retryable_error(exc: Exception) -> bool:
     ))
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """是否为纯粹的「网络连接错误」（地址不可达），用于地址级降级：主地址不通 → 无缝试备选地址。
+
+    覆盖 openai.APIConnectionError（openai SDK 对底层传输错误统一包装）与 httpx.ConnectError
+    （含 ConnectTimeout 等子类）；另对少数自建兼容端点直接抛出的裸 socket 错误做关键词兜底。
+    """
+    if _API_CONN_EXC is not None and isinstance(exc, _API_CONN_EXC):
+        return True
+    if _HTTPX_CONNECT_EXC is not None and isinstance(exc, _HTTPX_CONNECT_EXC):
+        return True
+    msg = str(exc).lower()
+    return any(kw in msg for kw in (
+        "connection refused", "failed to connect", "cannot connect",
+        "getaddrinfo", "name resolution", "could not resolve",
+        "network unreachable", "host unreachable", "connecterror",
+    ))
+
+
+def _is_retryable_business_error(exc: Exception) -> bool:
+    """
+    可重试的业务瞬时故障（429 限流 / 5xx / 超时 / 断连），但显式排除「网络连接错误」。
+
+    设计意图：网络连接错误意味着「当前地址不可达」，在同一地址上做指数退避是无意义的，
+    统一交由地址级降级（主地址 → 备选地址）处理；业务错误则说明地址可达、只是被拒绝，
+    才适合在同一地址上指数退避重试。
+    """
+    if _is_connection_error(exc):
+        return False
+    return _is_retryable_error(exc)
+
+
 def _is_response_format_unsupported(exc: Exception) -> bool:
     """部分 OpenAI 兼容 API 不支持 response_format 参数（400），需要降级为无格式约束重试。"""
     msg = str(exc).lower()
@@ -352,10 +395,12 @@ class AITranslator:
         if not api_key or not model_name:
             return None
         base_url = str(raw.get("base_url") or "").strip()
+        alt_base_url = str(raw.get("alt_base_url") or "").strip()
         name = str(raw.get("name") or "").strip() or model_name
         return {
             "name": name,
             "base_url": base_url or None,          # 空串 → None（走 OpenAI 默认端点）
+            "alt_base_url": alt_base_url or None,  # 可选，主地址网络不通时自动切换（地址级降级）
             "api_key": api_key,
             "model_name": model_name,
             "timeout": cls._safe_positive_int(raw.get("timeout"), default_timeout, allow_zero=False),
@@ -414,17 +459,36 @@ class AITranslator:
         return providers
 
     @staticmethod
-    def _build_client(provider: dict) -> Optional[OpenAI]:
+    def _build_address_list(provider: dict) -> List[str]:
+        """
+        组装当前 Provider 待尝试的「地址级」候选列表（主地址在前，备选地址在后）。
+        空串 "" 表示 OpenAI 默认端点（base_url 留空时的语义）。
+        - base_url 留空 → 主地址即 OpenAI 默认端点；
+        - alt_base_url 留空 或 与主地址相同 → 自动去重跳过（保证至少返回 1 个候选）。
+        """
+        primary = (provider.get("base_url") or "").strip()
+        alt = (provider.get("alt_base_url") or "").strip()
+        addresses: List[str] = [primary]
+        if alt and alt != primary:
+            addresses.append(alt)
+        return addresses
+
+    @staticmethod
+    def _build_client(provider: dict, base_url: Optional[str] = None) -> Optional[OpenAI]:
         """
         根据单个 Provider 构建 OpenAI client。
         显式关闭 SDK 自带重试（max_retries=0），统一由本模块瀑布流控制，避免重试叠加导致长阻塞。
+
+        base_url 参数：地址级降级时覆盖 provider["base_url"]；
+        传 None 表示沿用 Provider 配置的主地址，传 "" 表示使用 OpenAI 默认端点。
         """
         if not OPENAI_AVAILABLE:
             logger.error("   ❌ [AI翻译] openai SDK 未安装，无法发起翻译请求")
             return None
         kwargs: dict = {"api_key": provider["api_key"]}
-        if provider.get("base_url"):
-            kwargs["base_url"] = provider["base_url"]
+        url = provider.get("base_url") if base_url is None else base_url
+        if url:
+            kwargs["base_url"] = url
         kwargs["timeout"] = provider.get("timeout", DEFAULT_TIMEOUT)
         kwargs["max_retries"] = 0
         try:
@@ -462,12 +526,84 @@ class AITranslator:
                 return client.chat.completions.create(**kwargs)
             raise
 
+    def _chat_with_address_fallback(self, *, provider: dict, messages: List[dict],
+                                    temperature: float, max_tokens: int):
+        """
+        【地址级降级核心】同一 Provider 内，主地址 → 备选地址 逐个尝试。
+
+        候选列表由 _build_address_list 组装：[base_url(主), alt_base_url(备)]，空串 = OpenAI 默认端点。
+        精准异常分流：
+        - 纯粹的「网络连接错误」（APIConnectionError / httpx.ConnectError，地址不可达）→
+          logger.warning 后 continue 无缝尝试下一个地址；
+        - 业务错误（429 限流 / 5xx / 超时，说明地址可达但被拒绝）→ 不试备选地址，直接上抛，
+          由 _retry_with_backoff 已经完成的指数退避结果 + 模型级瀑布降级逻辑接管；
+        - 主备地址全部连接失败 → 抛最后一次连接异常，触发降级到下一个 Provider。
+        """
+        pname = provider["name"]
+        addresses = self._build_address_list(provider)
+        total = len(addresses)
+        last_conn_exc: Optional[Exception] = None
+
+        for i, addr in enumerate(addresses):
+            addr_display = addr if addr else "OpenAI默认端点"
+            addr_tag = "主地址" if i == 0 else "备选地址"
+            logger.info(
+                "   🚀 [AI翻译] Provider[%s] 正在尝试%s %s（%d/%d）…",
+                pname, addr_tag, addr_display, i + 1, total,
+            )
+
+            client = self._build_client(provider, base_url=addr)
+            if client is None:
+                logger.warning("   ⚠️ [AI翻译] Provider[%s] %s 客户端构建失败，跳过该地址", pname, addr_display)
+                continue
+
+            try:
+                resp = _retry_with_backoff(
+                    lambda: self._chat_once(client, provider, messages, temperature, max_tokens),
+                    max_retries=provider["max_retries"],
+                    base_delay=DEFAULT_BASE_DELAY,
+                    max_delay=DEFAULT_MAX_BACKOFF_DELAY,
+                    should_retry=_is_retryable_business_error,
+                    on_retry=lambda attempt, exc, delay, pname=pname: logger.warning(
+                        "   ⚠️ [AI翻译] Provider[%s] 第 %d 次指数退避重试（%.1fs 后）：%s",
+                        pname, attempt, delay, exc,
+                    ),
+                )
+                if i > 0:
+                    logger.info("   ✅ [AI翻译] Provider[%s] 备选地址请求成功，翻译继续", pname)
+                return resp
+            except Exception as exc:
+                if _is_connection_error(exc):
+                    # 纯网络错误：地址不通 → 无缝继续尝试备选地址（不做指数退避，浪费时间）
+                    last_conn_exc = exc
+                    logger.warning(
+                        "   ⚠️ [AI翻译] Provider[%s] %s 网络连接失败（%s）%s",
+                        pname, addr_display, exc,
+                        "，正在尝试备选地址…" if i < total - 1 else "，主备地址均已尝试",
+                    )
+                    continue
+                # 业务错误（429/5xx/超时）：地址可达但被拒绝 → 不试备选地址，直接上抛走模型级降级
+                logger.warning(
+                    "   ⚠️ [AI翻译] Provider[%s] %s 可达但业务报错（%s），跳过备选地址，交由指数退避/模型级降级",
+                    pname, addr_display, exc,
+                )
+                raise
+
+        # 主备地址全部连接失败 → 抛最后一次连接异常，触发降级到下一个 Provider
+        logger.error(
+            "   ❌ [AI翻译] Provider[%s] 全部 %d 个地址均网络连接失败，降级到下一个 Provider，最后异常: %s",
+            pname, total, last_conn_exc,
+        )
+        if last_conn_exc is not None:
+            raise last_conn_exc
+        raise RuntimeError(f"Provider[{pname}] 无可用地址")
+
     def _chat_complete_with_fallback(self, *, system_prompt: str, user_prompt: str,
                                      temperature: float, max_tokens: int) -> Optional[str]:
         """
         【瀑布流核心】按优先级遍历 Provider：
-        单 Provider 内指数退避重试 → 耗尽后捕获异常、log warning → 无缝切换下一个 API。
-        全部失败 → log error 并返回 None（调用方兜底原文映射）。
+        单 Provider 内「地址级网络降级（主→备）」→ 指数退避重试 → 耗尽后捕获异常、log warning →
+        无缝切换下一个 API。全部失败 → log error 并返回 None（调用方兜底原文映射）。
         """
         providers = self._resolve_providers(log_invalid=True)
         if not providers:
@@ -482,26 +618,17 @@ class AITranslator:
         last_exc: Optional[Exception] = None
         for idx, provider in enumerate(providers):
             pname = provider["name"]
-            client = self._build_client(provider)
-            if client is None:
-                logger.warning("   ⚠️ [AI翻译] Provider[%s] 客户端构建失败，跳过", pname)
-                continue
 
             logger.info(
                 "   🚀 [AI翻译] 尝试 Provider[%s] (model=%s) …",
                 pname, provider["model_name"],
             )
             try:
-                resp = _retry_with_backoff(
-                    lambda: self._chat_once(client, provider, messages, temperature, max_tokens),
-                    max_retries=provider["max_retries"],
-                    base_delay=DEFAULT_BASE_DELAY,
-                    max_delay=DEFAULT_MAX_BACKOFF_DELAY,
-                    should_retry=_is_retryable_error,
-                    on_retry=lambda attempt, exc, delay, pname=pname: logger.warning(
-                        "   ⚠️ [AI翻译] Provider[%s] 第 %d 次指数退避重试（%.1fs 后）：%s",
-                        pname, attempt, delay, exc,
-                    ),
+                resp = self._chat_with_address_fallback(
+                    provider=provider,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                 )
                 content = (resp.choices[0].message.content or "").strip()
                 if content:
@@ -512,7 +639,7 @@ class AITranslator:
             except Exception as exc:
                 last_exc = exc
                 logger.warning(
-                    "   ⚠️ [AI翻译] Provider[%s] 重试耗尽，降级到下一个 API: %s",
+                    "   ⚠️ [AI翻译] Provider[%s] 地址降级/重试均耗尽，降级到下一个 API: %s",
                     pname, exc,
                 )
 

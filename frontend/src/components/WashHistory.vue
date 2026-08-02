@@ -1,19 +1,44 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import axios from 'axios'
-import { Timer, RefreshLeft, Delete } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { History, RefreshCw, Trash2, Clock, ChevronLeft, ChevronRight } from 'lucide-vue-next'
 
 const API_URL = ''
 const historyData = ref([])
 const loading = ref(false)
 const siteOptions = ref([])
 
+// ==================== 客户端分页（纯 UI，不改变后端数据结构） ====================
+const pageSize = 20
+const page = ref(1)
+const total = computed(() => historyData.value.length)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+const pagedData = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return historyData.value.slice(start, start + pageSize)
+})
+// 页码集合（含省略号，最多 7 个）
+const pageNumbers = computed(() => {
+  const n = totalPages.value
+  if (n <= 7) return Array.from({ length: n }, (_, i) => i + 1)
+  const set = new Set([1, n, page.value])
+  for (let i = page.value - 1; i <= page.value + 1; i++) {
+    if (i > 1 && i < n) set.add(i)
+  }
+  return [...set].sort((a, b) => a - b)
+})
+// 数据减少时钳制页码
+watch(totalPages, (n) => {
+  if (page.value > n) page.value = n
+})
+
 const fetchHistory = async () => {
   loading.value = true
   try {
     const res = await axios.get(`${API_URL}/api/history`)
     historyData.value = res.data
+    page.value = 1
   } catch (e) {
     ElMessage.error('获取历史记录失败')
   } finally {
@@ -26,6 +51,7 @@ const clearHistory = async () => {
     await ElMessageBox.confirm('确定要清空所有记录吗？', '提示', { type: 'warning' })
     await axios.delete(`${API_URL}/api/history`)
     historyData.value = []
+    page.value = 1
     ElMessage.success('已清空')
   } catch {}
 }
@@ -62,415 +88,215 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="history-container">
-    <!-- ==================== Toolbar ==================== -->
-    <div class="history-toolbar">
-      <span class="history-title">
-        <span class="title-icon"><el-icon :size="18"><Timer /></el-icon></span>
-        订阅任务历史
-      </span>
-      <div class="btn-group">
-        <button class="btn-icon" @click="fetchHistory" title="刷新">
-          <el-icon :size="16"><RefreshLeft /></el-icon>
+  <!-- ==================== 固定高度容器：内部列表滚动，分页器固定在底部 ==================== -->
+  <div class="records-root mx-auto flex h-[calc(100vh-120px)] w-full max-w-[1100px] flex-col overflow-hidden px-5 pt-3.5">
+    <!-- ==================== 头部 ==================== -->
+    <header class="flex flex-shrink-0 flex-wrap items-center justify-between gap-3.5 pb-3.5">
+      <div class="flex min-w-0 items-center gap-3.5">
+        <div
+          class="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-xl border border-electric/30 bg-gradient-to-br from-electric/20 to-electric/5 text-blue-400 shadow-[0_0_18px_rgba(59,130,246,0.22),inset_0_0_10px_rgba(59,130,246,0.08)]"
+        >
+          <History :size="20" />
+        </div>
+        <div class="min-w-0">
+          <h2 class="text-base font-bold tracking-wide text-white">订阅任务历史</h2>
+          <p class="mt-0.5 text-xs text-slate-500">共 {{ total }} 条执行记录</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2.5">
+        <button
+          type="button"
+          class="flex h-9 w-9 items-center justify-center rounded-[10px] border border-white/10 bg-white/5 text-slate-400 transition-all duration-200 hover:border-electric/40 hover:bg-electric/10 hover:text-blue-400 hover:shadow-[0_0_14px_rgba(59,130,246,0.25)]"
+          @click="fetchHistory"
+          title="刷新"
+        >
+          <RefreshCw :size="16" :class="{ spin: loading }" />
         </button>
-        <button class="btn-pill btn-pill-danger" @click="clearHistory">
-          <el-icon :size="14"><Delete /></el-icon> 清空
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-[10px] border border-danger/40 bg-danger/10 px-4 py-2 text-[13px] font-semibold text-red-400 transition-all duration-200 hover:bg-danger/20 hover:text-red-300 hover:border-danger/60 hover:shadow-[0_0_18px_rgba(239,68,68,0.35)]"
+          @click="clearHistory"
+        >
+          <Trash2 :size="15" />清空
         </button>
       </div>
-    </div>
+    </header>
 
-    <!-- ==================== Card List (统一桌面端 + 移动端) ==================== -->
-    <div v-loading="loading" class="history-list">
-      <div
-        v-for="row in historyData"
-        :key="row.id"
-        class="history-card"
-        :class="{ 'card-fail': row.status !== 'success' }"
-      >
-        <!-- Status indicator bar -->
-        <div class="card-status-bar" :class="row.status === 'success' ? 'bar-success' : 'bar-fail'"></div>
+    <!-- ==================== 主视窗（独立 overflow-y-auto，内部滚动） ==================== -->
+    <div class="records-body min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1" v-loading="loading">
+      <!-- 空状态：居中呼吸灯 -->
+      <div v-if="!loading && !total" class="flex h-full min-h-[320px] flex-col items-center justify-center gap-1.5 text-center">
+        <div class="empty-breathe mb-2.5 flex text-slate-500 drop-shadow-[0_0_24px_rgba(59,130,246,0.3)]">
+          <History :size="64" />
+        </div>
+        <p class="text-[15px] font-semibold text-slate-400">暂无记录</p>
+        <p class="text-[13px] text-slate-600">还没有任何订阅任务历史</p>
+      </div>
 
-        <!-- Card content -->
-        <div class="card-inner">
-          <!-- Top: name + status + type -->
-          <div class="card-header">
-            <div class="card-name-group">
-              <span class="card-name">{{ row.name }}</span>
-              <span class="card-season">S{{ row.season }}</span>
-              <span class="card-tmdb">TMDB: {{ row.tmdb_id }}</span>
+      <!-- 日志列表（极浅斑马纹） -->
+      <div v-else class="flex flex-col gap-0.5 pb-1">
+        <div
+          v-for="row in pagedData"
+          :key="row.id"
+          class="flex items-stretch rounded-xl border border-transparent transition-all duration-200 even:bg-white/[0.02] hover:border-electric/20 hover:bg-white/5"
+          :class="{ 'row-fail': row.status !== 'success' }"
+        >
+          <!-- 左侧状态发光条 -->
+          <div
+            class="my-2 w-[3px] flex-shrink-0 self-stretch rounded-r"
+            :class="row.status === 'success'
+              ? 'bg-neon shadow-[0_0_8px_rgba(52,211,153,0.6)]'
+              : 'bg-danger shadow-[0_0_8px_rgba(248,113,113,0.6)]'"
+          ></div>
+
+          <div class="flex min-w-0 flex-1 flex-col gap-1.5 px-3.5 py-3">
+            <!-- 标题行 -->
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div class="flex min-w-0 flex-wrap items-baseline gap-2">
+                <span class="text-[14px] font-semibold text-slate-100">{{ row.name }}</span>
+                <span class="text-xs font-semibold text-slate-400">S{{ row.season }}</span>
+                <span class="font-hud text-[11px] text-slate-600">TMDB {{ row.tmdb_id }}</span>
+              </div>
+              <div class="flex flex-shrink-0 gap-1.5">
+                <span
+                  class="inline-flex items-center gap-1 whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[11px] font-semibold"
+                  :class="row.status === 'success'
+                    ? 'border-neon/25 bg-neon/10 text-neon'
+                    : 'border-danger/25 bg-danger/10 text-danger'"
+                >
+                  <span class="h-1.5 w-1.5 rounded-full bg-current shadow-[0_0_6px_currentColor]"></span>
+                  {{ row.status === 'success' ? '成功' : '失败' }}
+                </span>
+                <span
+                  class="whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[11px] font-semibold"
+                  :class="row.wash_type === 'complete'
+                    ? 'border-warn/25 bg-warn/10 text-warn'
+                    : row.wash_type === 'new_sub'
+                      ? 'border-electric/25 bg-electric/10 text-electric'
+                      : 'border-slate-500/20 bg-slate-500/10 text-slate-400'"
+                >
+                  {{ row.wash_type === 'complete' ? '完结洗版' : row.wash_type === 'new_sub' ? '新增配置' : '未知' }}
+                </span>
+              </div>
             </div>
-            <div class="card-badges">
-              <span class="badge" :class="row.status === 'success' ? 'badge-success' : 'badge-fail'">
-                {{ row.status === 'success' ? '成功' : '失败' }}
-              </span>
-              <span class="badge" :class="row.wash_type === 'complete' ? 'badge-wash' : row.wash_type === 'new_sub' ? 'badge-sub' : 'badge-unknown'">
-                {{ row.wash_type === 'complete' ? '完结洗版' : row.wash_type === 'new_sub' ? '新增配置' : '未知' }}
-              </span>
+
+            <!-- 时间 -->
+            <div class="flex items-center gap-1.5 text-xs text-slate-600">
+              <Clock :size="12" />
+              <span>{{ formatDate(row.created_at) }}</span>
             </div>
-          </div>
 
-          <!-- Meta: time -->
-          <div class="card-meta">
-            <el-icon :size="13"><Timer /></el-icon>
-            <span>{{ formatDate(row.created_at) }}</span>
-          </div>
+            <!-- 执行参数 -->
+            <div v-if="row.wash_params" class="flex flex-wrap gap-1">
+              <span v-if="row.wash_params.scheme" class="p-chip p-scheme">策略: {{ row.wash_params.scheme }}</span>
+              <span v-if="row.wash_params.filter_groups" class="p-chip p-filter">规则: {{ row.wash_params.filter_groups?.join(',') }}</span>
+              <span v-if="row.wash_params.downloader" class="p-chip p-downloader">下载器: {{ row.wash_params.downloader }}</span>
+              <span v-if="row.wash_params.quality" class="p-chip p-quality">画质: {{ row.wash_params.quality }}</span>
+              <span v-if="row.wash_params.sites?.length" class="p-chip p-sites">站点: {{ formatSiteNames(row.wash_params.sites) }}</span>
+            </div>
 
-          <!-- Wash params -->
-          <div v-if="row.wash_params" class="card-params">
-            <span v-if="row.wash_params.scheme" class="param-chip param-scheme">策略: {{ row.wash_params.scheme }}</span>
-            <span v-if="row.wash_params.filter_groups" class="param-chip param-filter">规则: {{ row.wash_params.filter_groups?.join(',') }}</span>
-            <span v-if="row.wash_params.downloader" class="param-chip param-downloader">下载器: {{ row.wash_params.downloader }}</span>
-            <span v-if="row.wash_params.quality" class="param-chip param-quality">画质: {{ row.wash_params.quality }}</span>
-            <span v-if="row.wash_params.sites?.length" class="param-chip param-sites">站点: {{ formatSiteNames(row.wash_params.sites) }}</span>
-          </div>
-
-          <!-- Message -->
-          <div v-if="row.message" class="card-msg" :class="{ 'msg-error': row.status !== 'success' }">
-            {{ row.message }}
+            <!-- 消息 -->
+            <div
+              v-if="row.message"
+              class="break-all text-xs leading-relaxed"
+              :class="row.status !== 'success' ? 'text-red-400' : 'text-slate-400'"
+            >
+              {{ row.message }}
+            </div>
           </div>
         </div>
       </div>
-
-      <!-- Empty state -->
-      <div v-if="!loading && !historyData.length" class="empty-state">
-        <div class="empty-icon-circle">
-          <el-icon :size="36"><Timer /></el-icon>
-        </div>
-        <p class="empty-title">暂无记录</p>
-        <p class="empty-desc">还没有任何订阅任务历史</p>
-      </div>
     </div>
+
+    <!-- ==================== 底部固定分页器（不随列表滚动） ==================== -->
+    <footer class="flex flex-shrink-0 flex-wrap items-center justify-between gap-3 border-t border-white/5 px-1 pb-3.5 pt-3">
+      <span class="font-hud text-xs text-slate-600">共 {{ total }} 条</span>
+      <div class="flex items-center gap-1.5">
+        <button
+          type="button"
+          class="pager-btn flex h-[30px] min-w-[30px] items-center justify-center rounded-lg border border-white/10 bg-white/5 px-2 text-[13px] font-semibold text-slate-400 transition-all duration-200 hover:border-electric/40 hover:bg-electric/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+          :disabled="page <= 1"
+          @click="page--"
+          title="上一页"
+        >
+          <ChevronLeft :size="16" />
+        </button>
+        <template v-for="(p, i) in pageNumbers" :key="p">
+          <span v-if="i > 0 && p - pageNumbers[i - 1] > 1" class="px-1 text-slate-600">…</span>
+          <button
+            type="button"
+            class="pager-btn flex h-[30px] min-w-[30px] items-center justify-center rounded-lg border px-2 text-[13px] font-semibold transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-35"
+            :class="p === page
+              ? 'border-transparent bg-electric text-white shadow-[0_0_14px_rgba(59,130,246,0.45)]'
+              : 'border-white/10 bg-white/5 text-slate-400 hover:border-electric/40 hover:bg-electric/10 hover:text-white'"
+            @click="page = p"
+          >{{ p }}</button>
+        </template>
+        <button
+          type="button"
+          class="pager-btn flex h-[30px] min-w-[30px] items-center justify-center rounded-lg border border-white/10 bg-white/5 px-2 text-[13px] font-semibold text-slate-400 transition-all duration-200 hover:border-electric/40 hover:bg-electric/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+          :disabled="page >= totalPages"
+          @click="page++"
+          title="下一页"
+        >
+          <ChevronRight :size="16" />
+        </button>
+      </div>
+    </footer>
   </div>
 </template>
 
 <style scoped>
-/* ==================== Layout ==================== */
-.history-container {
-  padding: 8px 16px;
-  max-width: 100%;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
+/* ==================== 主视窗极细自定义滚动条（4px 半透明白） ==================== */
+.records-body::-webkit-scrollbar { width: 4px; }
+.records-body::-webkit-scrollbar-track { background: transparent; }
+.records-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+}
+.records-body::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.4); }
+
+/* ==================== 空状态呼吸灯（缓慢 Pulse） ==================== */
+.empty-breathe {
+  animation: breathe 2.6s ease-in-out infinite;
+}
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50% { opacity: 0.9; transform: scale(1.05); }
 }
 
-/* ==================== Toolbar ==================== */
-.history-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-  padding: 0 4px;
-  flex-wrap: wrap;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.history-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-primary);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.title-icon {
-  color: var(--accent-blue);
-}
-
-.btn-group {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-
-/* Icon button */
-.btn-icon {
-  width: 34px;
-  height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  border-radius: var(--radius-full);
-  background: var(--bg-card);
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: all 0.2s;
-}
-.btn-icon:hover {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
-}
-
-/* Pill button */
-.btn-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 14px;
-  border: none;
-  border-radius: var(--radius-full);
-  font-size: 12px;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s;
-  white-space: nowrap;
-}
-
-.btn-pill-danger {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
-}
-.btn-pill-danger:hover {
-  background: rgba(239, 68, 68, 0.3);
-}
-
-/* ==================== Card List ==================== */
-.history-list {
-  flex: 1;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-/* ==================== History Card ==================== */
-.history-card {
-  display: flex;
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  transition: all 0.2s;
-}
-.history-card:hover {
-  border-color: #475569;
-  box-shadow: var(--shadow-sm);
-}
-
-/* Left status bar */
-.card-status-bar {
-  width: 4px;
-  flex-shrink: 0;
-}
-.card-status-bar.bar-success {
-  background: var(--accent-green);
-}
-.card-status-bar.bar-fail {
-  background: var(--accent-red);
-}
-
-/* Inner content */
-.card-inner {
-  flex: 1;
-  padding: 14px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-}
-
-/* Header: name + badges */
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.card-name-group {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  flex-wrap: wrap;
-  min-width: 0;
-}
-
-.card-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.card-season {
-  font-size: 12px;
-  color: var(--text-tertiary);
-  font-weight: 500;
-}
-
-.card-tmdb {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-family: 'SF Mono', 'Fira Code', monospace;
-}
-
-/* Badges */
-.card-badges {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-.badge {
+/* ==================== 参数标签药丸 ==================== */
+.p-chip {
   display: inline-block;
-  padding: 3px 10px;
-  border-radius: var(--radius-full);
-  font-size: 11px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.badge-success {
-  background: var(--accent-green-soft);
-  color: var(--accent-green);
-}
-
-.badge-fail {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
-}
-
-.badge-wash {
-  background: rgba(245, 158, 11, 0.15);
-  color: var(--accent-yellow);
-}
-
-.badge-sub {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
-}
-
-.badge-unknown {
-  background: rgba(100, 116, 139, 0.15);
-  color: var(--text-tertiary);
-}
-
-/* Meta */
-.card-meta {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--text-tertiary);
-}
-
-/* Params chips */
-.card-params {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.param-chip {
-  display: inline-block;
-  padding: 3px 10px;
-  border-radius: var(--radius-full);
+  padding: 2px 9px;
+  border-radius: 999px;
   font-size: 11px;
   font-weight: 500;
   white-space: nowrap;
+  border: 1px solid;
 }
+.p-scheme { background: rgba(250, 204, 21, 0.07); color: #facc15; border-color: rgba(250, 204, 21, 0.25); text-shadow: 0 0 8px rgba(250, 204, 21, 0.35); }
+.p-filter { background: rgba(148, 163, 184, 0.08); color: #cbd5e1; border-color: rgba(148, 163, 184, 0.2); }
+.p-downloader { background: rgba(16, 185, 129, 0.08); color: #34d399; border-color: rgba(16, 185, 129, 0.25); }
+.p-quality { background: rgba(248, 113, 113, 0.07); color: #fb7185; border-color: rgba(248, 113, 113, 0.25); }
+.p-sites { background: rgba(139, 92, 246, 0.08); color: #a78bfa; border-color: rgba(139, 92, 246, 0.25); }
 
-.param-scheme {
-  background: rgba(245, 158, 11, 0.12);
-  color: var(--accent-yellow);
-}
+/* ==================== 动画 & 响应式 ==================== */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 1s linear infinite; }
 
-.param-filter {
-  background: rgba(100, 116, 139, 0.12);
-  color: var(--text-secondary);
-}
-
-.param-downloader {
-  background: rgba(16, 185, 129, 0.12);
-  color: var(--accent-green);
-}
-
-.param-quality {
-  background: rgba(239, 68, 68, 0.12);
-  color: var(--accent-red);
-}
-
-.param-sites {
-  background: rgba(139, 92, 246, 0.12);
-  color: var(--accent-purple);
-}
-
-/* Message */
-.card-msg {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.5;
-  word-break: break-all;
-}
-.card-msg.msg-error {
-  color: var(--accent-red);
-}
-
-/* ==================== Empty State ==================== */
-.empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 20px;
-  text-align: center;
-}
-
-.empty-icon-circle {
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  background: var(--bg-card);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-tertiary);
-  margin-bottom: 16px;
-}
-
-.empty-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin: 0 0 4px;
-}
-
-.empty-desc {
-  font-size: 13px;
-  color: var(--text-tertiary);
-  margin: 0;
-}
-
-/* ==================== Mobile ==================== */
-@media screen and (max-width: 768px) {
-  .history-container {
-    padding: 4px;
+@media (max-width: 768px) {
+  .records-root {
+    height: calc(100dvh - 112px);
+    padding: 0 12px;
   }
+}
 
-  .history-toolbar {
-    padding: 4px;
-    margin-bottom: 8px;
+@media (prefers-reduced-motion: reduce) {
+  .empty-breathe, .spin, .record-row, .btn-icon, .btn-danger, .pager-btn {
+    animation: none !important;
+    transition: none !important;
   }
-
-  .card-inner {
-    padding: 12px;
-    gap: 6px;
-  }
-
-  .card-name {
-    font-size: 13px;
-  }
-
-  .card-badges {
-    gap: 4px;
-  }
-
-  .badge {
-    font-size: 10px;
-    padding: 2px 8px;
-  }
+  .empty-breathe { opacity: 0.9; }
 }
 </style>

@@ -1774,6 +1774,7 @@ onUnmounted(() => {
           placeholder="全部分类"
           class="category-select"
           clearable
+          teleported="false"
         >
           <el-option
             v-for="opt in categoryOptions"
@@ -1796,7 +1797,7 @@ onUnmounted(() => {
       <div class="split-col">
         <div class="col-header">
           <div class="col-header-left">
-            <span class="col-dot dot-danger"></span>
+            <span class="col-dot dot-danger animate-pulse"></span>
             <span class="col-label">待清理实例</span>
             <span v-if="leftInstanceId && totalLeft > 0" class="col-count">
               {{ totalLeft }} 个匹配
@@ -1898,8 +1899,8 @@ onUnmounted(() => {
                   <div class="cc-progress">
                     <div class="cc-progress-track">
                       <div
-                        class="cc-progress-fill"
-                        :style="{ width: (torrent.progress * 100) + '%', background: getProgressColor(torrent.state) }"
+                        class="cc-progress-fill bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.8)]"
+                        :style="{ width: (torrent.progress * 100) + '%' }"
                       ></div>
                     </div>
                     <span class="cc-progress-num">{{ Math.round(torrent.progress * 100) }}%</span>
@@ -1937,7 +1938,7 @@ onUnmounted(() => {
       <div class="split-col">
         <div class="col-header">
           <div class="col-header-left">
-            <span class="col-dot dot-success"></span>
+            <span class="col-dot dot-success animate-pulse"></span>
             <span class="col-label">全集归档实例</span>
             <span v-if="rightInstanceId && totalRight > 0" class="col-count">
               {{ totalRight }} 个匹配
@@ -2053,8 +2054,8 @@ onUnmounted(() => {
                   <div class="cc-progress">
                     <div class="cc-progress-track">
                       <div
-                        class="cc-progress-fill"
-                        :style="{ width: (torrent.progress * 100) + '%', background: getProgressColor(torrent.state) }"
+                        class="cc-progress-fill bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.8)]"
+                        :style="{ width: (torrent.progress * 100) + '%' }"
                       ></div>
                     </div>
                     <span class="cc-progress-num">{{ Math.round(torrent.progress * 100) }}%</span>
@@ -2114,7 +2115,7 @@ onUnmounted(() => {
       <!-- Section Header -->
       <div class="cd2-section-header">
         <div class="cd2-section-title">
-          <span class="col-dot dot-cd2"></span>
+          <span class="col-dot dot-cd2 animate-pulse"></span>
           <span>CD2 网盘文件概览</span>
           <span class="cd2-cat-sep">›</span>
           <el-select
@@ -2810,6 +2811,54 @@ onUnmounted(() => {
   padding-left: 36px;
 }
 
+/* ==================== 下拉框毛玻璃（teleported="false" 时局部覆盖） ==================== */
+:deep(.el-select-dropdown) {
+  background: rgba(15, 23, 42, 0.94);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  box-shadow: 0 18px 50px -12px rgba(0, 0, 0, 0.55), 0 0 24px rgba(59, 130, 246, 0.06);
+  overflow: hidden;
+  z-index: 2100;
+}
+:deep(.el-select-dropdown__item) { color: #94a3b8; border-radius: 9px; }
+:deep(.el-select-dropdown__item.hover),
+:deep(.el-select-dropdown__item.is-hovering),
+:deep(.el-select-dropdown__item:hover) {
+  background: rgba(255, 255, 255, 0.1);
+  color: #f1f5f9;
+}
+:deep(.el-select-dropdown__item.is-selected) {
+  color: #60a5fa;
+  font-weight: 600;
+  text-shadow: 0 0 8px rgba(96, 165, 250, 0.55);
+}
+
+/* ==================== 弹窗 — 深度毛玻璃化 ==================== */
+:deep(.el-dialog) {
+  --el-dialog-bg-color: transparent;
+  background: rgba(11, 17, 32, 0.82);
+  backdrop-filter: blur(40px) saturate(150%);
+  -webkit-backdrop-filter: blur(40px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  box-shadow: 0 24px 60px -16px rgba(0, 0, 0, 0.6), 0 0 30px rgba(30, 58, 138, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+:deep(.el-dialog__header) {
+  background: transparent;
+  border-bottom: none;
+}
+:deep(.el-dialog__title) {
+  color: #ffffff;
+  font-weight: 700;
+}
+:deep(.el-dialog__body) { color: #cbd5e1; }
+:deep(.el-dialog__footer) {
+  background: transparent;
+  border-top: none;
+}
+
 /* --- 预留按钮 --- */
 .btn-auto-scan {
   padding: 9px 18px;
@@ -2842,6 +2891,12 @@ onUnmounted(() => {
   flex-direction: column;
   overflow: hidden;
   min-height: 0;
+  /* 毛玻璃面板：带边框圆角 */
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
 }
 
 /* ==================== Column Header ==================== */
@@ -3075,14 +3130,17 @@ onUnmounted(() => {
   align-items: stretch;
   gap: 12px;
   padding: 12px 14px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
   transition: all 0.2s ease;
 }
 .compact-card:hover {
-  border-color: #475569;
-  box-shadow: var(--shadow-sm);
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: 0 8px 22px -14px rgba(0, 0, 0, 0.5);
 }
 .compact-card.card-left {
   border-left: 3px solid transparent;
@@ -3096,8 +3154,9 @@ onUnmounted(() => {
 }
 .compact-card.card-left.is-checked {
   border-left-color: var(--accent-blue) !important;
-  border-color: var(--accent-blue);
-  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.3);
+  border-color: rgba(59, 130, 246, 0.55);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25), 0 0 16px rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.06);
 }
 .compact-card.card-right {
   border-left: 3px solid transparent;
@@ -3107,8 +3166,9 @@ onUnmounted(() => {
 }
 .compact-card.card-right.is-checked {
   border-left-color: var(--accent-purple, #8b5cf6) !important;
-  border-color: var(--accent-purple, #8b5cf6);
-  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.3);
+  border-color: rgba(139, 92, 246, 0.55);
+  box-shadow: 0 0 0 1px rgba(139, 92, 246, 0.25), 0 0 16px rgba(139, 92, 246, 0.3);
+  background: rgba(139, 92, 246, 0.06);
 }
 
 /* Card checkbox (left column only) */
@@ -3127,6 +3187,7 @@ onUnmounted(() => {
 .cc-checkbox :deep(.el-checkbox__input.is-checked .el-checkbox__inner) {
   background: var(--accent-blue);
   border-color: var(--accent-blue);
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
 }
 .cc-checkbox :deep(.el-checkbox__input.is-checked .el-checkbox__inner::after) {
   border-color: #fff;
@@ -3141,9 +3202,9 @@ onUnmounted(() => {
 }
 
 .cc-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
+  font-size: 13.5px;
+  font-weight: 700;
+  color: #ffffff;
   line-height: 1.45;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -3188,15 +3249,17 @@ onUnmounted(() => {
 
 .cc-progress-track {
   flex: 1;
-  height: 3px;
-  background: var(--border-color);
-  border-radius: 2px;
+  height: 6px; /* 极细 h-1.5 */
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 999px;
   overflow: hidden;
 }
 
 .cc-progress-fill {
   height: 100%;
-  border-radius: 2px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #34d399, #10b981);
+  box-shadow: 0 0 10px rgba(52, 211, 153, 0.8), 0 0 3px rgba(52, 211, 153, 0.5);
   transition: width 0.5s ease;
 }
 
@@ -3802,7 +3865,7 @@ onUnmounted(() => {
   cursor: default;
 }
 .cd2-file-item:hover {
-  background: var(--bg-card-hover);
+  background: rgba(255, 255, 255, 0.05); /* hover:bg-white/5 整行微提亮 */
 }
 .cd2-file-item + .cd2-file-item {
   border-top: 1px solid var(--border-color-subtle, rgba(255,255,255,0.03));
@@ -3813,13 +3876,18 @@ onUnmounted(() => {
   cursor: pointer;
 }
 .cd2-file-item.is-clickable:hover {
-  background: var(--accent-blue-soft);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 .cd2-file-icon {
   font-size: 14px;
   flex-shrink: 0;
-  opacity: 0.85;
+  /* 文件树图标 — 浅灰色 */
+  filter: grayscale(0.75) opacity(0.82);
+  transition: filter 0.15s;
+}
+.cd2-file-item:hover .cd2-file-icon {
+  filter: grayscale(0.4) opacity(0.95);
 }
 
 .cd2-file-name {

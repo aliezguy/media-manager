@@ -1,11 +1,11 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  DataAnalysis, Clock, CircleCheck, CircleClose, VideoPlay,
-  RefreshLeft, View, Loading, InfoFilled, WarningFilled,
-  SuccessFilled, RemoveFilled, Document, Search, Delete
+  DataAnalysis, Clock, CircleCheck, CircleClose,
+  RefreshLeft, View, Loading, WarningFilled, InfoFilled,
+  Document, Delete, Close, ArrowDown, ArrowUp
 } from '@element-plus/icons-vue'
 
 // ==================== API 层 ====================
@@ -71,12 +71,40 @@ const currentTaskId = ref(null)
 const skippedIncompleteSeasons = ref([])
 const forceMovingSeason = ref(null)  // 正在执行强制移动的 season number
 
+// ==================== 状态色 → Tailwind 令牌映射 ====================
+const cardTones = {
+  blue: {
+    bar: 'bg-electric shadow-[0_0_12px_rgba(59,130,246,0.6)]',
+    num: 'text-electric [text-shadow:0_0_18px_rgba(59,130,246,0.30)]',
+    icon: 'text-electric',
+    glow: 'hover:border-electric/40 hover:shadow-[0_0_18px_rgba(59,130,246,0.18)]',
+  },
+  green: {
+    bar: 'bg-neon shadow-[0_0_12px_rgba(16,185,129,0.6)]',
+    num: 'text-neon [text-shadow:0_0_18px_rgba(16,185,129,0.30)]',
+    icon: 'text-neon',
+    glow: 'hover:border-neon/40 hover:shadow-[0_0_18px_rgba(16,185,129,0.18)]',
+  },
+  yellow: {
+    bar: 'bg-warn shadow-[0_0_12px_rgba(245,158,11,0.6)]',
+    num: 'text-warn [text-shadow:0_0_18px_rgba(245,158,11,0.30)]',
+    icon: 'text-warn',
+    glow: 'hover:border-warn/40 hover:shadow-[0_0_18px_rgba(245,158,11,0.18)]',
+  },
+  red: {
+    bar: 'bg-danger shadow-[0_0_12px_rgba(239,68,68,0.6)]',
+    num: 'text-danger [text-shadow:0_0_18px_rgba(239,68,68,0.30)]',
+    icon: 'text-danger',
+    glow: 'hover:border-danger/40 hover:shadow-[0_0_18px_rgba(239,68,68,0.18)]',
+  },
+}
+
 // ==================== 统计卡片配置 ====================
 const statCards = computed(() => [
-  { label: '总任务数', value: stats.value.total, icon: DataAnalysis, color: '#3b82f6', bg: 'rgba(59,130,246,0.12)' },
-  { label: '已完成', value: stats.value.completed, icon: CircleCheck, color: '#10b981', bg: 'rgba(16,185,129,0.12)' },
-  { label: '等待回调', value: stats.value.waiting, icon: Clock, color: '#f59e0b', bg: 'rgba(245,158,11,0.12)' },
-  { label: '失败', value: stats.value.failed, icon: CircleClose, color: '#ef4444', bg: 'rgba(239,68,68,0.12)' },
+  { label: '总任务数', value: stats.value.total, icon: DataAnalysis, tone: cardTones.blue },
+  { label: '已完成', value: stats.value.completed, icon: CircleCheck, tone: cardTones.green },
+  { label: '等待回调', value: stats.value.waiting, icon: Clock, tone: cardTones.yellow },
+  { label: '失败', value: stats.value.failed, icon: CircleClose, tone: cardTones.red },
 ])
 
 // ==================== 状态筛选选项 ====================
@@ -131,6 +159,21 @@ const openTimeline = async (task) => {
   }
 }
 
+const closeDrawer = () => {
+  drawerVisible.value = false
+}
+
+// ESC 关闭 + 打开时锁定背景滚动
+const handleKeydown = (e) => {
+  if (e.key === 'Escape' && drawerVisible.value) closeDrawer()
+}
+
+watch(drawerVisible, (v) => {
+  const scroller = document.querySelector('.app-main')
+  if (scroller) scroller.style.overflow = v ? 'hidden' : ''
+  else document.body.style.overflow = v ? 'hidden' : ''
+})
+
 // ==================== 删除任务 ====================
 const handleDelete = async (task) => {
   try {
@@ -150,8 +193,22 @@ const handleDelete = async (task) => {
   }
 }
 
-const handleSelectionChange = (rows) => {
-  selectedRows.value = rows
+// ==================== 自定义多选 ====================
+const isSelected = (id) => selectedRows.value.some(r => r.id === id)
+
+const isAllSelected = computed(() => tasks.value.length > 0 && selectedRows.value.length === tasks.value.length)
+
+const isIndeterminate = computed(() => selectedRows.value.length > 0 && selectedRows.value.length < tasks.value.length)
+
+const toggleSelectAll = (e) => {
+  if (e.target.checked) selectedRows.value = tasks.value.slice()
+  else selectedRows.value = []
+}
+
+const toggleRowSelect = (row) => {
+  const idx = selectedRows.value.findIndex(r => r.id === row.id)
+  if (idx > -1) selectedRows.value.splice(idx, 1)
+  else selectedRows.value.push(row)
 }
 
 const handleBatchDelete = async () => {
@@ -208,17 +265,7 @@ const handleForceMove = async (seasonInfo) => {
   }
 }
 
-// ==================== 状态标签样式映射 ====================
-const getStatusType = (status) => {
-  const map = {
-    INIT: '',
-    COMPLETED: 'success',
-    WAITING_FOR_DELETE_WEBHOOK: 'warning',
-    FAILED: 'danger',
-  }
-  return map[status] || 'info'
-}
-
+// ==================== 状态药丸（Tailwind 令牌） ====================
 const getStatusLabel = (status) => {
   const map = {
     INIT: '初始化',
@@ -229,74 +276,68 @@ const getStatusLabel = (status) => {
   return map[status] || status
 }
 
+const getStatusClass = (status) => {
+  const map = {
+    INIT: 'bg-electric/10 text-electric border-electric/25 shadow-[0_0_10px_rgba(59,130,246,0.12)]',
+    COMPLETED: 'bg-neon/10 text-neon border-neon/25 shadow-[0_0_10px_rgba(16,185,129,0.12)]',
+    WAITING_FOR_DELETE_WEBHOOK: 'bg-warn/10 text-warn border-warn/25 shadow-[0_0_10px_rgba(245,158,11,0.12)]',
+    FAILED: 'bg-danger/10 text-danger border-danger/25 shadow-[0_0_10px_rgba(239,68,68,0.12)]',
+  }
+  return map[status] || 'bg-slate-500/10 text-slate-400 border-slate-500/25'
+}
+
 // ==================== 时间线节点配置 ====================
 const getTimelineConfig = (actionType) => {
   const configs = {
-    DELETE_TORRENT: {
-      color: '#ef4444',
-      icon: RemoveFilled,
-      bg: 'rgba(239,68,68,0.1)',
-      border: 'rgba(239,68,68,0.3)',
-      label: '删除种子',
-    },
-    DELETE_MEDIA: {
-      color: '#f97316',
-      icon: WarningFilled,
-      bg: 'rgba(249,115,22,0.1)',
-      border: 'rgba(249,115,22,0.3)',
-      label: '清理媒体库',
-    },
-    DELETE_ORGANIZED: {
-      color: '#f97316',
-      icon: WarningFilled,
-      bg: 'rgba(249,115,22,0.1)',
-      border: 'rgba(249,115,22,0.3)',
-      label: '清理已完结',
-    },
-    MOVE_FOLDER: {
-      color: '#3b82f6',
-      icon: SuccessFilled,
-      bg: 'rgba(59,130,246,0.1)',
-      border: 'rgba(59,130,246,0.3)',
-      label: '移入媒体库',
-    },
-    SKIP_FOLDER: {
-      color: '#64748b',
-      icon: InfoFilled,
-      bg: 'rgba(100,116,139,0.1)',
-      border: 'rgba(100,116,139,0.3)',
-      label: '跳过目录',
-    },
-    KEEP_MEDIA: {
-      color: '#10b981',
-      icon: SuccessFilled,
-      bg: 'rgba(16,185,129,0.1)',
-      border: 'rgba(16,185,129,0.3)',
-      label: '保留媒体库',
-    },
-    KEEP_ORGANIZED: {
-      color: '#14b8a6',
-      icon: InfoFilled,
-      bg: 'rgba(20,184,166,0.1)',
-      border: 'rgba(20,184,166,0.3)',
-      label: '保留已完结',
-    },
-    KEEP_TORRENT: {
-      color: '#eab308',
-      icon: Clock,
-      bg: 'rgba(234,179,8,0.1)',
-      border: 'rgba(234,179,8,0.3)',
-      label: '保留种子',
-    },
+    DELETE_TORRENT:  { color: '#ef4444', label: '删除种子' },
+    DELETE_MEDIA:    { color: '#f97316', label: '清理媒体库' },
+    DELETE_ORGANIZED:{ color: '#f97316', label: '清理已完结' },
+    MOVE_FOLDER:     { color: '#3b82f6', label: '移入媒体库' },
+    SKIP_FOLDER:     { color: '#64748b', label: '跳过目录' },
+    KEEP_MEDIA:      { color: '#10b981', label: '保留媒体库' },
+    KEEP_ORGANIZED:  { color: '#14b8a6', label: '保留已完结' },
+    KEEP_TORRENT:    { color: '#eab308', label: '保留种子' },
   }
-  return configs[actionType] || {
-    color: '#94a3b8',
-    icon: Document,
-    bg: 'rgba(148,163,184,0.1)',
-    border: 'rgba(148,163,184,0.3)',
-    label: actionType,
+  return configs[actionType] || { color: '#94a3b8', label: actionType }
+}
+
+const getTimelineIcon = (actionType) => {
+  const icons = {
+    DELETE_TORRENT: Delete,
+    DELETE_MEDIA: WarningFilled,
+    DELETE_ORGANIZED: WarningFilled,
+    MOVE_FOLDER: CircleCheck,
+    SKIP_FOLDER: InfoFilled,
+    KEEP_MEDIA: CircleCheck,
+    KEEP_ORGANIZED: CircleCheck,
+    KEEP_TORRENT: Clock,
+  }
+  return icons[actionType] || Document
+}
+
+// hex (#3b82f6) → rgba(59,130,246,a)
+const hexToRgba = (hex, alpha) => {
+  const h = hex.replace('#', '')
+  const full = h.length === 3 ? h.split('').map(c => c + c).join('') : h
+  const n = parseInt(full, 16)
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`
+}
+
+// 预计算时间线节点的全部发光变量
+const logCfg = (log) => {
+  const cfg = getTimelineConfig(log.action_type)
+  const color = cfg.color
+  return {
+    ...cfg,
+    icon: getTimelineIcon(log.action_type),
+    bg: hexToRgba(color, 0.10),
+    ring: hexToRgba(color, 0.16),
+    glow: hexToRgba(color, 0.50),
+    badgeBorder: hexToRgba(color, 0.30),
   }
 }
+
+const timelineNodes = computed(() => timelineLogs.value.map(log => ({ log, cfg: logCfg(log) })))
 
 const formatTime = (isoStr) => {
   if (!isoStr) return '-'
@@ -321,6 +362,13 @@ const toggleDetail = (logId) => {
 onMounted(() => {
   loadStats()
   loadTasks()
+  window.addEventListener('keydown', handleKeydown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeydown)
+  const scroller = document.querySelector('.app-main')
+  if (scroller) scroller.style.overflow = ''
 })
 
 watch(statusFilter, () => {
@@ -341,43 +389,70 @@ const handleSizeChange = (size) => {
 </script>
 
 <template>
-  <div class="dashboard-container">
-    <!-- ==================== 顶部标题栏 ==================== -->
-    <div class="dashboard-header">
-      <div class="header-left">
-        <span class="header-icon"><el-icon :size="20"><DataAnalysis /></el-icon></span>
-        <span class="header-title">自动化大盘</span>
+  <div class="mx-auto max-w-[1200px] p-5">
+    <!-- ==================== 顶部标题栏 + 实时监控指示 ==================== -->
+    <div class="mb-5 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-2.5">
+        <span class="flex h-[34px] w-[34px] items-center justify-center rounded-[10px] border border-electric/25 bg-electric/10 text-electric shadow-[0_0_14px_rgba(59,130,246,0.25)]">
+          <el-icon :size="18"><DataAnalysis /></el-icon>
+        </span>
+        <div>
+          <h1 class="text-xl font-bold tracking-wide text-white">自动化大盘</h1>
+          <p class="font-hud mt-0.5 text-[10px] uppercase tracking-[0.14em] text-slate-500">Automation · Operations Timeline</p>
+        </div>
       </div>
-      <div class="header-right">
-        <button class="btn-pill btn-pill-refresh" @click="() => { loadStats(); loadTasks(); }">
+
+      <div class="flex items-center gap-2.5">
+        <!-- 雷达式实时监控指示灯 -->
+        <div class="flex items-center gap-1.5 rounded-full border border-neon/25 bg-neon/10 px-2.5 py-1">
+          <span class="relative flex h-2 w-2">
+            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-neon opacity-60"></span>
+            <span class="relative inline-flex h-2 w-2 rounded-full bg-neon shadow-[0_0_8px_rgba(52,211,153,0.9)]"></span>
+          </span>
+          <span class="font-hud text-[10px] font-bold uppercase tracking-[0.1em] text-neon">Live</span>
+        </div>
+        <button
+          type="button"
+          class="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-[13px] font-medium text-slate-400 backdrop-blur-md transition-all duration-200 hover:border-electric/50 hover:bg-electric/10 hover:text-electric hover:shadow-[0_0_14px_rgba(59,130,246,0.3)]"
+          @click="() => { loadStats(); loadTasks(); }"
+        >
           <el-icon :size="14"><RefreshLeft /></el-icon>
           <span>刷新</span>
         </button>
       </div>
     </div>
 
-    <!-- ==================== 统计卡片 ==================== -->
-    <div class="stats-grid">
+    <!-- ==================== 统计卡片（状态色发光） ==================== -->
+    <div class="mb-5 grid grid-cols-2 gap-4 lg:grid-cols-4">
       <div
         v-for="card in statCards"
         :key="card.label"
-        class="stat-card"
-        :style="{ '--card-color': card.color, '--card-bg': card.bg }"
+        class="relative overflow-hidden rounded-xl border border-white/10 bg-white/5 p-5 backdrop-blur-md transition-all duration-200"
+        :class="card.tone.glow"
       >
-        <div class="stat-icon-wrap">
-          <el-icon :size="22"><component :is="card.icon" /></el-icon>
-        </div>
-        <div class="stat-body">
-          <span class="stat-value">{{ statsLoading ? '-' : card.value }}</span>
-          <span class="stat-label">{{ card.label }}</span>
+        <!-- 左侧状态色发光指示条 -->
+        <span class="absolute bottom-0 left-0 top-0 w-[3px]" :class="card.tone.bar"></span>
+        <!-- 低透明度背景 Icon -->
+        <el-icon
+          :size="92"
+          class="pointer-events-none absolute -bottom-3 -right-2 -rotate-6 opacity-[0.07]"
+          :class="card.tone.icon"
+        >
+          <component :is="card.icon" />
+        </el-icon>
+        <div class="relative">
+          <div class="font-hud text-[34px] font-extrabold leading-none tracking-wide" :class="card.tone.num">
+            {{ statsLoading ? '--' : card.value }}
+          </div>
+          <div class="mt-2.5 text-[11px] font-medium uppercase tracking-[0.08em] text-slate-500">{{ card.label }}</div>
         </div>
       </div>
     </div>
 
-    <!-- ==================== 筛选 & 表格 ==================== -->
-    <div class="table-section">
-      <div class="table-toolbar">
-        <div class="filter-group">
+    <!-- ==================== 筛选 & 数据列表 ==================== -->
+    <div class="overflow-hidden rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md">
+      <div class="flex flex-col items-start justify-between gap-3 border-b border-white/5 px-4 py-3.5 sm:flex-row sm:items-center">
+        <div class="flex items-center gap-2.5">
           <el-select
             v-model="statusFilter"
             placeholder="筛选状态"
@@ -396,71 +471,110 @@ const handleSizeChange = (size) => {
             />
           </el-select>
         </div>
-        <div class="toolbar-right">
+        <div class="flex items-center gap-3">
           <button
             v-if="selectedRows.length > 0"
-            class="btn-pill btn-pill-batch-delete"
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-full border border-danger/30 bg-danger/10 px-4 py-2 text-[13px] font-semibold text-danger transition-all duration-200 hover:bg-danger hover:text-white hover:shadow-[0_0_14px_rgba(239,68,68,0.4)]"
             @click="handleBatchDelete"
           >
             <el-icon :size="14"><Delete /></el-icon>
             <span>删除 ({{ selectedRows.length }})</span>
           </button>
-          <span class="table-count">共 {{ totalTasks }} 条记录</span>
+          <span class="font-hud text-[13px] text-slate-500">共 {{ totalTasks }} 条记录</span>
         </div>
       </div>
 
-      <el-table
-        :data="tasks"
-        v-loading="tableLoading"
-        stripe
-        style="width: 100%"
-        :header-cell-style="{ background: 'var(--bg-card)', color: 'var(--text-secondary)', fontWeight: 600 }"
-        row-class-name="task-row"
-        @selection-change="handleSelectionChange"
-      >
-        <el-table-column type="selection" width="45" align="center" />
-        <el-table-column prop="id" label="ID" width="70" align="center" />
-        <el-table-column prop="tmdb_id" label="TMDB" width="85" align="center" />
-        <el-table-column prop="title" label="剧集名称" min-width="200" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span class="task-title">{{ row.title }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column prop="task_type" label="类型" width="120" align="center" />
-        <el-table-column prop="status" label="状态" width="140" align="center">
-          <template #default="{ row }">
-            <el-tag
-              :type="getStatusType(row.status)"
-              effect="dark"
-              size="small"
-              :disable-transitions="true"
-            >
-              {{ getStatusLabel(row.status) }}
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="updated_at" label="更新时间" width="170" align="center">
-          <template #default="{ row }">
-            <span class="time-cell">{{ formatTime(row.updated_at) }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="操作" width="180" align="center">
-          <template #default="{ row }">
-            <div class="action-cell">
-              <button class="btn-pill btn-pill-view" @click.stop="openTimeline(row)">
-                <el-icon :size="14"><View /></el-icon>
-                <span>时间线</span>
-              </button>
-              <button class="btn-pill btn-pill-delete" @click.stop="handleDelete(row)">
-                <el-icon :size="14"><Delete /></el-icon>
-              </button>
-            </div>
-          </template>
-        </el-table-column>
-      </el-table>
+      <!-- 无竖向分割线数据列表 -->
+      <div class="data-table" v-loading="tableLoading">
+        <div class="dt-head grid items-center grid-cols-[45px_70px_85px_minmax(200px,1fr)_120px_140px_170px_180px] border-b border-white/5 bg-white/5">
+          <div class="px-3 py-3 text-center">
+            <label class="cb">
+              <input
+                type="checkbox"
+                class="cb-input"
+                :checked="isAllSelected"
+                :indeterminate.prop="isIndeterminate"
+                @change="toggleSelectAll"
+              />
+              <span class="cb-box" :class="{ indeterminate: isIndeterminate }"></span>
+            </label>
+          </div>
+          <div class="dt-head-cell">ID</div>
+          <div class="dt-head-cell">TMDB</div>
+          <div class="dt-head-cell text-left">剧集名称</div>
+          <div class="dt-head-cell">类型</div>
+          <div class="dt-head-cell">状态</div>
+          <div class="dt-head-cell">更新时间</div>
+          <div class="dt-head-cell">操作</div>
+        </div>
 
-      <!-- 分页 -->
-      <div class="pagination-wrap" v-if="totalTasks > 0">
+        <div class="dt-body">
+          <div
+            v-for="row in tasks"
+            :key="row.id"
+            class="dt-row grid items-center grid-cols-[45px_70px_85px_minmax(200px,1fr)_120px_140px_170px_180px] transition-colors duration-150 even:bg-white/[0.02] hover:bg-white/5"
+          >
+            <div class="px-3 py-3 text-center">
+              <label class="cb">
+                <input
+                  type="checkbox"
+                  class="cb-input"
+                  :checked="isSelected(row.id)"
+                  @change="toggleRowSelect(row)"
+                />
+                <span class="cb-box"></span>
+              </label>
+            </div>
+            <div class="px-3 py-3 text-center text-[13px] text-slate-400">{{ row.id }}</div>
+            <div class="px-3 py-3 text-center text-[13px] text-slate-400">{{ row.tmdb_id }}</div>
+            <div class="px-3 py-3 text-left text-[13px] font-medium text-slate-100">{{ row.title }}</div>
+            <div class="px-3 py-3 text-center text-xs tracking-wide text-slate-500">{{ row.task_type }}</div>
+            <div class="px-3 py-3 text-center">
+              <span
+                class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border px-3 py-1 text-xs font-semibold"
+                :class="getStatusClass(row.status)"
+              >
+                <span class="h-1.5 w-1.5 rounded-full bg-current shadow-[0_0_6px_currentColor]"></span>
+                {{ getStatusLabel(row.status) }}
+              </span>
+            </div>
+            <div class="px-3 py-3 text-center">
+              <span class="font-hud whitespace-nowrap text-xs text-slate-500">{{ formatTime(row.updated_at) }}</span>
+            </div>
+            <div class="px-3 py-3 text-center">
+              <div class="flex items-center justify-center gap-2">
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 rounded-full border border-slate-400/20 px-3 py-1.5 text-xs font-medium text-slate-400 transition-all duration-200 hover:border-electric/50 hover:bg-electric/10 hover:text-electric hover:shadow-[0_0_12px_rgba(59,130,246,0.35)]"
+                  @click="openTimeline(row)"
+                  aria-label="查看操作时间线"
+                >
+                  <el-icon :size="14"><View /></el-icon>
+                  <span>时间线</span>
+                </button>
+                <button
+                  type="button"
+                  class="flex h-[30px] w-[30px] items-center justify-center rounded-lg border border-slate-400/20 text-slate-400 transition-all duration-200 hover:border-danger/50 hover:bg-danger/10 hover:text-danger hover:shadow-[0_0_12px_rgba(239,68,68,0.35)]"
+                  @click="handleDelete(row)"
+                  aria-label="删除任务"
+                >
+                  <el-icon :size="14"><Delete /></el-icon>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="!tableLoading && tasks.length === 0" class="flex flex-col items-center justify-center gap-2 px-5 py-14 text-center">
+            <el-icon :size="40" class="text-slate-500"><Document /></el-icon>
+            <p class="text-[15px] font-medium text-slate-400">暂无任务数据</p>
+            <span class="text-[13px] text-slate-600">调整筛选条件或等待新的洗版任务</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 科技感分页器 -->
+      <div v-if="totalTasks > 0" class="flex justify-end border-t border-white/5 px-4 py-3.5">
         <el-pagination
           v-model:current-page="currentPage"
           v-model:page-size="pageSize"
@@ -474,644 +588,308 @@ const handleSizeChange = (size) => {
       </div>
     </div>
 
-    <!-- ==================== 时间线抽屉 ==================== -->
-    <el-drawer
-      v-model="drawerVisible"
-      :title="drawerTitle"
-      direction="rtl"
-      size="520px"
-      :close-on-click-modal="true"
-      class="timeline-drawer"
-    >
-      <div class="timeline-wrap" v-loading="timelineLoading">
-        <!-- 跳过 Season 手动处理区 -->
-        <div v-if="!timelineLoading && skippedIncompleteSeasons.length > 0" class="skipped-seasons-section">
-          <div class="skipped-header">
-            <el-icon :size="16" color="#f59e0b"><WarningFilled /></el-icon>
-            <span>以下 Season 因已完结不完整被跳过，可手动强制移动</span>
+    <!-- ==================== 右侧时间线抽屉 ==================== -->
+    <transition name="fade">
+      <div v-if="drawerVisible" class="drawer-mask fixed inset-0 z-[1000] bg-black/40 backdrop-blur-sm" @click.self="closeDrawer"></div>
+    </transition>
+
+    <transition name="slide">
+      <aside
+        v-if="drawerVisible"
+        class="fixed bottom-0 right-0 top-0 z-[1001] flex max-w-full w-[520px] flex-col border-l border-white/10 bg-[#0F172A]/80 backdrop-blur-xl shadow-[-24px_0_60px_rgba(0,0,0,0.5)]"
+        role="dialog"
+        aria-modal="true"
+        aria-label="操作时间线"
+      >
+        <header class="flex flex-shrink-0 items-center justify-between gap-3 border-b border-white/5 px-5 py-[18px]">
+          <div class="flex min-w-0 items-center gap-2.5">
+            <span class="flex h-[30px] w-[30px] flex-shrink-0 items-center justify-center rounded-lg border border-electric/25 bg-electric/10 text-electric shadow-[0_0_12px_rgba(59,130,246,0.25)]">
+              <el-icon :size="15"><DataAnalysis /></el-icon>
+            </span>
+            <span class="truncate text-[15px] font-bold text-white">{{ drawerTitle }}</span>
           </div>
-          <div
-            v-for="s in skippedIncompleteSeasons"
-            :key="'skipped-' + s.season"
-            class="skipped-row"
+          <button
+            type="button"
+            class="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-slate-400 transition-all duration-200 hover:border-danger/40 hover:bg-danger/10 hover:text-danger hover:shadow-[0_0_12px_rgba(239,68,68,0.25)]"
+            @click="closeDrawer"
+            aria-label="关闭时间线"
           >
-            <div class="skipped-info">
-              <span class="skipped-label">Season {{ s.season }}</span>
-              <span class="skipped-stats">
-                已完结 {{ s.organized_file_count }}/{{ s.expected_file_count }}
-                &nbsp;|&nbsp;
-                媒体库 {{ s.media_file_count }}/{{ s.expected_file_count }}
-              </span>
+            <el-icon :size="17"><Close /></el-icon>
+          </button>
+        </header>
+
+        <div class="drawer-body flex-1 overflow-y-auto overflow-x-hidden p-5" v-loading="timelineLoading">
+          <!-- 跳过 Season 手动处理区 -->
+          <div v-if="!timelineLoading && skippedIncompleteSeasons.length > 0" class="mb-4 rounded-xl border border-warn/25 bg-gradient-to-br from-warn/10 to-warn/5 p-3.5 shadow-[0_0_16px_rgba(245,158,11,0.06)]">
+            <div class="mb-2.5 flex items-center gap-2 text-xs font-semibold text-warn">
+              <el-icon :size="15"><WarningFilled /></el-icon>
+              <span>以下 Season 因已完结不完整被跳过，可手动强制移动</span>
             </div>
-            <button
-              class="btn-pill btn-pill-force"
-              :disabled="forceMovingSeason === s.season"
-              @click="handleForceMove(s)"
+            <div
+              v-for="s in skippedIncompleteSeasons"
+              :key="'skipped-' + s.season"
+              class="mt-2 flex items-center justify-between gap-3 rounded-[10px] border border-white/5 bg-black/20 p-2.5"
             >
-              <el-icon :size="13" v-if="forceMovingSeason === s.season"><Loading /></el-icon>
-              <span>{{ forceMovingSeason === s.season ? '移动中...' : '强制移动' }}</span>
-            </button>
-          </div>
-        </div>
-
-        <div v-if="!timelineLoading && timelineLogs.length === 0 && skippedIncompleteSeasons.length === 0" class="timeline-empty">
-          <el-icon :size="40"><Document /></el-icon>
-          <p>暂无操作日志</p>
-          <span>该任务可能尚未产生任何自动化操作</span>
-        </div>
-
-        <div class="timeline-list" v-if="timelineLogs.length > 0">
-          <div
-            v-for="log in timelineLogs"
-            :key="log.id"
-            class="timeline-node"
-            :style="{
-              '--node-color': getTimelineConfig(log.action_type).color,
-              '--node-bg': getTimelineConfig(log.action_type).bg,
-              '--node-border': getTimelineConfig(log.action_type).border,
-            }"
-          >
-            <!-- 时间线竖线 + 节点 -->
-            <div class="timeline-rail">
-              <div class="timeline-dot">
-                <el-icon :size="14">
-                  <component :is="getTimelineConfig(log.action_type).icon" />
-                </el-icon>
-              </div>
-            </div>
-
-            <!-- 内容卡片 -->
-            <div class="timeline-card">
-              <!-- 头部：时间 + 动作标签 -->
-              <div class="card-header">
-                <span class="card-time">{{ formatTime(log.created_at) }}</span>
-                <span
-                  class="card-badge"
-                  :style="{ background: getTimelineConfig(log.action_type).bg, color: getTimelineConfig(log.action_type).color }"
-                >
-                  {{ getTimelineConfig(log.action_type).label }}
+              <div class="flex min-w-0 flex-col gap-0.5">
+                <span class="text-[13px] font-bold text-slate-100">Season {{ s.season }}</span>
+                <span class="font-hud text-[11px] text-slate-500">
+                  已完结 {{ s.organized_file_count }}/{{ s.expected_file_count }}
+                  &nbsp;|&nbsp;
+                  媒体库 {{ s.media_file_count }}/{{ s.expected_file_count }}
                 </span>
               </div>
+              <button
+                type="button"
+                class="inline-flex flex-shrink-0 items-center gap-1.5 rounded-full border border-warn/40 bg-warn/15 px-3.5 py-1.5 text-xs font-semibold text-warn transition-all duration-200 hover:bg-warn hover:text-[#0B1120] hover:shadow-[0_0_14px_rgba(245,158,11,0.4)] disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="forceMovingSeason === s.season"
+                @click="handleForceMove(s)"
+              >
+                <el-icon :size="13" v-if="forceMovingSeason === s.season"><Loading /></el-icon>
+                <span>{{ forceMovingSeason === s.season ? '移动中...' : '强制移动' }}</span>
+              </button>
+            </div>
+          </div>
 
-              <!-- 操作对象 -->
-              <div class="card-object">
-                <el-icon :size="14" :color="getTimelineConfig(log.action_type).color">
-                  <component :is="getTimelineConfig(log.action_type).icon" />
-                </el-icon>
-                <span class="object-name">{{ log.target_name }}</span>
-              </div>
+          <div v-if="!timelineLoading && timelineLogs.length === 0 && skippedIncompleteSeasons.length === 0" class="flex flex-col items-center justify-center gap-2 px-5 py-16 text-center">
+            <el-icon :size="40" class="text-slate-500"><Document /></el-icon>
+            <p class="text-[15px] font-medium text-slate-400">暂无操作日志</p>
+            <span class="text-[13px] text-slate-600">该任务可能尚未产生任何自动化操作</span>
+          </div>
 
-              <!-- 原因 -->
-              <div class="card-reason" v-if="log.reason">
-                <span class="reason-label">原因：</span>
-                <span class="reason-text">{{ log.reason }}</span>
-              </div>
+          <!-- 发光时间线 -->
+          <div v-if="timelineNodes.length > 0" class="timeline">
+            <div
+              v-for="{ log, cfg } in timelineNodes"
+              :key="log.id"
+              class="timeline-item"
+              :style="{
+                '--node-color': cfg.color,
+                '--node-bg': cfg.bg,
+                '--node-ring': cfg.ring,
+                '--node-glow': cfg.glow,
+              }"
+            >
+              <!-- 发光圆点（ring 发光效果） -->
+              <span class="timeline-dot"></span>
 
-              <!-- 路径 -->
-              <div class="card-path" v-if="log.target_path">
-                <span class="path-label">路径：</span>
-                <code class="path-text">{{ log.target_path }}</code>
-              </div>
-
-              <!-- 校验详情 (MOVE_FOLDER) -->
-              <div v-if="log.detail && (log.detail.source_stats || Object.keys(log.detail).length > 0)" class="card-detail">
-                <div
-                  class="detail-toggle"
-                  @click="toggleDetail(log.id)"
-                >
-                  <span>校验详情</span>
-                  <el-icon :size="14" :class="{ rotated: expandedDetails[log.id] }">
-                    <RemoveFilled v-if="expandedDetails[log.id]" />
-                    <InfoFilled v-else />
-                  </el-icon>
+              <!-- 事件卡片 -->
+              <div class="ev-card">
+                <div class="flex items-center justify-between gap-2.5">
+                  <span class="font-hud text-[11px] text-slate-500">{{ formatTime(log.created_at) }}</span>
+                  <span
+                    class="whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-[0.06em]"
+                    :style="{ color: cfg.color, background: cfg.bg, borderColor: cfg.badgeBorder }"
+                  >
+                    {{ cfg.label }}
+                  </span>
                 </div>
-                <div v-show="expandedDetails[log.id]" class="detail-body">
-                  <pre class="detail-json">{{ formatDetailJson(log.detail) }}</pre>
+
+                <div class="mb-2 flex items-center gap-1.5">
+                  <el-icon :size="13" :color="cfg.color"><component :is="cfg.icon" /></el-icon>
+                  <span class="break-all text-[14px] font-semibold leading-snug text-slate-100">{{ log.target_name }}</span>
+                </div>
+
+                <div v-if="log.reason" class="mt-1.5 flex items-start gap-2 text-xs leading-relaxed">
+                  <span class="min-w-7 flex-shrink-0 text-slate-500">原因:</span>
+                  <span class="break-all text-slate-300">{{ log.reason }}</span>
+                </div>
+
+                <div v-if="log.target_path" class="mt-1.5 flex items-start gap-2 text-xs leading-relaxed">
+                  <span class="min-w-7 flex-shrink-0 text-slate-500">路径:</span>
+                  <code class="break-all rounded border border-white/5 bg-white/5 px-1.5 py-0.5 font-hud text-[11px] text-slate-300">{{ log.target_path }}</code>
+                </div>
+
+                <!-- 校验详情 (MOVE_FOLDER) -->
+                <div v-if="log.detail && (log.detail.source_stats || Object.keys(log.detail).length > 0)" class="mt-2.5 border-t border-white/5 pt-2">
+                  <div class="flex cursor-pointer items-center justify-between py-1 text-xs text-slate-500 transition-colors duration-200 hover:text-electric select-none" @click="toggleDetail(log.id)">
+                    <span>校验详情</span>
+                    <el-icon :size="13" :class="{ rotated: expandedDetails[log.id] }">
+                      <ArrowDown v-if="!expandedDetails[log.id]" />
+                      <ArrowUp v-else />
+                    </el-icon>
+                  </div>
+                  <div v-show="expandedDetails[log.id]" class="mt-1.5">
+                    <pre class="overflow-x-auto whitespace-pre rounded-lg border border-white/5 bg-black/30 p-3 font-hud text-xs leading-relaxed text-slate-400">{{ formatDetailJson(log.detail) }}</pre>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
-    </el-drawer>
+      </aside>
+    </transition>
   </div>
 </template>
 
 <style scoped>
-.dashboard-container {
-  padding: 20px;
-  max-width: 1200px;
-  margin: 0 auto;
-}
+/* ==================== 数据列表响应式（移动端水平滚动） ==================== */
+.data-table { width: 100%; }
 
-/* ==================== Header ==================== */
-.dashboard-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 20px;
-}
-.header-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.header-icon {
-  color: var(--accent-blue);
-  display: flex;
-  align-items: center;
-}
-.header-title {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--text-primary);
-  letter-spacing: 0.5px;
-}
-.header-right {
-  display: flex;
-  gap: 8px;
-}
-
-/* ==================== 通用按钮 ==================== */
-.btn-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 7px 16px;
-  border-radius: var(--radius-full);
-  border: none;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  white-space: nowrap;
-}
-.btn-pill-refresh {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
-}
-.btn-pill-refresh:hover {
-  background: var(--accent-blue);
-  color: #fff;
-}
-.btn-pill-view {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
-  padding: 5px 14px;
-  font-size: 12px;
-}
-.btn-pill-view:hover {
-  background: var(--accent-blue);
-  color: #fff;
-}
-.btn-pill-delete {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
-  padding: 5px 10px;
-  font-size: 12px;
-}
-.btn-pill-delete:hover {
-  background: var(--accent-red);
-  color: #fff;
-}
-.btn-pill-batch-delete {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
-  padding: 7px 16px;
-  font-size: 13px;
-  font-weight: 600;
-}
-.btn-pill-batch-delete:hover {
-  background: var(--accent-red);
-  color: #fff;
-}
-
-/* 操作列布局 */
-.action-cell {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
-
-/* ==================== 统计卡片 ==================== */
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 16px;
-  margin-bottom: 20px;
-}
-.stat-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-lg);
-  padding: 18px 20px;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  transition: all 0.25s ease;
-  cursor: default;
-  position: relative;
-  overflow: hidden;
-}
-.stat-card::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 4px;
-  height: 100%;
-  background: var(--card-color);
-  border-radius: 0 3px 3px 0;
-  transition: width 0.2s ease;
-}
-.stat-card:hover {
-  border-color: var(--card-color);
-  box-shadow: 0 4px 20px rgba(0,0,0,0.25), 0 0 0 1px var(--card-color);
-  transform: translateY(-2px);
-}
-.stat-card:hover::before {
-  width: 6px;
-}
-.stat-icon-wrap {
-  width: 44px;
-  height: 44px;
-  border-radius: var(--radius-md);
-  background: var(--card-bg);
-  color: var(--card-color);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.stat-body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.stat-value {
-  font-size: 28px;
-  font-weight: 700;
-  color: var(--text-primary);
-  line-height: 1;
-}
-.stat-label {
-  font-size: 13px;
-  color: var(--text-tertiary);
-  font-weight: 500;
-}
-
-/* ==================== 表格区域 ==================== */
-.table-section {
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-}
-.table-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border-color);
-}
-.filter-group {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-.table-count {
-  font-size: 13px;
-  color: var(--text-tertiary);
-}
-
-/* 表格行 hover 交互 */
-:deep(.task-row) {
-  cursor: pointer;
-}
-.task-title {
-  font-weight: 500;
-  color: var(--text-primary);
-}
-.time-cell {
-  font-size: 12px;
-  color: var(--text-tertiary);
-  font-family: 'SF Mono', Menlo, monospace;
-}
-
-/* 分页 */
-.pagination-wrap {
-  padding: 14px 18px;
-  display: flex;
-  justify-content: flex-end;
-  border-top: 1px solid var(--border-color);
-}
-
-/* ==================== 时间线抽屉 ==================== */
-:deep(.timeline-drawer) {
-  --el-drawer-bg-color: var(--bg-primary);
-}
-
-.timeline-wrap {
-  min-height: 200px;
-}
-
-.timeline-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 20px;
-  color: var(--text-tertiary);
-  gap: 8px;
-  text-align: center;
-}
-.timeline-empty p {
-  font-size: 15px;
-  color: var(--text-secondary);
-  font-weight: 500;
-  margin-top: 4px;
-}
-.timeline-empty span {
-  font-size: 13px;
-  color: var(--text-tertiary);
-}
-
-/* 跳过 Season 手动处理区 */
-.skipped-seasons-section {
-  background: rgba(245, 158, 11, 0.06);
-  border: 1px solid rgba(245, 158, 11, 0.2);
-  border-radius: var(--radius-md);
-  padding: 14px;
-  margin-bottom: 16px;
-}
-.skipped-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin-bottom: 10px;
-}
-.skipped-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 10px;
-  background: var(--bg-primary);
-  border-radius: var(--radius-sm);
-  margin-top: 6px;
-}
-.skipped-info {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.skipped-label {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-.skipped-stats {
-  font-size: 12px;
-  color: var(--text-tertiary);
-}
-.btn-pill-force {
-  background: rgba(245, 158, 11, 0.15);
-  color: #d97706;
-  padding: 6px 14px;
-  font-size: 12px;
-  flex-shrink: 0;
-}
-.btn-pill-force:hover:not(:disabled) {
-  background: #f59e0b;
-  color: #fff;
-}
-.btn-pill-force:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-/* 时间线列表 */
-.timeline-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-
-/* 时间线节点 */
-.timeline-node {
-  display: flex;
-  gap: 14px;
-  padding-bottom: 4px;
-}
-
-/* 竖线 + 圆点 */
-.timeline-rail {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  position: relative;
-  flex-shrink: 0;
-  width: 36px;
-}
-.timeline-rail::after {
-  content: '';
-  position: absolute;
-  top: 36px;
-  bottom: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 2px;
-  background: var(--border-color);
-}
-.timeline-node:last-child .timeline-rail::after {
-  display: none;
-}
-.timeline-dot {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  background: var(--node-bg);
-  border: 2px solid var(--node-border);
-  color: var(--node-color);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1;
-  flex-shrink: 0;
-}
-
-/* 内容卡片 */
-.timeline-card {
-  flex: 1;
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  padding: 14px 16px;
-  margin-bottom: 16px;
-  transition: border-color 0.2s;
-}
-.timeline-card:hover {
-  border-color: var(--node-border);
-}
-
-.card-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-.card-time {
-  font-size: 12px;
-  color: var(--text-tertiary);
-  font-family: 'SF Mono', Menlo, monospace;
-}
-.card-badge {
+/* ==================== 表头单元格 ==================== */
+.dt-head-cell {
+  padding: 12px;
   font-size: 11px;
   font-weight: 600;
-  padding: 2px 10px;
-  border-radius: var(--radius-full);
-  letter-spacing: 0.3px;
-}
-
-.card-object {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-}
-.object-name {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-primary);
-  word-break: break-all;
-}
-
-.card-reason,
-.card-path {
-  display: flex;
-  align-items: flex-start;
-  gap: 4px;
-  margin-top: 4px;
-  font-size: 13px;
-  line-height: 1.5;
-}
-.reason-label,
-.path-label {
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   color: var(--text-tertiary);
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* ==================== 自定义复选框 ==================== */
+.cb {
+  display: inline-flex;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.cb-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.cb-box {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  background: rgba(255, 255, 255, 0.02);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  transition: all 0.15s ease;
   flex-shrink: 0;
 }
-.reason-text {
-  color: var(--text-secondary);
+.cb-input:checked + .cb-box {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.5);
 }
-.path-text {
-  color: var(--text-secondary);
-  background: var(--bg-primary);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 12px;
-  word-break: break-all;
+.cb-input:checked + .cb-box::after {
+  content: '';
+  width: 7px;
+  height: 4px;
+  border-left: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  transform: rotate(-45deg) translateY(-1px);
+}
+.cb-box.indeterminate {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.5);
+}
+.cb-box.indeterminate::after {
+  content: '';
+  width: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: #fff;
+}
+.cb-input:focus-visible + .cb-box {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
 }
 
-/* 校验详情 panel */
-.card-detail {
-  margin-top: 10px;
-  border-top: 1px solid var(--border-color);
-  padding-top: 8px;
+/* ==================== 抽屉过渡动画 ==================== */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.25s ease;
 }
-.detail-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  cursor: pointer;
-  font-size: 12px;
-  color: var(--text-tertiary);
-  padding: 4px 0;
-  transition: color 0.2s;
-  user-select: none;
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
 }
-.detail-toggle:hover {
-  color: var(--accent-blue);
+.slide-enter-active,
+.slide-leave-active {
+  transition: transform 0.32s cubic-bezier(0.16, 1, 0.3, 1);
 }
-.detail-json {
-  background: var(--bg-primary);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  padding: 12px;
-  font-size: 12px;
-  font-family: 'SF Mono', Menlo, Consolas, monospace;
-  color: var(--text-secondary);
-  overflow-x: auto;
-  white-space: pre;
-  line-height: 1.6;
-  margin-top: 6px;
+.slide-enter-from,
+.slide-leave-to {
+  transform: translateX(100%);
+}
+
+/* ==================== 时间线 ==================== */
+.timeline {
+  position: relative;
+}
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 15px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: linear-gradient(to bottom, rgba(148, 163, 184, 0.30), rgba(148, 163, 184, 0.06));
+}
+.timeline-item {
+  position: relative;
+  padding-left: 44px;
+  padding-bottom: 18px;
+}
+.timeline-item:last-child {
+  padding-bottom: 0;
+}
+
+/* 发光圆点：ring 发光效果 = 4px 柔光圈 + 弥散光晕 */
+.timeline-dot {
+  position: absolute;
+  left: 9px;
+  top: 18px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--node-color);
+  box-shadow:
+    0 0 0 4px var(--node-ring),
+    0 0 14px var(--node-glow);
+}
+
+/* ==================== 事件卡片 ==================== */
+.ev-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 12px;
+  padding: 12px 14px;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+.ev-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.detail-toggle .el-icon.rotated {
+  transform: rotate(180deg);
+  transition: transform 0.2s ease;
 }
 
 /* ==================== 响应式 ==================== */
-@media screen and (max-width: 768px) {
-  .dashboard-container {
-    padding: 8px;
-  }
-  .dashboard-header {
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-  .header-right {
-    width: 100%;
-  }
-  .header-right .btn-pill-refresh {
-    width: 100%;
-    justify-content: center;
-  }
-  .stats-grid {
-    grid-template-columns: repeat(2, 1fr);
-    gap: 10px;
-  }
-  .stat-card {
-    padding: 12px 14px;
-    gap: 10px;
-  }
-  .stat-value {
-    font-size: 24px;
-  }
-  .table-toolbar {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 10px;
-  }
-  .toolbar-right {
-    width: 100%;
-    justify-content: space-between;
-  }
-  .filter-group {
-    width: 100%;
-  }
-  .filter-group .el-select {
-    width: 100% !important;
-  }
-  /* 表格水平滚动 — 防止操作列遮挡内容 */
-  .table-section {
+@media (max-width: 768px) {
+  .data-table {
     overflow-x: auto;
   }
-  .table-section :deep(.el-table) {
-    min-width: 700px;
+  .dt-head,
+  .dt-row {
+    min-width: 980px;
   }
-  .action-cell {
-    gap: 4px;
+  .drawer-panel {
+    width: 100vw;
   }
-  .action-cell .btn-pill {
-    padding: 4px 8px;
-    font-size: 11px;
+  .drawer-body {
+    padding: 14px;
   }
-  :deep(.timeline-drawer) {
-    --el-drawer-size: 90vw !important;
+}
+
+/* ==================== 尊重系统减弱动效偏好 ==================== */
+@media (prefers-reduced-motion: reduce) {
+  .timeline-dot,
+  .ev-card,
+  .cb-box,
+  .drawer-panel,
+  .drawer-mask {
+    transition: none !important;
+    animation: none !important;
   }
 }
 </style>

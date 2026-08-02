@@ -1,7 +1,8 @@
 <script setup>
 import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
-import { Files, Connection, VideoCameraFilled, Expand, Fold, Timer, Box, EditPen, Menu, Brush, DataAnalysis, Calendar, User } from '@element-plus/icons-vue'
+import { Files, Connection, VideoCameraFilled, Timer, Box, EditPen, Brush, DataAnalysis, Calendar, User } from '@element-plus/icons-vue'
 
+import Sidebar from './components/Sidebar.vue'
 import TagManager from './components/TagManager.vue'
 import EmbySettings from './components/EmbySettings.vue'
 import MpConfig from './components/MpConfig.vue'
@@ -15,20 +16,20 @@ import ActorLocalizationStudio from './components/ActorLocalizationStudio.vue'
 import ActorLibrary from './components/ActorLibrary.vue'
 
 const isCollapse = ref(false)
-const activeMenu = ref('manager')
+const activeMenu = ref('emby')
 const windowWidth = ref(window.innerWidth)
-const showMobileDrawer = ref(false)
 
 const isMobile = computed(() => windowWidth.value < 768)
 
-const currentComponent = shallowRef(TagManager)
+const currentComponent = shallowRef(EmbySettings)
 
+// 用于组件解析 + 移动端底部 Tab 栏（index 必须与 Sidebar 中的菜单项保持一致）
 const menuItems = [
   { index: 'manager', label: '标签管理', icon: Files, component: TagManager },
   { index: 'qb', label: '下载管理', icon: Box, component: QbManager },
   { index: 'cleanup', label: '种子清理', icon: Brush, component: TorrentCleanup },
   { index: 'dashboard', label: '大盘', icon: DataAnalysis, component: TaskDashboard },
-  { index: 'actor', label: '演职员', icon: User, component: ActorLocalizationStudio },
+  { index: 'actor', label: '演员', icon: User, component: ActorLocalizationStudio },
   { index: 'actorLib', label: '演员库', icon: User, component: ActorLibrary },
   { index: 'scheduler', label: '定时扫描', icon: Calendar, component: ScheduledTasks },
   { index: 'emby', label: 'Emby', icon: Connection, component: EmbySettings },
@@ -41,7 +42,6 @@ const handleSelect = (index) => {
   activeMenu.value = index
   const item = menuItems.find(i => i.index === index)
   if (item) currentComponent.value = item.component
-  showMobileDrawer.value = false
 }
 
 const handleResize = () => {
@@ -63,35 +63,19 @@ onUnmounted(() => {
 
 <template>
   <div class="app-root">
-    <!-- ==================== 桌面端侧边栏 ==================== -->
-    <el-container class="app-layout" v-if="!isMobile">
-      <el-aside :width="isCollapse ? '64px' : '200px'" class="app-sidebar">
-        <div class="logo-area">
-          <span v-if="!isCollapse" class="title">Media Manager</span>
-          <el-icon v-else :size="20"><Menu /></el-icon>
-        </div>
-
-        <el-menu
-          :default-active="activeMenu"
-          class="sidebar-menu"
-          :collapse="isCollapse"
-          @select="handleSelect"
-        >
-          <el-menu-item v-for="item in menuItems" :key="item.index" :index="item.index">
-            <el-icon><component :is="item.icon" /></el-icon>
-            <template #title>{{ item.label }}</template>
-          </el-menu-item>
-        </el-menu>
-
-        <div class="collapse-btn" @click="isCollapse = !isCollapse">
-          <el-icon><Expand v-if="isCollapse" /><Fold v-else /></el-icon>
-        </div>
-      </el-aside>
+    <!-- ==================== 桌面端布局 ==================== -->
+    <div class="app-layout" v-if="!isMobile">
+      <Sidebar
+        :collapsed="isCollapse"
+        :active-menu="activeMenu"
+        @select="handleSelect"
+        @toggle-collapse="isCollapse = !isCollapse"
+      />
 
       <el-main class="app-main">
         <component :is="currentComponent" :key="activeMenu" />
       </el-main>
-    </el-container>
+    </div>
 
     <!-- ==================== 移动端布局 ==================== -->
     <div class="mobile-layout" v-else>
@@ -123,80 +107,13 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-/* ==================== CSS Variables (component-scoped fallback) ==================== */
-/* Depend on global :root variables from style.css */
-
 /* ==================== 桌面端样式 ==================== */
 .app-root { width: 100%; height: 100vh; overflow: hidden; }
-.app-layout { height: 100%; background-color: var(--bg-primary); }
-
-.app-sidebar {
-  background-color: var(--bg-card);
-  border-right: 1px solid var(--border-color);
-  display: flex;
-  flex-direction: column;
-  transition: width 0.3s;
-  overflow: hidden;
-}
-
-.logo-area {
-  height: 50px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-bottom: 1px solid var(--border-color);
-  color: var(--text-primary);
-}
-.title {
-  font-weight: bold; font-size: 16px; color: var(--text-primary); white-space: nowrap;
-  letter-spacing: 0.5px;
-}
-
-/* el-menu dark overrides via CSS variables */
-.sidebar-menu {
-  border-right: none;
-  margin-top: 5px;
-  flex: 1;
-  --el-menu-bg-color: transparent;
-  --el-menu-text-color: var(--text-secondary);
-  --el-menu-hover-bg-color: rgba(59, 130, 246, 0.1);
-  --el-menu-active-color: var(--accent-blue);
-  --el-menu-border-color: transparent;
-}
-.sidebar-menu :deep(.el-menu-item) {
-  height: 44px;
-  margin: 3px 8px;
-  border-radius: var(--radius-sm);
-  color: var(--text-secondary);
-  transition: all 0.2s ease;
-}
-.sidebar-menu :deep(.el-menu-item:hover) {
-  background-color: rgba(59, 130, 246, 0.08);
-  color: var(--text-primary);
-}
-.sidebar-menu :deep(.el-menu-item.is-active) {
-  background-color: var(--accent-blue-soft);
-  color: var(--accent-blue);
-  font-weight: 600;
-  box-shadow: inset 3px 0 0 var(--accent-blue);
-}
-
-.collapse-btn {
-  height: 44px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  color: var(--text-tertiary);
-  border-top: 1px solid var(--border-color);
-  transition: all 0.2s ease;
-}
-.collapse-btn:hover {
-  color: var(--text-primary);
-  background-color: rgba(59, 130, 246, 0.08);
-}
+.app-layout { display: flex; height: 100%; background-color: var(--bg-primary); }
 
 .app-main {
+  flex: 1;
+  min-width: 0;
   padding: 0;
   overflow-y: auto;
   overflow-x: hidden;

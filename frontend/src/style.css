@@ -1,3 +1,8 @@
+/* ==================== Tailwind CSS ==================== */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 /* ==================== CSS Custom Properties — Dark Theme ==================== */
 :root {
   --bg-primary: #0f172a;
@@ -71,10 +76,10 @@ body {
   height: 100%;
 }
 
-/* ==================== Custom Scrollbar ==================== */
+/* ==================== Custom Scrollbar (4px, half-white thumb) ==================== */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 4px;
+  height: 4px;
 }
 
 ::-webkit-scrollbar-track {
@@ -82,18 +87,22 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border-color);
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--text-tertiary);
+  background: rgba(255, 255, 255, 0.35);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* Firefox scrollbar */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--border-color) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
 }
 
 /* ==================== Mobile Safe Area ==================== */
@@ -201,26 +210,78 @@ body {
   color: var(--text-tertiary);
 }
 
-/* Select dropdown */
+/* ==================== Select dropdown — 毛玻璃 Popper ==================== */
+/* ElPlus 下拉默认 append 到 body，必须在全局（非 scoped）层覆盖 */
+/* —— Bug 根因：el-select 的下拉被包在 el-tooltip 的 .el-popper.is-light 外层里，
+   EP 默认给它白色底 + 1px 浅灰边框 + 4px 小圆角。白色"方角"会从毛玻璃下拉的
+   14px 圆角边缘透出，形成"方角+圆角重叠"。必须清掉外层的默认视觉。 */
+.el-select__popper.el-popper {
+  z-index: 2100 !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  overflow: hidden !important; /* 外层同步裁切，防直角溢出 */
+}
+
+/* 下拉容器：统一圆角 + 强制 overflow:hidden 裁切，防止内层列表/滚动条等
+   直角元素溢出外层圆角；边框统一为 border-white/10（rgba(255,255,255,.1)） */
 .el-select-dropdown {
-  --el-select-dropdown-bg-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  z-index: 2100 !important;
+  --el-select-dropdown-bg-color: rgba(15, 23, 42, 0.92);
+  --el-select-dropdown-hover-bg-color: rgba(255, 255, 255, 0.1);
+  --el-select-dropdown-border-color: rgba(255, 255, 255, 0.1);
+  --el-select-dropdown-text-color: #94a3b8;
+  --el-select-dropdown-item-height: 34px;
+  background: rgba(15, 23, 42, 0.92);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.1); /* border-white/10 */
+  border-radius: 14px;
+  box-shadow: 0 18px 50px -12px rgba(0, 0, 0, 0.55), 0 0 24px rgba(59, 130, 246, 0.06);
+  overflow: hidden !important; /* 强制裁切 — 圆角生效的关键 */
+}
+
+.el-select-dropdown__wrap {
+  max-height: 280px;
+  overflow-x: hidden; /* 纵向滚动时防止横向直角溢出 */
+}
+
+/* 文件列表 — 文件名悬浮全名提示（毛玻璃，跟随鼠标下方展示） */
+.file-name-popper.el-popper {
+  background: rgba(15, 23, 42, 0.95) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  border-radius: 8px;
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.65), 0 0 14px rgba(59, 130, 246, 0.14);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  font-size: 12.5px;
+  color: #e2e8f0;
+  max-width: 60vw;
+  overflow: hidden; /* 圆角裁切 */
 }
 
 .el-select-dropdown__item {
-  color: var(--text-secondary);
+  color: #94a3b8;
+  border-radius: 9px;
+  margin: 0 6px;
+  padding: 0 12px;
+  transition: background 0.15s ease, color 0.15s ease;
 }
-
 .el-select-dropdown__item.hover,
+.el-select-dropdown__item.is-hovering,
 .el-select-dropdown__item:hover {
-  background-color: var(--accent-blue-soft);
-  color: var(--accent-blue);
+  background-color: rgba(255, 255, 255, 0.1);
+  color: #f1f5f9;
+}
+.el-select-dropdown__item.is-selected {
+  color: #60a5fa;
+  font-weight: 600;
+  text-shadow: 0 0 8px rgba(96, 165, 250, 0.55);
 }
 
-.el-select-dropdown__item.selected {
-  color: var(--accent-blue);
-  font-weight: 600;
+/* 兼容：部分版本的 popper 根节点仅有 .el-popper 类 */
+.el-select__popper.el-popper {
+  z-index: 2100 !important;
 }
 
 /* Table (will be removed from QbManager but style it for configs page) */

@@ -1,6 +1,6 @@
 <template>
   <div class="qb-manager">
-    <!-- ==================== Custom Tab Bar ==================== -->
+    <!-- ==================== Custom Tab Bar (胶囊滑动) ==================== -->
     <div class="tab-bar">
       <button
         :class="['tab-btn', { active: activeTab === 'torrents' }]"
@@ -127,13 +127,10 @@
             </div>
 
             <div class="card-progress">
-              <div class="progress-track">
+              <div class="progress-track h-1.5">
                 <div
-                  class="progress-fill"
-                  :style="{
-                    width: (row.progress * 100) + '%',
-                    background: getProgressColor(row.state)
-                  }"
+                  class="progress-fill bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.8)]"
+                  :style="{ width: (row.progress * 100) + '%' }"
                 ></div>
               </div>
             </div>
@@ -233,7 +230,7 @@
       <div class="config-cards">
         <div v-for="cfg in qbConfigs" :key="cfg.id" class="config-card">
           <div class="cfg-left">
-            <div class="cfg-icon-circle" :class="{ active: cfg.active }">
+            <div class="cfg-icon-circle bg-emerald-500/10 text-emerald-400" :class="{ active: cfg.active }">
               <el-icon :size="20"><Monitor /></el-icon>
             </div>
           </div>
@@ -280,21 +277,40 @@
     <!--                         文件列表弹窗                                -->
     <!-- ================================================================== -->
     <el-dialog v-model="fileDialogVisible" title="文件列表" width="800px" class="file-dialog">
-      <el-table :data="fileList" v-loading="filesLoading" height="500px">
-        <el-table-column prop="name" label="文件名" min-width="400" show-overflow-tooltip />
-        <el-table-column prop="size" label="大小" width="120">
+      <el-table :data="fileList" v-loading="filesLoading" height="500px" class="file-table">
+        <el-table-column prop="name" label="文件名" min-width="360">
           <template #default="{ row }">
-            {{ formatBytes(row.size) }}
+            <el-tooltip
+              :content="row.name"
+              placement="bottom"
+              effect="dark"
+              trigger="click"
+              popper-class="file-name-popper"
+            >
+              <span class="cell-name-text">{{ row.name }}</span>
+            </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column prop="progress" label="进度" width="150">
+        <el-table-column prop="size" label="大小" width="120">
           <template #default="{ row }">
-            <el-progress :percentage="Math.round(row.progress * 100)" />
+            <span class="cell-size">{{ formatBytes(row.size) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="progress" label="进度" width="180">
+          <template #default="{ row }">
+            <div class="cell-progress">
+              <el-progress
+                :percentage="Math.round(row.progress * 100)"
+                :stroke-width="6"
+                :show-text="false"
+              />
+              <span class="cell-pct">{{ Math.round(row.progress * 100) }}%</span>
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="priority" label="优先级" width="100">
           <template #default="{ row }">
-            {{ row.priority === 0 ? '忽略' : (row.priority === 6 ? '高' : '正常') }}
+            <span class="cell-priority">{{ row.priority === 0 ? '忽略' : (row.priority === 6 ? '高' : '正常') }}</span>
           </template>
         </el-table-column>
       </el-table>
@@ -649,265 +665,224 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* ==================== Layout ==================== */
+/* ==================== 页面根容器 ==================== */
 .qb-manager {
+  padding: 20px 24px;
   height: 100%;
   display: flex;
   flex-direction: column;
-  padding: 8px 16px;
+  gap: 16px;
+  background: radial-gradient(ellipse 70% 45% at 90% -5%, rgba(59, 130, 246, 0.08), transparent 65%),
+              radial-gradient(ellipse 55% 40% at 0% 100%, rgba(16, 185, 129, 0.06), transparent 60%),
+              var(--bg-primary);
 }
 
-/* ==================== Tab Bar ==================== */
+/* ==================== 胶囊 Tab 栏 ==================== */
 .tab-bar {
-  display: flex;
+  display: inline-flex;
   gap: 4px;
   padding: 4px;
-  background: var(--bg-card);
-  border-radius: var(--radius-lg);
-  margin-bottom: 12px;
-  flex-shrink: 0;
+  width: fit-content;
+  background: rgba(2, 6, 23, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.35);
 }
 
 .tab-btn {
-  flex: 1;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 8px 16px;
+  gap: 7px;
+  padding: 9px 22px;
+  border-radius: 999px;
   border: none;
-  border-radius: var(--radius-md);
   background: transparent;
-  color: var(--text-tertiary);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.2s ease;
   font-family: inherit;
-}
-.tab-btn:hover {
-  color: var(--text-secondary);
-  background: var(--bg-card-hover);
-}
-.tab-btn.active {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
+  font-size: 13px;
   font-weight: 600;
-  box-shadow: 0 1px 3px rgba(59, 130, 246, 0.15);
+  color: #64748b;
+  cursor: pointer;
+  transition: all 0.22s ease;
+}
+.tab-btn:hover { color: #cbd5e1; }
+.tab-btn.active {
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.18);
+  box-shadow: 0 0 14px rgba(59, 130, 246, 0.3), inset 0 0 8px rgba(59, 130, 246, 0.06);
 }
 
-/* ==================== Torrent Tab ==================== */
+/* ==================== 种子管理 Tab ==================== */
 .torrent-tab {
   flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  gap: 14px;
 }
 
-/* ==================== Filter Bar ==================== */
+/* 过滤器 */
 .filter-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
   flex-wrap: wrap;
-  margin-bottom: 12px;
-  flex-shrink: 0;
+  gap: 10px;
 }
 
 .filter-select {
-  width: 140px;
+  width: 190px;
 }
+.filter-select-sm { width: 140px; }
 
-.filter-select-sm {
-  width: 110px;
-}
-
-/* Search box — custom pill input */
 .search-box {
-  position: relative;
   display: flex;
   align-items: center;
+  gap: 8px;
   flex: 1;
   min-width: 180px;
-  max-width: 280px;
+  padding: 8px 14px;
+  background: rgba(2, 6, 23, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
-
-.search-icon {
-  position: absolute;
-  left: 12px;
-  color: var(--text-tertiary);
-  pointer-events: none;
+.search-box:focus-within {
+  border-color: rgba(59, 130, 246, 0.4);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25), 0 0 14px rgba(59, 130, 246, 0.2);
 }
-
+.search-icon { color: #64748b; }
 .search-input {
-  width: 100%;
-  padding: 8px 32px 8px 36px;
-  background: var(--bg-input);
+  flex: 1;
+  min-width: 0;
   border: none;
-  border-radius: var(--radius-full);
-  color: var(--text-primary);
-  font-size: 13px;
-  font-family: inherit;
   outline: none;
-  transition: box-shadow 0.2s, background 0.2s;
-  box-shadow: 0 0 0 1px var(--border-color);
-}
-.search-input::placeholder {
-  color: var(--text-tertiary);
-}
-.search-input:focus {
-  box-shadow: 0 0 0 2px var(--accent-blue);
-  background: var(--bg-input-focus);
-}
-
-.search-clear {
-  position: absolute;
-  right: 10px;
-  color: var(--text-tertiary);
-  cursor: pointer;
-  transition: color 0.15s;
-}
-.search-clear:hover {
-  color: var(--text-primary);
-}
-
-/* Icon button */
-.btn-icon {
-  width: 36px;
-  height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  border-radius: var(--radius-full);
-  background: var(--bg-card);
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: all 0.2s;
-  flex-shrink: 0;
-}
-.btn-icon:hover {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
-}
-.btn-icon:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-/* Selection count */
-.select-count {
-  color: var(--accent-blue);
+  background: transparent;
+  color: #f1f5f9;
   font-size: 13px;
-  font-weight: 600;
-  white-space: nowrap;
-  margin-left: 4px;
-}
-
-/* Pill buttons */
-.btn-pill {
-  padding: 6px 14px;
-  border: none;
-  border-radius: var(--radius-full);
-  font-size: 12px;
-  font-weight: 500;
   font-family: inherit;
+}
+.search-input::placeholder { color: #475569; }
+.search-clear {
+  color: #64748b;
   cursor: pointer;
-  transition: all 0.2s;
-  white-space: nowrap;
+}
+.search-clear:hover { color: #f87171; }
+
+.btn-icon {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.05);
+  color: #94a3b8;
+  cursor: pointer;
+  transition: all 0.2s;
 }
+.btn-icon:hover:not(:disabled) {
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.12);
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.3);
+}
+.btn-icon:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/* 批量操作药丸按钮 */
+.select-count {
+  font-size: 12px;
+  color: #93c5fd;
+  font-weight: 600;
+}
+.btn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 15px;
+  border-radius: 999px;
+  border: 1px solid;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+}
 .btn-pill-all {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.35);
+  background: rgba(59, 130, 246, 0.12);
 }
 .btn-pill-all:hover {
-  background: rgba(59, 130, 246, 0.3);
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.35);
 }
-
 .btn-pill-clear {
-  background: var(--bg-card-hover);
-  color: var(--text-secondary);
+  color: #94a3b8;
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
 }
-.btn-pill-clear:hover {
-  background: var(--border-color);
-  color: var(--text-primary);
-}
-
+.btn-pill-clear:hover { color: #e2e8f0; background: rgba(255, 255, 255, 0.1); }
 .btn-pill-danger {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.1);
 }
 .btn-pill-danger:hover {
-  background: rgba(239, 68, 68, 0.3);
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.35);
 }
-
 .btn-pill-primary {
-  background: var(--accent-blue);
   color: #fff;
+  border: none;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+  box-shadow: 0 4px 16px rgba(59, 130, 246, 0.35);
 }
 .btn-pill-primary:hover {
-  background: #2563eb;
+  box-shadow: 0 8px 24px rgba(99, 102, 241, 0.55);
 }
 
-/* ==================== Card List ==================== */
+/* ==================== 种子卡片 ==================== */
 .card-list {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-right: 4px;
-}
-.card-list.is-empty {
-  flex: none;
+  gap: 10px;
+  padding: 4px 2px;
 }
 
-/* ==================== Torrent Card ==================== */
 .torrent-card {
   display: flex;
-  align-items: stretch;
-  gap: 12px;
-  padding: 14px 16px;
-  background: var(--bg-card);
-  border-radius: var(--radius-lg);
-  border: 1px solid transparent;
-  transition: all 0.2s ease;
-  cursor: default;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 16px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  transition: border-color 0.22s ease, box-shadow 0.22s ease, background 0.22s ease;
 }
 .torrent-card:hover {
-  background: var(--bg-card-hover);
-  border-color: var(--border-color);
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-md);
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 .torrent-card.selected {
-  border-color: var(--accent-blue);
-  box-shadow: 0 0 0 1px var(--accent-blue), var(--shadow-md);
+  border-color: rgba(59, 130, 246, 0.5);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.2), 0 8px 26px -14px rgba(59, 130, 246, 0.4);
+  background: rgba(59, 130, 246, 0.05);
 }
 
-/* Left: icon circle */
-.card-icon-col {
-  display: flex;
-  align-items: flex-start;
-  padding-top: 2px;
-  flex-shrink: 0;
-}
+.card-icon-col { flex-shrink: 0; }
 
 .card-icon-circle {
-  width: 42px;
-  height: 42px;
-  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
 }
 
-/* Center: info */
 .card-body {
   flex: 1;
   min-width: 0;
@@ -916,279 +891,283 @@ onMounted(() => {
   gap: 6px;
 }
 
+/* 资源名称 — 主标题纯白 */
 .card-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  line-height: 1.4;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #ffffff;
+  line-height: 1.35;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .card-meta-row {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   font-size: 12px;
-  color: var(--text-tertiary);
+  color: #64748b;
 }
+.meta-size { color: #94a3b8; font-weight: 500; }
+.meta-progress-text { color: #34d399; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+.meta-ratio { color: #64748b; }
+.meta-sep { color: #334155; }
 
-.meta-size {
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-.meta-sep {
-  color: var(--border-color);
-}
-
-.meta-progress-text {
-  font-weight: 600;
-  color: var(--text-secondary);
-}
-
-.meta-ratio {
-  color: var(--text-tertiary);
-}
-
-/* Progress bar */
-.card-progress {
-  width: 100%;
-}
+/* 细长霓虹绿进度条 */
+.card-progress { width: 100%; }
 
 .progress-track {
   width: 100%;
-  height: 4px;
-  background: var(--border-color);
-  border-radius: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
   overflow: hidden;
 }
 
 .progress-fill {
   height: 100%;
-  border-radius: 2px;
-  transition: width 0.6s ease;
-  min-width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #34d399, #10b981);
+  transition: width 0.4s ease;
 }
 
-/* Tag chips */
 .card-tag-row {
   display: flex;
   align-items: center;
-  gap: 6px;
   flex-wrap: wrap;
+  gap: 6px;
 }
 
+/* 状态标签 — 带边框低透明度发光药丸 */
 .tag-chip {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: 4px;
   padding: 3px 10px;
-  border-radius: var(--radius-full);
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
   font-size: 11px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-
-.tag-state {
   font-weight: 600;
+  letter-spacing: 0.3px;
+  background: rgba(255, 255, 255, 0.05);
 }
-
+.tag-state {
+  border-color: transparent;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.18);
+}
 .tag-category {
-  background: rgba(139, 92, 246, 0.15);
-  color: var(--accent-purple);
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.28);
+  background: rgba(59, 130, 246, 0.09);
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.15);
 }
-
 .tag-hash {
-  background: var(--bg-card-hover);
-  color: var(--text-tertiary);
+  color: #a78bfa;
+  border-color: rgba(139, 92, 246, 0.28);
+  background: rgba(139, 92, 246, 0.09);
+  box-shadow: 0 0 10px rgba(139, 92, 246, 0.15);
 }
 
-/* Right: checkbox + actions */
 .card-actions-col {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  justify-content: space-between;
-  flex-shrink: 0;
+  align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .card-checkbox {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  border: 2px solid var(--border-color);
   display: flex;
   align-items: center;
   justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  border: 1.5px solid rgba(148, 163, 184, 0.35);
+  color: #fff;
   cursor: pointer;
   transition: all 0.2s;
-  color: #fff;
-  flex-shrink: 0;
-}
-.card-checkbox:hover {
-  border-color: var(--accent-blue);
 }
 .card-checkbox.checked {
-  background: var(--accent-blue);
-  border-color: var(--accent-blue);
+  background: #3b82f6;
+  border-color: #3b82f6;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
 }
 
 .card-action-btns {
   display: flex;
-  gap: 4px;
+  gap: 6px;
 }
 
+/* 通用小图标按钮 */
 .ac-btn {
-  width: 30px;
-  height: 30px;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: none;
-  border-radius: var(--radius-sm);
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid transparent;
   background: transparent;
-  color: var(--text-tertiary);
+  color: #64748b;
   cursor: pointer;
   transition: all 0.2s;
 }
 .ac-btn:hover {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
+  color: #93c5fd;
+  background: rgba(59, 130, 246, 0.12);
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.25);
 }
 .ac-btn-warn:hover {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.12);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.25);
 }
 
-/* ==================== Empty State ==================== */
+/* ==================== 空状态 ==================== */
 .empty-state {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 60px 20px;
-  text-align: center;
+  padding: 60px 0;
+  gap: 8px;
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.02);
 }
-
 .empty-icon-circle {
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  background: var(--bg-card);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-tertiary);
-  margin-bottom: 16px;
+  width: 64px;
+  height: 64px;
+  border-radius: 20px;
+  margin-bottom: 6px;
+  color: #60a5fa;
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.15);
 }
+.empty-title { font-size: 15px; font-weight: 600; color: #cbd5e1; margin: 0; }
+.empty-desc { font-size: 12.5px; color: #64748b; margin: 0; }
 
-.empty-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin-bottom: 4px;
-}
-
-.empty-desc {
-  font-size: 13px;
-  color: var(--text-tertiary);
-}
-
-/* ==================== Pagination ==================== */
+/* ==================== 分页 ==================== */
 .pagination-bar {
   display: flex;
   justify-content: center;
-  padding: 12px 0 4px;
+  padding: 6px 0 2px;
   flex-shrink: 0;
 }
+.pagination-bar :deep(.el-pagination) {
+  --el-pagination-bg-color: rgba(255, 255, 255, 0.05);
+  --el-pagination-button-bg-color: rgba(255, 255, 255, 0.05);
+  --el-pagination-hover-color: #60a5fa;
+  --el-pagination-text-color: #94a3b8;
+}
+.pagination-bar :deep(.el-pager li) {
+  color: #94a3b8;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  margin: 0 2px;
+}
+.pagination-bar :deep(.el-pager li.is-active) {
+  background: #3b82f6;
+  color: #fff;
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.5);
+}
 
-/* ==================== Configs Tab ==================== */
+/* ==================== 实例配置 Tab ==================== */
 .configs-tab {
   flex: 1;
-  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
 .configs-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 10px;
 }
-
 .configs-title {
   font-size: 16px;
-  font-weight: 600;
-  color: var(--text-primary);
+  font-weight: 700;
+  color: #f1f5f9;
   margin: 0;
+  letter-spacing: 0.3px;
 }
 
 .config-cards {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 4px 2px;
 }
 
+/* 实例卡片 — 横向毛玻璃卡片 */
 .config-card {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 16px;
   padding: 14px 18px;
-  background: var(--bg-card);
-  border-radius: var(--radius-lg);
-  border: 1px solid transparent;
-  transition: all 0.2s;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 16px;
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  transition: border-color 0.22s ease, box-shadow 0.22s ease;
 }
 .config-card:hover {
-  background: var(--bg-card-hover);
-  border-color: var(--border-color);
+  border-color: rgba(16, 185, 129, 0.3);
+  box-shadow: 0 8px 26px -14px rgba(16, 185, 129, 0.25);
 }
 
-.cfg-left {
-  flex-shrink: 0;
-}
+.cfg-left { flex-shrink: 0; }
 
+/* 服务器图标 — 发光绿 */
 .cfg-icon-circle {
-  width: 42px;
-  height: 42px;
-  border-radius: 50%;
-  background: var(--bg-card-hover);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--text-tertiary);
-  transition: all 0.3s;
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  box-shadow: 0 0 14px rgba(52, 211, 153, 0.25), inset 0 0 8px rgba(52, 211, 153, 0.08);
 }
 .cfg-icon-circle.active {
-  background: rgba(16, 185, 129, 0.18);
-  color: var(--accent-green);
-  box-shadow: 0 0 8px rgba(16, 185, 129, 0.3);
+  color: #34d399;
+  box-shadow: 0 0 18px rgba(52, 211, 153, 0.5), inset 0 0 10px rgba(52, 211, 153, 0.12);
 }
 
 .cfg-body {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
-
 .cfg-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin-bottom: 2px;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #ffffff;
 }
-
 .cfg-url {
-  font-size: 12px;
-  color: var(--accent-blue);
-  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 12.5px;
+  color: #94a3b8;
+  font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-
 .cfg-user {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  margin-top: 1px;
+  font-size: 12px;
+  color: #64748b;
 }
 
 .cfg-right {
@@ -1198,100 +1177,188 @@ onMounted(() => {
   flex-shrink: 0;
 }
 
-.cfg-switch {
-  --el-switch-on-color: var(--accent-green);
+/* Toggle 开关 — 激活霓虹绿光晕 */
+.cfg-switch :deep(.el-switch__core) {
+  width: 44px;
+}
+.cfg-switch :deep(.el-switch.is-checked .el-switch__core) {
+  background: #10b981;
+  box-shadow: 0 0 14px rgba(16, 185, 129, 0.6);
+  border-color: transparent;
 }
 
-.cfg-actions {
+/* ==================== Element Plus overrides ==================== */
+:deep(.el-switch) {
+  --el-switch-on-color: #3b82f6;
+  --el-switch-off-color: rgba(148, 163, 184, 0.25);
+  --el-switch-border-color: transparent;
+}
+:deep(.el-switch.is-checked .el-switch__core) {
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
+}
+
+:deep(.el-select__wrapper) {
+  background: rgba(2, 6, 23, 0.5);
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.14) !important;
+  transition: box-shadow 0.2s;
+}
+:deep(.el-select__wrapper.is-focused) {
+  box-shadow: 0 0 0 1px #3b82f6, 0 0 10px rgba(59, 130, 246, 0.4) !important;
+}
+:deep(.el-select__selected-item) { color: #f1f5f9; }
+:deep(.el-select-dropdown) {
+  --el-select-dropdown-bg-color: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  overflow: hidden; /* 强制裁切，防直角元素溢出圆角 */
+}
+:deep(.el-select-dropdown__item) { color: #94a3b8; }
+:deep(.el-select-dropdown__item.hover),
+:deep(.el-select-dropdown__item:hover) { background: rgba(59, 130, 246, 0.12); color: #93c5fd; }
+:deep(.el-select-dropdown__item.is-selected) { color: #60a5fa; font-weight: 600; }
+
+/* 弹窗 — 全息毛玻璃（文件列表 / 新增编辑实例） */
+:deep(.el-overlay) {
+  @apply bg-black/60 backdrop-blur-sm;
+}
+:deep(.el-dialog) {
+  --el-dialog-bg-color: transparent;
+  @apply bg-[#0B1120]/80 backdrop-blur-2xl border border-white/10 rounded-2xl;
+  box-shadow: 0 0 30px rgba(59, 130, 246, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+:deep(.el-dialog__header) {
+  background: transparent;
+  border-bottom: none;
+  padding-bottom: 14px;
+}
+:deep(.el-dialog__title) {
+  color: #ffffff;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+:deep(.el-dialog__body) {
+  color: #cbd5e1;
+}
+:deep(.el-dialog__footer) {
+  background: transparent;
+  border-top: none;
+  padding-top: 8px;
+}
+:deep(.el-dialog__headerbtn) {
+  color: #64748b;
+  transition: color 0.25s ease, transform 0.25s ease, text-shadow 0.25s ease;
+}
+:deep(.el-dialog__headerbtn:hover) {
+  color: #3b82f6;
+  transform: rotate(90deg);
+  text-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
+}
+:deep(.el-form-item__label) { color: #94a3b8; }
+:deep(.el-input__wrapper) {
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 10px;
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.12) !important;
+}
+:deep(.el-input__wrapper.is-focus) {
+  background: rgba(59, 130, 246, 0.06);
+  box-shadow: 0 0 0 1px #3b82f6, 0 0 10px rgba(59, 130, 246, 0.4) !important;
+}
+:deep(.el-input__inner) { color: #f1f5f9; }
+:deep(.el-input__inner::placeholder) { color: #475569; }
+
+/* ==================== 文件列表 — 隐形排版表格 ==================== */
+/* 注意：class="file-table" 直接加在 el-table 根节点上（同一个元素同时持有
+   .el-table 与 .file-table）。因此穿透选择器里不能再写 .el-table 作为中间
+   祖先（`.file-table .el-table` 要求 .el-table 是 .file-table 的后代，永不命中），
+   一律以 .file-table 为根，只写其后代选择器。 */
+.file-table {
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: transparent;
+  --el-table-row-hover-bg-color: transparent;
+  --el-table-border-color: transparent;
+}
+/* 剥离所有默认背景 */
+.file-table :deep(tr),
+.file-table :deep(th.el-table__cell),
+.file-table :deep(td.el-table__cell) {
+  background-color: transparent !important;
+}
+/* 去除纵向边框，底边替换为极细半透明线 */
+.file-table :deep(th.el-table__cell),
+.file-table :deep(td.el-table__cell) {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+}
+/* 隐藏表格底部默认灰线 */
+.file-table :deep(.el-table__inner-wrapper::before) { display: none; }
+/* Hover 提亮 */
+.file-table :deep(tbody tr:hover > td.el-table__cell) {
+  background-color: rgba(255, 255, 255, 0.03) !important;
+}
+/* 单元格固定高度 + 垂直居中（修复错位的关键） */
+.file-table :deep(td.el-table__cell) {
+  height: 48px !important;
+  padding: 0 8px !important;
+  vertical-align: middle;
+}
+/* 单元格内容统一：去 EP 默认 12px 内边距 + 单行 nowrap + 省略号。
+   .cell 自身渲染省略号，保证列表始终单行紧凑，不会多行撑高行高；
+   全名改为「点击触发」展示。 */
+.file-table :deep(td.el-table__cell .cell) {
+  padding: 0 !important;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 单元格内容 flex 容器：垂直居中（进度条 + 百分比） */
+.cell-progress {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+/* 文件名 — 行内文本，不自身裁剪；点击查看全名（cursor 提示可点） */
+.cell-name-text {
+  color: #e2e8f0;
+  font-size: 13px;
+  cursor: pointer;
+}
+/* 大小 / 进度百分比 — 等宽极客字体 */
+.cell-size {
+  @apply font-mono text-slate-300;
+  font-size: 12px;
+}
+.cell-pct {
+  @apply font-mono text-slate-300;
+  font-size: 12px;
+  min-width: 34px;
+  text-align: right;
+}
+.cell-priority {
+  font-size: 12px;
+  color: #94a3b8;
+}
+/* 高科技进度条 — 电光蓝细条 + 发光 */
+.file-dialog :deep(.el-progress) { flex: 1; min-width: 0; }
+.file-dialog :deep(.el-progress-bar__outer) { background-color: rgba(255, 255, 255, 0.08); }
+.file-dialog :deep(.el-progress-bar__inner) {
+  background: linear-gradient(90deg, #2563eb, #3b82f6);
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
 }
 
-/* ==================== Mobile ==================== */
-@media screen and (max-width: 768px) {
+/* ==================== 移动端响应式 ==================== */
+@media (max-width: 768px) {
   .qb-manager {
-    padding: 4px;
+    padding: 10px 12px 32px;
   }
-
-  .tab-bar {
-    margin-bottom: 8px;
-  }
-
-  .tab-btn {
-    font-size: 13px;
-    padding: 6px 12px;
-  }
-
-  .filter-bar {
-    gap: 4px;
-  }
-
-  .filter-select {
-    width: calc(50% - 30px) !important;
-  }
-
-  .filter-select-sm {
-    width: calc(25% - 4px) !important;
-  }
-
-  .search-box {
-    min-width: 120px;
-    max-width: none;
-    flex: none;
-    width: 100%;
-    order: 99;
-  }
-
-  .torrent-card {
-    padding: 10px 12px;
-    gap: 8px;
-  }
-
-  .card-icon-circle {
-    width: 36px;
-    height: 36px;
-  }
-
-  .card-name {
-    font-size: 13px;
-  }
-
-  .card-meta-row {
-    font-size: 11px;
-  }
-
-  .card-tag-row {
-    gap: 4px;
-  }
-
-  .tag-chip {
-    font-size: 10px;
-    padding: 2px 8px;
-  }
-
-  .card-actions-col {
-    gap: 4px;
-  }
-
-  .ac-btn {
-    width: 26px;
-    height: 26px;
-  }
-
-  .btn-pill {
-    font-size: 11px;
-    padding: 4px 10px;
-  }
-
-  .config-card {
-    flex-wrap: wrap;
-    padding: 12px;
-  }
-
-  .cfg-right {
-    width: 100%;
-    justify-content: space-between;
-    margin-top: 8px;
-  }
+  .tab-bar { width: 100%; }
+  .tab-btn { flex: 1; justify-content: center; }
+  .filter-bar { gap: 8px; }
+  .filter-select { width: 100%; }
+  .filter-select-sm { width: calc(50% - 4px); }
+  .search-box { min-width: 100%; }
+  .torrent-card { flex-wrap: wrap; }
+  .card-actions-col { flex-direction: row; justify-content: flex-end; width: 100%; }
 }
 </style>

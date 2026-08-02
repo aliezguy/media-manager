@@ -3,8 +3,8 @@ import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Search, SwitchButton, CircleCheck, CircleClose, RefreshRight,
-  Upload, VideoCamera, Picture, Lock, Loading, VideoPlay, Download
+  Search, RefreshRight, VideoCamera, Picture, Loading, VideoPlay, Download,
+  Tickets, DataAnalysis, MagicStick, Connection, Compass
 } from '@element-plus/icons-vue'
 
 const API_URL = ''
@@ -431,7 +431,12 @@ const handleToggleAuto = async (val) => {
 }
 
 const statusLabel = (s) => ({ pending: '未汉化', synced: '已汉化', locked: '已锁定', syncing: '汉化中' }[s] || s)
-const statusColor = (s) => ({ pending: '#ef4444', synced: '#10b981', locked: '#64748b', syncing: '#3b82f6' }[s] || '#94a3b8')
+const statusPillClass = (s) => ({
+  pending: 'pill-pending',
+  synced: 'pill-synced',
+  locked: 'pill-locked',
+  syncing: 'pill-syncing',
+}[s] || 'pill-locked')
 
 const getPosterGradient = (name) => {
   const g = [
@@ -455,6 +460,15 @@ const getSyncTag = (item) => {
   if (!item.syncResult) return null
   if (item.syncResult.success) return '✓ 匹配 ' + item.syncResult.matched + '/' + item.syncResult.total_actors
   return '✘ 失败'
+}
+
+// ★ 最终展示行：演员名（已汉化优先取新名）+ 角色名，统一“名 饰 角色”格式（纯展示层，不改动业务逻辑）
+const actorDisplayRows = (item) => {
+  const details = (item.status === 'synced' && item.syncResult) ? (item.syncResult.details || []) : []
+  if (details.length) {
+    return details.map(d => ({ name: d.new_name || d.emby_name, role: d.new_role || '' }))
+  }
+  return (item.actors || []).map(a => ({ name: a.Name || a.name, role: a.Role || a.role }))
 }
 
 const openDetailsDrawer = async (itemId) => {
@@ -571,83 +585,200 @@ onUnmounted(() => {
 </script>
 <template>
   <div class="studio-root">
-    <div class="header-bar">
-      <div class="header-left">
-        <h1 class="page-title">演职员中文化治理</h1>
-        <div class="stats-badge"><span class="stats-dot" /><span>已汉化 <strong>{{ stats.synced }}</strong> / {{ stats.total }}</span></div>
+    <!-- ==================== Sticky 顶部操作区 ==================== -->
+    <div class="sticky top-0 z-30 border-b border-white/5 bg-[#0B1120]/80 backdrop-blur-xl">
+      <!-- 第一行：标题 + 筛选 -->
+      <div class="flex flex-wrap items-center gap-3 px-5 py-3">
+        <div class="flex items-center gap-3">
+          <h1 class="whitespace-nowrap text-[17px] font-bold tracking-wide text-white">演职员中文化治理</h1>
+          <div class="stats-pill">
+            <span class="stats-dot" />
+            <span>已汉化 <strong>{{ stats.synced }}</strong> / {{ stats.total }}</span>
+          </div>
+        </div>
+
+        <div class="ml-auto flex flex-wrap items-center gap-2.5">
+          <el-select v-model="selectedLibrary" placeholder="选择媒体库" class="hdr-select" size="default" :disabled="systemStatus.is_running" @change="currentPage=1;loadItems()">
+            <el-option v-for="opt in libraryOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+          </el-select>
+          <el-select v-model="selectedStatus" placeholder="全部状态" class="hdr-select" size="default" @change="currentPage=1;loadItems()">
+            <el-option v-for="opt in statusOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+          </el-select>
+          <el-input v-model="searchQuery" placeholder="搜索剧名..." :prefix-icon="Search" class="hdr-search" clearable size="default" />
+          <div class="auto-switch">
+            <span class="switch-label">自动化更新</span>
+            <el-switch v-model="autoUpdateEnabled" :loading="autoUpdating" @change="handleToggleAuto" />
+          </div>
+        </div>
       </div>
-      <div class="header-center">
-        <el-select v-model="selectedLibrary" placeholder="选择媒体库" class="header-select" size="default" :disabled="systemStatus.is_running" @change="currentPage=1;loadItems()">
-          <el-option v-for="opt in libraryOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-        </el-select>
-        <el-select v-model="selectedStatus" placeholder="全部状态" class="header-select" size="default" @change="currentPage=1;loadItems()">
-          <el-option v-for="opt in statusOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
-        </el-select>
-      </div>
-      <div class="header-right">
-        <el-input v-model="searchQuery" placeholder="搜索剧名..." :prefix-icon="Search" class="search-input" clearable size="default" />
-        <div class="auto-switch-group"><span class="switch-label">自动化更新</span><el-switch v-model="autoUpdateEnabled" :loading="autoUpdating" @change="handleToggleAuto" /></div>
+
+      <!-- 第二行：选中信息 + 批量操作 -->
+      <div v-if="filteredItems.length > 0" class="flex flex-wrap items-center gap-3 border-t border-white/5 px-5 py-2.5">
+        <el-checkbox v-model="isAllChecked" :indeterminate="checkedIds.length > 0 && !isAllChecked" class="tech-checkbox select-all-check">
+          全选 ({{ checkedIds.length }}/{{ filteredItems.length }})
+        </el-checkbox>
+        <span class="select-count">已选 {{ pendingCheckedIds.length }} 个待处理项</span>
+
+        <div class="ml-auto flex flex-wrap items-center gap-2 hdr-actions">
+          <el-button
+            size="small"
+            class="btn-ghost"
+            :icon="Connection"
+            :disabled="pendingCheckedIds.length === 0 || systemStatus.is_running"
+            @click="handleBatchSync"
+          >{{ pendingCheckedIds.length > 0 ? '同步选中项 (' + pendingCheckedIds.length + ')' : '批量执行中文化' }}</el-button>
+          <el-button
+            size="small"
+            class="btn-ghost btn-danger-ghost"
+            :icon="RefreshRight"
+            :disabled="checkedIds.length === 0 || systemStatus.is_running"
+            @click="handleForceTranslate"
+          >强制汉化(覆盖)</el-button>
+          <el-button
+            size="small"
+            class="btn-primary"
+            :icon="MagicStick"
+            :disabled="systemStatus.is_running || !selectedLibrary"
+            @click="handleFullSync"
+          >全量汉化</el-button>
+          <el-button
+            size="small"
+            class="btn-ghost"
+            :icon="Compass"
+            :loading="auditLoading"
+            :disabled="systemStatus.is_running || !selectedLibrary"
+            @click="handleAuditLocal"
+          >审计本地汉化状态</el-button>
+          <el-button
+            size="small"
+            class="btn-ghost"
+            :icon="DataAnalysis"
+            :loading="auditingSelected"
+            :disabled="checkedIds.length === 0 || systemStatus.is_running"
+            @click="handleAuditSelected"
+          >审计选中项</el-button>
+        </div>
       </div>
     </div>
 
-    <div v-if="systemStatus.is_running" class="progress-banner">
-      <div class="progress-info"><el-icon class="is-loading" :size="14"><Loading /></el-icon><span>🚀 后台正在执行汉化任务: <strong>{{ systemStatus.current_task || '处理中...' }}</strong></span><span class="progress-count">({{ systemStatus.progress }}/{{ systemStatus.total }})</span></div>
+    <!-- ==================== 系统任务进度横幅 ==================== -->
+    <div v-if="systemStatus.is_running" class="progress-banner mx-5 mt-4">
+      <div class="progress-info">
+        <el-icon class="is-loading" :size="16"><Loading /></el-icon>
+        <span>后台正在执行汉化任务: <strong>{{ systemStatus.current_task || '处理中...' }}</strong></span>
+        <span class="progress-count font-hud">({{ systemStatus.progress }}/{{ systemStatus.total }})</span>
+      </div>
       <el-progress :percentage="systemStatus.total > 0 ? Math.round((systemStatus.progress / systemStatus.total) * 100) : 0" :stroke-width="4" :show-text="false" color="#00A3FF" />
     </div>
 
-    <div class="select-all-row" v-if="filteredItems.length > 0">
-      <el-checkbox v-model="isAllChecked" :indeterminate="checkedIds.length > 0 && !isAllChecked">全选 ({{ checkedIds.length }}/{{ filteredItems.length }})</el-checkbox>
-      <span class="select-info">已选 {{ pendingCheckedIds.length }} 个待处理项</span>
-      <el-button type="primary" size="small" class="btn-batch-inline" :disabled="pendingCheckedIds.length === 0 || systemStatus.is_running" @click="handleBatchSync">{{ pendingCheckedIds.length > 0 ? '同步选中项 (' + pendingCheckedIds.length + ')' : '批量执行中文化' }}</el-button>
-      <el-button type="danger" size="small" plain class="btn-batch-inline" :disabled="checkedIds.length === 0 || systemStatus.is_running" @click="handleForceTranslate">强制汉化(覆盖)</el-button>
-      <el-button type="warning" size="small" class="btn-batch-inline" :disabled="systemStatus.is_running || !selectedLibrary" @click="handleFullSync">全量汉化</el-button>
-      <el-button size="small" class="btn-audit-local" :loading="auditLoading" :disabled="systemStatus.is_running || !selectedLibrary" @click="handleAuditLocal">审计本地汉化状态</el-button>
-      <el-button type="info" size="small" class="btn-audit-selected" :loading="auditingSelected" :disabled="checkedIds.length === 0 || systemStatus.is_running" @click="handleAuditSelected">审计选中项</el-button>
-    </div>
-
-    <div class="cards-grid">
-      <div v-if="loading" class="loading-overlay"><el-icon class="is-loading" :size="32"><Loading /></el-icon><span>正在加载媒体数据...</span></div>
-      <div v-for="item in filteredItems" :key="item.id" class="media-card" :class="{ 'is-locked': item.status === 'locked', 'is-synced': item.status === 'synced', 'is-checked': item.checked }" @click="item.checked = !item.checked">
-        <div class="card-check" @click.stop><el-checkbox v-model="item.checked" @click.stop /></div>
-        <div class="card-poster" :style="{ background: getPosterGradient(item.name) }">
-          <el-image :src="getPosterUrl(item)" class="poster-img" lazy fit="cover">
-            <template #placeholder><div class="poster-skeleton"></div></template>
-            <template #error><div class="poster-placeholder"><el-icon :size="20"><VideoCamera /></el-icon></div></template>
-          </el-image>
-          <span class="poster-type">{{ item.type === 'Movie' ? '电影' : '剧集' }}</span>
+    <!-- ==================== 演员卡片网格 ==================== -->
+    <div class="p-5">
+      <div class="cards-grid">
+        <!-- 加载态 -->
+        <div v-if="loading" class="loading-overlay">
+          <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+          <span>正在加载媒体数据...</span>
         </div>
-        <div class="card-body">
-          <div class="card-header"><span class="card-title">{{ item.name }}</span><span class="card-year">{{ item.year }}</span><span class="card-status" :style="{ color: statusColor(item.status) }">{{ statusLabel(item.status) }}</span></div>
-          <div class="actor-compare">
-            <div class="compare-col compare-emby">
-              <div class="compare-label">Emby 当前</div>
-              <div class="actor-list">
-                <div v-for="(a, ai) in item.actors.slice(0, 5)" :key="'emby-' + ai" class="actor-row"><span class="actor-name">{{ a.Name || a.name }}</span><span class="actor-role">{{ a.Role || a.role }}</span></div>
-                <div v-if="item.actors.length > 5" class="actor-more">+{{ item.actors.length - 5 }} 更多</div>
-                <div v-if="item.actors.length === 0" class="actor-empty">暂无演员</div>
+
+        <!-- 卡片（横向左右结构） -->
+        <div
+          v-for="item in filteredItems"
+          :key="item.id"
+          class="media-card group"
+          :class="{
+            'is-locked': item.status === 'locked',
+            'is-synced': item.status === 'synced',
+            'is-checked': item.checked
+          }"
+          @click="item.checked = !item.checked"
+        >
+          <!-- ===== 左侧海报区：2:3 竖版海报（加宽恢复黄金比例，约占卡片 40%），h-full 撑满 ===== -->
+          <div class="relative h-full w-[150px] shrink-0 overflow-hidden">
+            <el-image :src="getPosterUrl(item)" fit="cover" class="poster-img absolute inset-0 h-full w-full" lazy>
+              <template #placeholder><div class="poster-skeleton h-full w-full"></div></template>
+              <template #error>
+                <div class="poster-placeholder h-full w-full" :style="{ background: getPosterGradient(item.name) }">
+                  <el-icon :size="24"><VideoCamera /></el-icon>
+                </div>
+              </template>
+            </el-image>
+            <!-- 关键高级感：右边缘向左弥散渐变，海报"融化"进深色背景 -->
+            <div class="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-[#0F172A]/90 to-transparent"></div>
+          </div>
+
+          <!-- ===== 右侧信息区（四列窄卡片下减白至 p-3） ===== -->
+          <div class="relative flex flex-1 flex-col overflow-hidden p-3">
+            <!-- 标题区：Checkbox 与大标题垂直居中，状态药丸紧贴最右侧 -->
+            <div class="flex w-full items-center justify-between gap-2">
+              <div class="flex min-w-0 items-center gap-2">
+                <div class="shrink-0" @click.stop>
+                  <el-checkbox v-model="item.checked" class="tech-checkbox card-check" @click.stop />
+                </div>
+                <div class="min-w-0">
+                  <h3 class="truncate text-[15px] font-bold text-white">{{ item.name }}</h3>
+                  <div class="mt-1 text-xs text-slate-500">
+                    <span>{{ item.year || '—' }}</span>
+                    <span class="text-slate-600"> | </span>
+                    <span>{{ item.type === 'Movie' ? '电影' : '剧集' }}</span>
+                    <template v-if="item.actors.length">
+                      <span class="text-slate-600"> · </span>
+                      <span class="truncate">{{ item.actors.length }} 位演员</span>
+                    </template>
+                  </div>
+                </div>
               </div>
+              <span class="status-pill shrink-0 origin-top-right scale-90" :class="statusPillClass(item.status)">{{ statusLabel(item.status) }}</span>
             </div>
-            <div class="compare-divider"></div>
-            <div class="compare-col compare-douban">
-              <div class="compare-label">豆瓣同步</div>
-              <div class="actor-list" v-if="item.syncing"><div class="actor-syncing"><el-icon class="is-loading" :size="12"><Loading /></el-icon> 抓取中...</div></div>
-              <div class="actor-list" v-else-if="item.status === 'synced' && item.syncResult">
-                <div v-for="(d, di) in (item.syncResult.details || []).slice(0, 5)" :key="'detail-' + di" class="actor-row"><span class="actor-name">{{ d.new_name || d.emby_name }}</span><span class="actor-role">{{ d.new_role || '' }}</span></div>
-                <div class="sync-tag">{{ getSyncTag(item) }}</div>
+
+            <!-- ===== 演员列表区：双列网格铺满右侧（窄卡片极限压榨 gap，固定高度内滚动） ===== -->
+            <div class="actor-scroll mt-2 grid flex-1 grid-cols-2 gap-x-2 gap-y-1.5 overflow-y-auto pr-1">
+              <!-- 抓取中 -->
+              <div v-if="item.syncing" class="col-span-2 actor-syncing"><el-icon class="is-loading" :size="12"><Loading /></el-icon> 抓取中...</div>
+
+              <!-- 单行演员数据：演员名 饰 角色名（已汉化优先取新名；min-w-0 + truncate 防溢出） -->
+              <div
+                v-for="(r, ri) in actorDisplayRows(item)"
+                :key="'actor-' + ri"
+                class="flex w-full min-w-0 items-center"
+                :title="r.role ? (r.name + ' 饰 ' + r.role) : r.name"
+              >
+                <span class="max-w-[55%] shrink-0 truncate text-[12px] font-medium text-slate-100">{{ r.name }}</span>
+                <span v-if="r.role" class="mx-1 shrink-0 text-[9px] font-light text-slate-600">饰</span>
+                <span v-if="r.role" class="min-w-0 flex-1 truncate text-[11px] text-slate-400">{{ r.role }}</span>
               </div>
-              <div class="actor-list" v-else><div class="actor-empty hint">未同步</div></div>
+
+              <!-- 尾部信息 -->
+              <div v-if="actorDisplayRows(item).length === 0" class="col-span-2 actor-empty">暂无演员</div>
+              <div v-if="getSyncTag(item)" class="col-span-2 sync-tag">{{ getSyncTag(item) }}</div>
+            </div>
+
+            <!-- ===== 底部操作栏：沉底，细线贯穿整个右侧信息区（精简字号与间距） ===== -->
+            <div v-if="item.type === 'Series'" class="mt-auto flex w-full items-center gap-3 border-t border-white/5 pt-2">
+              <button type="button" class="card-action text-[11px] text-slate-400 transition-colors hover:text-blue-400" @click.stop="openDetailsDrawer(item.id)">
+                <el-icon :size="12"><Tickets /></el-icon><span>分集海报</span>
+              </button>
+              <button type="button" class="card-action text-[11px] text-slate-400 transition-colors hover:text-blue-400" @click.stop="handleBatchEnrichEpisodes(item)">
+                <el-icon :size="12"><Download /></el-icon><span>批量获取</span>
+              </button>
             </div>
           </div>
-          <div v-if="item.type === 'Series'" class="card-actions">
-            <el-button size="small" class="btn-details" @click.stop="openDetailsDrawer(item.id)">分集透视</el-button>
-            <el-button size="small" class="btn-enrich" :icon="Download" :loading="false" @click.stop="handleBatchEnrichEpisodes(item)">批量获取分集</el-button>
-          </div>
+        </div>
+
+        <!-- 空状态 -->
+        <div v-if="!loading && filteredItems.length === 0 && selectedLibrary" class="empty-state">
+          <el-icon :size="48"><Picture /></el-icon>
+          <p>暂无匹配的媒体项</p>
+          <span>尝试调整筛选条件或搜索关键词</span>
+        </div>
+        <div v-if="!loading && !selectedLibrary" class="empty-state">
+          <el-icon :size="48"><VideoPlay /></el-icon>
+          <p>请先选择媒体库</p>
+          <span>在上方下拉框中选择 Emby 媒体库后自动加载数据</span>
         </div>
       </div>
-      <div v-if="!loading && filteredItems.length === 0 && selectedLibrary" class="empty-state"><el-icon :size="48"><Picture /></el-icon><p>暂无匹配的媒体项</p><span>尝试调整筛选条件或搜索关键词</span></div>
-      <div v-if="!loading && !selectedLibrary" class="empty-state"><el-icon :size="48"><VideoPlay /></el-icon><p>请先选择媒体库</p><span>在上方下拉框中选择 Emby 媒体库后自动加载数据</span></div>
     </div>
 
+    <!-- ==================== 分页 ==================== -->
     <div class="pagination-bar">
       <el-pagination v-model:current-page="currentPage" v-model:page-size="pageSize" :total="totalItems" :page-sizes="[10, 20, 50]" layout="total, sizes, prev, pager, next, jumper" background small @current-change="loadItems" @size-change="currentPage=1;loadItems()" />
     </div>
@@ -816,143 +947,376 @@ onUnmounted(() => {
   </div>
 </template>
 <style scoped>
-.studio-root{--s-bg:#0a0a0a;--s-card:#1a1a1a;--s-card-hv:#222;--s-accent:#00A3FF;--s-accent-soft:rgba(0,163,255,.12);--s-border:#2a2a2a;--s-text:#e0e0e0;--s-text2:#888;--s-text3:#555;background:var(--s-bg);min-height:100vh;padding:20px 24px;color:var(--s-text)}
-.header-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 20px;background:var(--s-card);border:1px solid var(--s-border);border-radius:10px;margin-bottom:14px;flex-wrap:wrap}
-.header-left{display:flex;align-items:center;gap:14px}
-.page-title{font-size:18px;font-weight:700;color:#fff;white-space:nowrap}
-.stats-badge{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--s-text2);padding:4px 10px;background:rgba(255,255,255,.04);border-radius:20px}
-.stats-badge strong{color:var(--s-accent);font-weight:600}
-.stats-dot{width:7px;height:7px;border-radius:50%;background:var(--s-accent);box-shadow:0 0 6px rgba(0,163,255,.5)}
-.header-center{display:flex;align-items:center;gap:10px}
-.header-select{width:150px}
-.header-right{display:flex;align-items:center;gap:10px}
-.search-input{width:180px}
-.auto-switch-group{display:flex;align-items:center;gap:6px;padding:4px 10px;background:rgba(255,255,255,.03);border-radius:8px;border:1px solid var(--s-border)}
-.switch-label{font-size:12px;color:var(--s-text2);white-space:nowrap}
-.select-all-row{display:flex;align-items:center;gap:14px;padding:6px 16px;margin-bottom:12px;font-size:13px;color:var(--s-text2)}
-.select-info{font-size:12px;color:var(--s-accent)}
-.btn-batch-inline{font-weight:500;border-radius:6px;font-size:12px;margin-left:auto;background:var(--s-accent)!important;border-color:var(--s-accent)!important}
-.btn-batch-inline:hover{background:#0090e0!important;border-color:#0090e0!important}
-.btn-audit-local{border-radius:6px;font-size:12px;color:var(--s-text2);border-color:var(--s-border)}
-.btn-audit-selected{border-radius:6px;font-size:12px}
+/* ==================== 根容器 ==================== */
+.studio-root {
+  min-height: 100vh;
+  background: #0B1120;
+  color: #E2E8F0;
+  padding-bottom: 40px;
+}
 
-.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:16px}
-@media(min-width:1800px){.cards-grid{grid-template-columns:repeat(4,1fr)}}
-@media(max-width:1600px){.cards-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:1200px){.cards-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:768px){.cards-grid{grid-template-columns:1fr}}
+/* ==================== Sticky 顶部操作区 ==================== */
+.stats-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #64748B;
+  padding: 4px 12px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  white-space: nowrap;
+}
+.stats-pill strong { color: #60A5FA; font-weight: 600; }
+.stats-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #3B82F6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.7);
+}
 
-.loading-overlay{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 20px;gap:14px;color:var(--s-text2);font-size:14px}
-.loading-overlay .el-icon{color:var(--s-accent)}
-.empty-state{grid-column:1/-1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:80px 20px;color:var(--s-text2)}
-.empty-state p{font-size:16px;margin:14px 0 6px;color:var(--s-text)}
-.empty-state span{font-size:13px;color:var(--s-text3)}
+/* 极暗无边框筛选框 — Focus 时电光蓝发光 */
+.hdr-select { width: 150px; }
+.hdr-search { width: 190px; }
+.hdr-select :deep(.el-input__wrapper),
+.hdr-search :deep(.el-input__wrapper) {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
+  transition: box-shadow 0.2s ease, background 0.2s ease;
+}
+.hdr-select :deep(.el-input__wrapper:hover),
+.hdr-search :deep(.el-input__wrapper:hover) {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18) !important;
+}
+.hdr-select :deep(.el-input__wrapper.is-focus),
+.hdr-search :deep(.el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.7), 0 0 14px rgba(59, 130, 246, 0.28) !important;
+  background: rgba(255, 255, 255, 0.05) !important;
+}
+.hdr-select :deep(.el-input__inner),
+.hdr-search :deep(.el-input__inner) { color: #E2E8F0; }
+.hdr-select :deep(.el-input__inner::placeholder),
+.hdr-search :deep(.el-input__inner::placeholder) { color: #475569; }
 
-.media-card{display:flex;gap:0;padding:0;background:var(--s-card);border:1px solid var(--s-border);border-radius:10px;transition:all .2s;cursor:pointer;overflow:hidden;min-width:0;position:relative}
-.media-card:hover{background:var(--s-card-hv);border-color:#444}
-.media-card.is-checked{border-color:var(--s-accent)!important;box-shadow:0 0 0 1px var(--s-accent)}
-.media-card.is-locked{opacity:.65}
-.media-card.is-synced{border-color:rgba(16,185,129,.2)}
-.card-check{position:absolute;top:10px;left:10px;z-index:3}
-.card-check :deep(.el-checkbox__inner){background:rgba(0,0,0,.5);border-color:rgba(255,255,255,.3)}
+/* 自动化更新开关 */
+.auto-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+.auto-switch .switch-label { font-size: 12px; color: #64748B; white-space: nowrap; }
+.auto-switch :deep(.el-switch.is-checked .el-switch__core) {
+  background-color: #3B82F6;
+  border-color: #3B82F6;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.4);
+}
 
-.card-poster{width:130px;aspect-ratio:2/3;border-radius:10px 0 0 10px;display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0;position:relative;overflow:hidden}
-.poster-img{position:absolute;inset:0;width:100%;height:100%}
-.poster-img :deep(img){object-fit:cover;width:100%;height:100%;transition:opacity .5s ease}
-.poster-img :deep(.el-image__placeholder),.poster-img :deep(.el-image__error){position:absolute;inset:0}
-.poster-skeleton{position:absolute;inset:0;background:linear-gradient(90deg,#1a1a2e 25%,#222 50%,#1a1a2e 75%);background-size:200% 100%;animation:shimmer 1.8s infinite}
-@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
-.poster-placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,.15)}
-.poster-type{font-size:9px;color:rgba(255,255,255,.5);position:absolute;bottom:4px;right:4px;z-index:2;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:3px}
+/* 选中信息 */
+.select-count { font-size: 12px; color: #3B82F6; }
 
-.card-body{flex:1;min-width:0;display:flex;flex-direction:column;padding:14px 16px;gap:10px}
-.card-header{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;min-width:0}
-.card-title{font-size:14px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
-.card-year{font-size:11px;color:var(--s-text3);flex-shrink:0}
-.card-status{font-size:10px;font-weight:500;white-space:nowrap;flex-shrink:0;margin-left:auto;padding:1px 6px;border-radius:10px;background:rgba(255,255,255,.05)}
+/* ==================== 顶部操作按钮 ==================== */
+.hdr-actions .el-button {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+/* 幽灵按钮 */
+.btn-ghost {
+  background: transparent !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  color: #94A3B8 !important;
+}
+.btn-ghost:hover:not(.is-disabled) {
+  background: rgba(255, 255, 255, 0.05) !important;
+  border-color: rgba(255, 255, 255, 0.2) !important;
+  color: #FFFFFF !important;
+}
+/* 危险幽灵按钮 */
+.btn-danger-ghost {
+  color: rgba(248, 113, 113, 0.85) !important;
+  border-color: rgba(248, 113, 113, 0.22) !important;
+}
+.btn-danger-ghost:hover:not(.is-disabled) {
+  background: rgba(239, 68, 68, 0.08) !important;
+  border-color: rgba(248, 113, 113, 0.45) !important;
+  color: #F87171 !important;
+}
+/* 主操作：电光蓝渐变 + 微发光 */
+.btn-primary {
+  background: linear-gradient(135deg, #3B82F6 0%, #6366F1 100%) !important;
+  border: 1px solid rgba(59, 130, 246, 0.5) !important;
+  color: #FFFFFF !important;
+  box-shadow:
+    0 0 16px rgba(59, 130, 246, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+}
+.btn-primary:hover:not(.is-disabled) {
+  box-shadow:
+    0 0 26px rgba(59, 130, 246, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+  filter: brightness(1.08);
+}
+.hdr-actions .el-button.is-disabled { opacity: 0.45; }
 
-.actor-compare{display:grid;grid-template-columns:minmax(0,1fr) 1px minmax(0,1fr);gap:16px;flex:1;min-width:0;max-width:340px}
-.compare-col{min-width:0;overflow:hidden}
-.compare-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;color:var(--s-text3);margin-bottom:4px;padding-bottom:3px;border-bottom:1px solid var(--s-border);white-space:nowrap}
-.compare-douban .compare-label{color:var(--s-accent)}
-.compare-divider{width:1px;background:var(--s-border);align-self:stretch}
-.actor-list{display:flex;flex-direction:column;gap:1px}
-.actor-row{display:flex;align-items:center;justify-content:space-between;padding:2px 0;min-width:0}
-.actor-name{font-size:12px;color:var(--s-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;margin-right:6px}
-.actor-role{font-size:11px;color:var(--s-text3);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:50%;flex-shrink:0}
-.actor-more{font-size:10px;color:var(--s-text3);padding-top:2px}
-.actor-empty{font-size:11px;color:var(--s-text3);padding:4px 0}
-.actor-empty.hint{color:#444;font-style:italic;font-size:11px;padding:6px 0}
-.actor-syncing{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--s-text3);padding:6px 0}
-.sync-tag{font-size:10px;padding:2px 6px;border-radius:4px;margin-top:4px;color:#10b981;background:rgba(16,185,129,.1)}
+/* ==================== 系统任务进度横幅 ==================== */
+.progress-banner {
+  background: rgba(59, 130, 246, 0.06);
+  border: 1px solid rgba(59, 130, 246, 0.18);
+  border-radius: 12px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.06);
+}
+.progress-info { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #E2E8F0; }
+.progress-info .el-icon { color: #60A5FA; }
+.progress-info strong { color: #93C5FD; }
+.progress-count { font-size: 12px; color: #60A5FA; margin-left: auto; }
 
-.header-select :deep(.el-input__wrapper),.search-input :deep(.el-input__wrapper){background:var(--s-card)!important;border-radius:8px!important;box-shadow:0 0 0 1px var(--s-border)!important}
-.header-select :deep(.el-input__wrapper:hover),.search-input :deep(.el-input__wrapper:hover){box-shadow:0 0 0 1px #444!important}
-.header-select :deep(.el-input__wrapper.is-focus),.search-input :deep(.el-input__wrapper.is-focus){box-shadow:0 0 0 1px var(--s-accent)!important}
-.header-select :deep(.el-input__inner),.search-input :deep(.el-input__inner){color:var(--s-text)}
-.auto-switch-group :deep(.el-switch.is-checked .el-switch__core){background-color:var(--s-accent);border-color:var(--s-accent)}
-.select-all-row :deep(.el-checkbox__label),.card-check :deep(.el-checkbox__label){color:var(--s-text2)!important}
-.progress-banner{background:rgba(0,163,255,.08);border:1px solid rgba(0,163,255,.2);border-radius:8px;padding:10px 16px;margin-bottom:12px;display:flex;flex-direction:column;gap:8px}
-.progress-info{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--s-text)}
-.progress-info strong{color:var(--s-accent)}
-.progress-count{font-size:12px;color:var(--s-text2);margin-left:auto}
-.btn-audit-local{border-radius:6px;font-size:12px;color:var(--s-text2);border-color:var(--s-border)}
+/* ==================== 卡片网格 ==================== */
+/* 横向卡片：1列 → md:2 → lg:3 → 2xl:4 */
+.cards-grid {
+  @apply grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-4 md:gap-6;
+}
 
-.pagination-bar{display:flex;justify-content:center;margin-top:24px;padding-bottom:20px}
+/* 横向左右结构卡片 */
+.media-card {
+  @apply flex flex-row bg-[#0B1120]/60 border border-white/5 backdrop-blur-xl rounded-2xl shadow-xl hover:border-blue-500/30 hover:shadow-blue-900/20 hover:-translate-y-1 transition-all duration-300 overflow-hidden h-[240px] cursor-pointer;
+}
+.media-card.is-checked {
+  border-color: rgba(59, 130, 246, 0.55) !important;
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.22) !important;
+}
+.media-card.is-locked { opacity: 0.55; }
+.media-card.is-synced { border-color: rgba(16, 185, 129, 0.15); }
 
-/* 卡片操作区 */
-.card-actions{padding-top:6px;border-top:1px solid var(--s-border);display:flex;gap:8px}
-.btn-details{font-size:11px;border-radius:4px;padding:3px 10px;color:var(--s-accent);border-color:rgba(0,163,255,.3);background:rgba(0,163,255,.06)}
-.btn-details:hover{background:rgba(0,163,255,.15);border-color:var(--s-accent)}
+/* 演员列表极细滚动条 */
+.actor-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+}
+.actor-scroll::-webkit-scrollbar { width: 4px; }
+.actor-scroll::-webkit-scrollbar-track { background: transparent; }
+.actor-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+}
+.actor-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
 
-/* 分集透视抽屉 */
-.details-container{padding:0 4px}
-.details-series-info{margin-bottom:20px}
-.details-series-title{font-size:18px;font-weight:700;color:#fff;margin:0 0 8px}
-.details-series-overview{font-size:13px;color:#999;line-height:1.7;margin:0 0 10px}
-.details-series-meta{display:flex;gap:16px;font-size:12px;color:var(--s-text3)}
+/* 海报：2:3 竖版海报完美填充左侧区域，不变形 */
+.poster-img :deep(img) {
+  @apply w-full h-full object-cover object-center;
+  display: block;
+  transition: transform 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.media-card:hover .poster-img :deep(img) { transform: scale(1.045); }
+.poster-img :deep(.el-image__placeholder),
+.poster-img :deep(.el-image__error) { position: absolute; inset: 0; }
+.poster-skeleton {
+  background: linear-gradient(90deg, #111827 25%, #1F2937 50%, #111827 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite;
+}
+@keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.poster-placeholder { display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.18); }
 
-.details-section{margin-bottom:18px}
-.details-section-title{font-size:14px;font-weight:600;color:#ccc;margin:0 0 10px;padding-bottom:6px;border-bottom:1px solid var(--s-border)}
+/* ==================== 发光药丸状态徽章 ==================== */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2.5px 10px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  backdrop-filter: blur(8px);
+  white-space: nowrap;
+}
+.status-pill::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.pill-synced {
+  color: #34D399;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.28);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.18), inset 0 0 8px rgba(16, 185, 129, 0.05);
+}
+.pill-pending {
+  color: #FBBF24;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.24);
+  box-shadow: 0 0 10px rgba(245, 158, 11, 0.14);
+}
+.pill-locked {
+  color: #94A3B8;
+  background: rgba(148, 163, 184, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+}
+.pill-syncing {
+  color: #60A5FA;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.22);
+  animation: pulse-glow 1.6s ease-in-out infinite;
+}
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 6px rgba(59, 130, 246, 0.12); }
+  50% { box-shadow: 0 0 14px rgba(59, 130, 246, 0.38); }
+}
 
-.actor-avatar-list{display:flex;flex-wrap:wrap;gap:12px}
-.actor-avatar-item{display:flex;flex-direction:column;align-items:center;width:72px}
-.actor-avatar-name{font-size:12px;color:#ccc;margin-top:5px;text-align:center;max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.actor-avatar-role{font-size:10px;color:var(--s-text3);margin-top:1px;text-align:center;max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* ==================== 科技感 Checkbox ==================== */
+.tech-checkbox :deep(.el-checkbox__inner) {
+  width: 16px;
+  height: 16px;
+  background: rgba(11, 17, 32, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 5px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  transition: all 0.2s ease;
+}
+.tech-checkbox :deep(.el-checkbox__inner:hover) { border-color: rgba(59, 130, 246, 0.65); }
+.tech-checkbox :deep(.el-checkbox__input.is-checked .el-checkbox__inner),
+.tech-checkbox :deep(.el-checkbox__input.is-indeterminate .el-checkbox__inner) {
+  background: #3B82F6;
+  border-color: #3B82F6;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.65), inset 0 0 6px rgba(255, 255, 255, 0.15);
+}
+.card-check :deep(.el-checkbox__label) { display: none; }
+.select-all-check :deep(.el-checkbox__label) { color: #94A3B8; font-size: 12.5px; }
+
+/* ==================== 演职员列表 ==================== */
+.actor-syncing { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #64748B; padding: 4px 0; }
+.actor-empty { font-size: 11px; color: #475569; padding: 2px 0; }
+.sync-tag {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: #34D399;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+}
+
+/* ==================== 卡片底部极简操作 ==================== */
+/* 颜色/字号由 Tailwind 类控制：text-slate-400 hover:text-blue-400 text-xs */
+.card-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 3px 6px;
+  border-radius: 6px;
+}
+.card-action:hover { background: rgba(59, 130, 246, 0.06); }
+
+/* ==================== 加载 & 空状态 ==================== */
+.loading-overlay,
+.empty-state {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px;
+  gap: 10px;
+  color: #64748B;
+}
+.loading-overlay .el-icon { color: #60A5FA; }
+.empty-state .el-icon { color: #3F4A5A; }
+.empty-state p { font-size: 15px; margin: 12px 0 4px; color: #E2E8F0; }
+.empty-state span { font-size: 12px; color: #475569; }
+
+/* ==================== 分页 ==================== */
+.pagination-bar {
+  display: flex;
+  justify-content: center;
+  margin-top: 8px;
+  padding: 0 24px 8px;
+}
+
+/* ==================== 分集透视抽屉 ==================== */
+.details-container { padding: 0 4px; }
+.details-series-info { margin-bottom: 20px; }
+.details-series-title { font-size: 18px; font-weight: 700; color: #fff; margin: 0 0 8px; }
+.details-series-overview { font-size: 13px; color: #94A3B8; line-height: 1.7; margin: 0 0 10px; }
+.details-series-meta { display: flex; gap: 16px; font-size: 12px; color: #475569; }
+
+.details-section { margin-bottom: 18px; }
+.details-section-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #CBD5E1;
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.actor-avatar-list { display: flex; flex-wrap: wrap; gap: 12px; }
+.actor-avatar-item { display: flex; flex-direction: column; align-items: center; width: 72px; }
+.actor-avatar-name { font-size: 12px; color: #CBD5E1; margin-top: 5px; text-align: center; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actor-avatar-role { font-size: 10px; color: #475569; margin-top: 1px; text-align: center; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 演员头像原生 img（替代 el-avatar，支持 referrerpolicy 防盗链） */
-.actor-avatar-box{border-radius:50%;overflow:hidden;background:#2a2a2a;display:flex;align-items:center;justify-content:center;flex-shrink:0}
-.actor-avatar-img{width:100%;height:100%;object-fit:cover;display:block}
-.actor-avatar-txt{color:#888;font-weight:600;line-height:1;user-select:none}
+.actor-avatar-box { border-radius: 50%; overflow: hidden; background: #1E293B; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.actor-avatar-img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.actor-avatar-txt { color: #64748B; font-weight: 600; line-height: 1; user-select: none; }
 
-.ep-content{padding:8px 0}
-.ep-overview{font-size:13px;color:#999;line-height:1.6;margin-bottom:12px}
-.ep-actors{padding-top:8px;border-top:1px solid rgba(255,255,255,.04)}
-.ep-no-actors{font-size:12px;color:var(--s-text3);padding:8px 0}
+.ep-content { padding: 8px 0; }
+.ep-overview { font-size: 13px; color: #94A3B8; line-height: 1.6; margin-bottom: 12px; }
+.ep-actors { padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.04); }
+.ep-no-actors { font-size: 12px; color: #475569; padding: 8px 0; }
+.ep-title-label { font-size: 14px; font-weight: 500; color: #D1D5DB; }
+.details-empty { text-align: center; padding: 40px 0; font-size: 13px; color: #475569; }
 
-.ep-title-label{font-size:14px;font-weight:500;color:#ddd}
+/* 抽屉 / 折叠面板暗色覆盖 */
+:deep(.el-drawer) { background: #0F172A !important; }
+:deep(.el-drawer__header) {
+  color: #F1F5F9;
+  margin-bottom: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding-bottom: 14px;
+}
+:deep(.el-drawer__close-btn) { color: #64748B; }
+:deep(.el-drawer__close-btn:hover) { color: #fff; }
+:deep(.el-collapse-item__header) {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.06);
+  color: #D1D5DB;
+  padding: 0 12px;
+  height: 42px;
+  border-radius: 8px;
+}
+:deep(.el-collapse-item__wrap) { background: rgba(255, 255, 255, 0.02); border-color: rgba(255, 255, 255, 0.06); }
+:deep(.el-collapse-item__content) { color: #CBD5E1; padding: 12px; }
 
-.details-empty{text-align:center;padding:40px 0;font-size:13px;color:var(--s-text3)}
+/* ==================== 进度对话框 ==================== */
+.enrich-dialog-body { display: flex; flex-direction: column; gap: 16px; padding: 8px 0; }
+.enrich-target-name { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #94A3B8; }
+.enrich-target-name strong { color: #fff; }
+.enrich-message { font-size: 13px; color: #94A3B8; min-height: 20px; }
 
-/* 抽屉暗色主题覆盖 */
-:deep(.el-drawer){background:#141414!important}
-:deep(.el-drawer__header){color:#fff;margin-bottom:16px;border-bottom:1px solid #2a2a2a;padding-bottom:14px}
-:deep(.el-drawer__close-btn){color:#888}
-:deep(.el-drawer__close-btn:hover){color:#fff}
-:deep(.el-collapse-item__header){background:#1a1a1a;border-color:#2a2a2a;color:#ddd;padding:0 12px;height:42px}
-:deep(.el-collapse-item__wrap){background:#1a1a1a;border-color:#2a2a2a}
-:deep(.el-collapse-item__content){color:#ccc;padding:12px}
-
-@media(max-width:1024px){.header-bar{flex-direction:column;align-items:stretch}.header-center,.header-right{flex-wrap:wrap;justify-content:flex-start}}
-
-/* 分集批量富化按钮 */
-.btn-enrich{margin-left:6px;font-size:11px;border-radius:6px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.25);color:#10b981}
-.btn-enrich:hover{background:rgba(16,185,129,.2);border-color:rgba(16,185,129,.4)}
-
-/* 进度对话框 */
-.enrich-dialog-body{display:flex;flex-direction:column;gap:16px;padding:8px 0}
-.enrich-target-name{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--s-text)}
-.enrich-target-name strong{color:#fff}
-.enrich-message{font-size:13px;color:var(--s-text2);min-height:20px}
-.enrich-footer-hint{font-size:12px;color:var(--s-text3)}
+/* 窄屏适配 */
+@media (max-width: 1024px) {
+  .hdr-search { width: 150px; }
+  .hdr-select { width: 130px; }
+}
 </style>
