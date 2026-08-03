@@ -25,6 +25,7 @@ from config.settings import load_config
 from services.ai_translator import get_translator, get_primary_provider, _is_rate_limit_error, _rate_limit_sleep
 from database import SessionLocal
 from services.db_crud import save_media_to_db, extract_provider_ids
+from models import MediaMetadata, MediaSyncStatus
 from services.actor_profile_service import ensure_profiles_for_people
 from utils.task_manager import task_manager
 from services.translation_utils import (
@@ -155,6 +156,14 @@ class DoubanSinizer:
         people = item_data.get("People", []) or []
         # ★ 提取 library_id：优先使用 Emby 返回的 ParentId（即媒体库 ID）
         series_library_id = item_data.get("ParentId", "") or ""
+
+        item_type = item_data.get("Type", "")
+        # ★ 单集一律走父 Series：不再按集名搜豆瓣（Frodo search 不索引单集页）
+        if item_type == "Episode":
+            logger.info(
+                "   📺 [Douban/Ep] %s 为单集，走父 Series 定位汉化", item_id,
+            )
+            return self._sinicize_episode_via_parent(item_id, item_data)
 
         # 只处理 Type="Actor" 的人员，截取前 MAX_ACTORS 位
         actors = [p for p in people if p.get("Type") == "Actor"]
@@ -622,6 +631,174 @@ class DoubanSinizer:
             logger.error(f"❌ [Douban中文化] Emby 回写失败")
 
         return result
+
+    def _resolve_series_douban_context(self, series_id: str):
+        """解析父 Series 的豆瓣上下文：优先 DB 缓存，无则系列级查找并回写。
+
+        Returns:
+            (douban_id, douban_actors, douban_match_map) 或 None
+        """
+        series_item = self._get_emby_item(series_id)
+        if not series_item:
+            logger.warning("⚠ [Douban/Ep] 父 Series %s 读取失败", series_id)
+            return None
+        series_name = series_item.get("Name", "")
+        series_actors = [
+            p for p in (series_item.get("People", []) or []) if p.get("Type") == "Actor"
+        ]
+
+        # 1) 优先 DB 缓存 douban_id
+        douban_id = ""
+        db_q = SessionLocal()
+        try:
+            rec = db_q.query(MediaSyncStatus).filter(
+                MediaSyncStatus.emby_item_id == series_id
+            ).first()
+            if rec and rec.douban_id:
+                douban_id = rec.douban_id
+        finally:
+            db_q.close()
+
+        # 2) 无缓存 → 做一次系列级查找并回写 DB
+        if not douban_id:
+            pids = series_item.get("ProviderIds", {}) or {}
+            douban_id = self._find_douban_id(
+                pids, title=series_name, mtype="Series",
+                year=str(series_item.get("ProductionYear", "")),
+            )
+            if not douban_id:
+                logger.warning(
+                    "⚠ [Douban/Ep] 父 Series %s 无法定位豆瓣条目，跳过", series_id,
+                )
+                return None
+            db_w = SessionLocal()
+            try:
+                rec = db_w.query(MediaSyncStatus).filter(
+                    MediaSyncStatus.emby_item_id == series_id
+                ).first()
+                if rec:
+                    rec.douban_id = douban_id
+                    rec.update_time = datetime.now()
+                else:
+                    # ★ 父 Series 无记录 → 自动新建并保存 douban_id，
+                    #   避免后续单集汉化重复触发系列级豆瓣查找
+                    db_w.add(MediaSyncStatus(
+                        emby_item_id=series_id,
+                        title=series_name,
+                        status="pending",
+                        douban_id=douban_id,
+                    ))
+                db_w.commit()
+            finally:
+                db_w.close()
+
+        # 3) 拉 cast + 构建 match_map
+        douban_actors = self._fetch_douban_actors(douban_id)
+        if not douban_actors:
+            logger.warning("⚠ [Douban/Ep] 父 Series %s 豆瓣演员列表为空", series_id)
+            return None
+        douban_match_map = self._build_douban_match_map(douban_actors, series_actors)
+        return (douban_id, douban_actors, douban_match_map)
+
+    def _sinicize_episode_via_parent(self, ep_item_id: str, ep_item: dict) -> dict:
+        """单集汉化一律走父 Series：定位父系列豆瓣页 → 用系列 cast 本地化本集。
+
+        豆瓣 Frodo search 不索引单集页（"第 26 集"这类泛化集名无法按集名搜到），
+        因此单集被直接汉化时不再按集名找豆瓣条目。父系列豆瓣上下文解析失败时
+        降级为 AI-only 本地化本集（不崩溃）。
+
+        Returns:
+            {"success", "matched", "total_actors", "details"}
+        """
+        result = {"success": False, "matched": 0, "total_actors": 0, "details": []}
+
+        # 1. 定位父 Series：Emby SeriesId → ParentId → DB parent_id 兜底
+        series_id = str(ep_item.get("SeriesId") or "").strip()
+        if not series_id:
+            series_id = str(ep_item.get("ParentId") or "").strip()
+        if not series_id:
+            db_q = SessionLocal()
+            try:
+                mm = db_q.query(MediaMetadata).filter(
+                    MediaMetadata.emby_item_id == ep_item_id
+                ).first()
+                series_id = (mm.parent_id or "") if mm else ""
+            finally:
+                db_q.close()
+        if not series_id:
+            logger.warning("⚠ [Douban/Ep] %s 无法定位父 Series，跳过", ep_item_id)
+            return result
+
+        ep_people = [
+            p for p in (ep_item.get("People", []) or [])
+            if p.get("Type") in ("Actor", "GuestStar")
+        ]
+        if not ep_people:
+            logger.warning("⚠ [Douban/Ep] %s 无演员数据", ep_item_id)
+            return result
+        result["total_actors"] = len(ep_people)
+
+        # 2. 解析父 Series 豆瓣上下文（ID + cast + match_map）
+        ctx = self._resolve_series_douban_context(series_id)
+        douban_match_map = ctx[2] if ctx else {}
+        if not ctx:
+            logger.warning(
+                "⚠ [Douban/Ep] 父 Series %s 无豆瓣上下文，本集降级为 AI-only 本地化",
+                series_id,
+            )
+
+        # 3. 本地化本集演员（含缓存拦截 + AI 兜底；无豆瓣上下文时空 map 走 AI-only）
+        db = SessionLocal()
+        try:
+            localized = self._localize_episode_people(
+                ep_people, douban_match_map,
+                series_name=ep_item.get("SeriesName", ""),
+                db=db, emby_item_id=ep_item_id, parent_id=series_id,
+            )
+            localized = _truncate_actors(localized, self.max_actors_per_media)
+
+            # 4. 回写 Emby（仅当有变更）
+            if localized != ep_people:
+                if not self._write_back_episode(ep_item_id, ep_item, localized):
+                    logger.warning("⚠ [Douban/Ep] %s 回写 Emby 失败", ep_item_id)
+                    return result
+
+            # 5. 入库（actor_records + 置信度，skip_profiles=True 复用父系列漏斗结果）
+            ep_pids = extract_provider_ids(ep_item)
+            chinese_ep, total_ep = _count_chinese_roles_ep(localized)
+            ep_status = "synced" if _is_chinese_role_synced_ep(localized) else "pending"
+            save_media_to_db(
+                db,
+                emby_item=ep_item,
+                provider_ids=ep_pids,
+                images=None,
+                people=localized,
+                library_id=ep_item.get("ParentId", "") or "",
+                status=ep_status,
+                matched_actors=chinese_ep,
+                total_actors=total_ep,
+                parent_id=series_id,
+                skip_profiles=True,
+            )
+            db.commit()
+
+            result["success"] = True
+            result["matched"] = sum(
+                1 for p in localized
+                if is_valid_chinese_translation(p.get("Name", ""))
+            )
+            result["details"] = [
+                {"name": p.get("Name", ""), "role": p.get("Role", "")} for p in localized
+            ]
+            return result
+        except Exception:
+            db.rollback()
+            logger.error(
+                "❌ [Douban/Ep] %s 处理异常:\n%s", ep_item_id, traceback.format_exc(),
+            )
+            return result
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # 1. Emby 读取
