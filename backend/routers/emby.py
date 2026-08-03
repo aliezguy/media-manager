@@ -634,7 +634,7 @@ def get_actor_items(req: ActorItemsRequest):
             for it in items:
                 sid = it.get("id", "")
                 rec = status_map.get(sid, {})
-                it["sync_status"] = rec.get("status", "pending")
+                it["sync_status"] = rec.get("status") or "pending"
                 it["sync_matched"] = rec.get("matched_actors", 0)
                 it["sync_total"] = rec.get("total_actors", 0)
 
@@ -679,7 +679,7 @@ def get_actor_items(req: ActorItemsRequest):
                 sid = it.get("id", "")
                 if sid in status_map:
                     rec = status_map[sid]
-                    it["sync_status"] = rec.get("status", "pending")
+                    it["sync_status"] = rec.get("status") or "pending"
                     it["sync_matched"] = rec.get("matched_actors", 0)
                     it["sync_total"] = rec.get("total_actors", 0)
                 else:
