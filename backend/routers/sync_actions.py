@@ -1701,6 +1701,26 @@ def reconcile_series_episodes(
         db.close()
 
 
+def _build_batch_audit_summary(
+    total_scanned: int, total_synced: int,
+    n_series: int, n_seasons: int,
+    total_eps_actual: int, total_eps_enriched: int,
+    total_guest_stars: int,
+) -> str:
+    """BatchAudit 最终摘要 — 分集数以【实际 Emby 入库数】为准，TMDB 数作括号参考。
+
+    修复：原摘要用 TMDB 整季 episodes 数（含未播出）冒充实际数（30 vs 12）。
+    """
+    eps_part = f"分集 {total_eps_actual} 集"
+    if total_eps_enriched != total_eps_actual:
+        eps_part += f"（TMDB {total_eps_enriched}）"
+    return (
+        f"✅ 审计完成: {total_scanned} 项 | 已汉化 {total_synced} 项 | "
+        f"{n_series} 部剧集 / {n_seasons} 季 | {eps_part} | "
+        f"客串演员 {total_guest_stars} 位"
+    )
+
+
 def _fetch_tmdb_seasons(tmdb_base: str, api_key: str, tmdb_id: str) -> list[int]:
     """通过 TMDB 获取剧集的所有季号列表。
 
@@ -1842,6 +1862,8 @@ def _batch_audit_task(
                                 "item_id": item_id,
                                 "tmdb_id": result["tmdb_id"],
                                 "name": result["item_name"],
+                                # ★ 实际 Emby 分集数（Phase 1 分集已入库）
+                                "episodes_actual": result.get("episodes_processed", 0),
                             })
                 else:
                     logger.warning(
@@ -1895,6 +1917,9 @@ def _batch_audit_task(
         season_processed = 0
         total_guest_stars_all = 0
         total_eps_enriched = 0
+        total_eps_actual = sum(
+            sq.get("episodes_actual", 0) for sq in series_with_seasons
+        )
 
         # ★ Phase 2 使用独立的 DB 会话（Phase 1 各调用已自行管理会话生命周期）
         db = SessionLocal()
@@ -2028,10 +2053,15 @@ def _batch_audit_task(
                         total_eps_enriched += 1
 
                     db.commit()
+                    actual_season_eps = db.query(MediaMetadata).filter(
+                        MediaMetadata.parent_id == item_id,
+                        MediaMetadata.parent_index_number == season_num,
+                        MediaMetadata.media_type == "Episode",
+                    ).count()
                     logger.info(
-                        "   ✅ [BatchAudit] 《%s》S%02d 完成: %d 集, %d 位客串",
-                        item_name, season_num, len(episodes),
-                        len(all_guest_stars),
+                        "   ✅ [BatchAudit] 《%s》S%02d 完成: %d 集 (TMDB %d), %d 位客串",
+                        item_name, season_num, actual_season_eps,
+                        len(episodes), len(all_guest_stars),
                     )
 
                 except Exception:
@@ -2056,18 +2086,20 @@ def _batch_audit_task(
 
         # ---- 全部完成 ----
         _batch_audit_success = True
-        _batch_audit_final_msg = (
-            f"✅ 审计完成: {total_scanned} 项 | "
-            f"已汉化 {total_synced} 项 | "
-            f"{len(series_with_seasons)} 部剧集 / {grand_total_seasons} 季 | "
-            f"分集 {total_eps_enriched} 集 | "
-            f"客串演员 {total_guest_stars_all} 位"
+        _batch_audit_final_msg = _build_batch_audit_summary(
+            total_scanned=total_scanned,
+            total_synced=total_synced,
+            n_series=len(series_with_seasons),
+            n_seasons=grand_total_seasons,
+            total_eps_actual=total_eps_actual,
+            total_eps_enriched=total_eps_enriched,
+            total_guest_stars=total_guest_stars_all,
         )
         logger.info(
             "✅ [BatchAudit] 任务 %s 全部完成: scanned=%d synced=%d series=%d seasons=%d eps=%d guests=%d",
             task_id, total_scanned, total_synced,
             len(series_with_seasons), grand_total_seasons,
-            total_eps_enriched, total_guest_stars_all,
+            total_eps_actual, total_guest_stars_all,
         )
 
     except Exception:
