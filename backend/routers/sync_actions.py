@@ -1565,6 +1565,37 @@ def _fetch_episodes_light(host: str, api_key: str, user_id: str,
     return all_eps
 
 
+def _compute_episode_diff(
+    db_episodes: list, emby_episodes: list,
+) -> dict:
+    """对比 DB 与 Emby 的分集集合，检测新增集与内部空集缺口。
+
+    缺口语义：Emby 有而 DB 没有的分集（missing）；其中"该季存在更高已入库集号"
+    的分集视为内部空集（interior_gaps，中间空洞）。尾部新增集（全部高于该季
+    DB 最大集号）不是内部空集，不触发整体汉化，仅补库。
+
+    Args:
+        db_episodes:   DB 已有分集的 [(season, episode)] 元组列表
+        emby_episodes: Emby 实际分集的 [(season, episode)] 元组列表
+
+    Returns:
+        {"missing": [(s,e), ...], "interior_gaps": [(s,e), ...]}（均升序）
+    """
+    db_set = set(db_episodes)
+    emby_set = set(emby_episodes)
+    missing = sorted(emby_set - db_set)
+
+    # 每季 DB 已存在的最大集号（用于判定中间空洞）
+    db_max: dict[int, int] = {}
+    for season, ep in db_set:
+        db_max[season] = max(db_max.get(season, 0), ep)
+
+    interior = sorted(
+        (s, e) for (s, e) in missing if e < db_max.get(s, -1)
+    )
+    return {"missing": missing, "interior_gaps": interior}
+
+
 def _fetch_tmdb_seasons(tmdb_base: str, api_key: str, tmdb_id: str) -> list[int]:
     """通过 TMDB 获取剧集的所有季号列表。
 
