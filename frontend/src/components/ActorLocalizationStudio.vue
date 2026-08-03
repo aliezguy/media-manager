@@ -220,6 +220,7 @@ const statusOptions = [
   { label: '全部状态', value: '' },
   { label: '未汉化', value: 'pending' },
   { label: '已汉化', value: 'synced' },
+  { label: '汉化失败', value: 'failed' },
   { label: '已锁定', value: 'locked' },
 ]
 

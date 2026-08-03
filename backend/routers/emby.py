@@ -595,6 +595,8 @@ def get_actor_items(req: ActorItemsRequest):
             )
             if req.status_filter == 'synced':
                 base_q = base_q.filter(MediaSyncStatus.status == 'synced')
+            elif req.status_filter == 'failed':
+                base_q = base_q.filter(MediaSyncStatus.status == 'failed')
             else:
                 # pending: status 为 'pending' 或 NULL（尚未审计过）
                 base_q = base_q.filter(

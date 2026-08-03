@@ -88,3 +88,19 @@ def test_nofilter_path_null_to_pending(monkeypatch):
     assert status_map["s1"] == "pending"  # NULL → pending（修复前为 None）
     assert status_map["s2"] == "failed"
     assert status_map["s3"] == "synced"
+
+
+def test_status_filter_failed_returns_only_failed(monkeypatch):
+    TestSession = _make_session(monkeypatch)
+    _seed(TestSession())
+    # status_filter='failed' → DB 只筛出 s2，Emby 按该 ID 拉取
+    monkeypatch.setattr(
+        emby.requests, "get",
+        lambda *a, **k: _FakeResp({"Items": _items(["s2"])}),
+    )
+
+    result = emby.get_actor_items(_req(status_filter="failed"))
+    ids = [it["id"] for it in result["items"]]
+
+    assert ids == ["s2"]
+    assert result["total"] == 1   # broken 时 total=2（s1+s2），修复后=1
