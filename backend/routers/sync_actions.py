@@ -10,7 +10,7 @@ import traceback
 from datetime import datetime
 
 import requests as _requests
-from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from config.settings import load_config
@@ -25,12 +25,11 @@ from services.db_crud import (
     extract_external_images,
 )
 from services.actor_profile_service import resolve_actor_profile, ensure_profiles_for_people
+from services.translation_utils import is_valid_chinese_translation
 from utils.task_manager import task_manager
 
 router = APIRouter()
 logger = logging.getLogger("uvicorn")
-
-_CHINESE_RE = re.compile(r'[一-鿿]')
 
 
 class FullSyncRequest(BaseModel):
@@ -90,7 +89,7 @@ def _count_chinese_roles(people: list) -> tuple:
         return 0, 0
     chinese_count = sum(
         1 for a in actors
-        if a.get("Role") and _CHINESE_RE.search(a.get("Role", ""))
+        if a.get("Role") and is_valid_chinese_translation(a.get("Role", ""))
     )
     return chinese_count, total
 
@@ -265,7 +264,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
             douban_id_str = str(info.get("douban_id", "") or "")
             if douban_id_str:
                 new_p["DoubanCelebrityId"] = douban_id_str
-            if info.get("name") and not _CHINESE_RE.search(emby_name):
+            if info.get("name") and not is_valid_chinese_translation(emby_name):
                 new_p["Name"] = info["name"]
             db_role = info.get("role", "")
             if db_role and db_role not in ("演员", "配音", "actor", "actress"):
@@ -273,9 +272,9 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
             localized.append(new_p)
         else:
             # ---- 漏斗 b: 标记待 AI 翻译 ----
-            if emby_name and not _CHINESE_RE.search(emby_name):
+            if emby_name and not is_valid_chinese_translation(emby_name):
                 _pending_ai_names[lookup_key] = emby_name
-            if emby_role and not _CHINESE_RE.search(emby_role):
+            if emby_role and not is_valid_chinese_translation(emby_role):
                 _pending_ai_roles[lookup_key] = emby_role
             localized.append(p)
 
@@ -291,7 +290,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
                     # c. 动态缓存：将 AI 结果写入 douban_map
                     for lookup_key, original_name in _pending_ai_names.items():
                         translated = name_map.get(original_name, "")
-                        if translated and _CHINESE_RE.search(translated):
+                        if translated and is_valid_chinese_translation(translated):
                             douban_map.setdefault(lookup_key, {})["name"] = translated
                             logger.debug(
                                 "   🤖 [AI缓存] 人名: %s → %s", original_name, translated,
@@ -313,7 +312,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
                         # c. 动态缓存
                         for lookup_key, original_role in _pending_ai_roles.items():
                             translated = role_map.get(original_role, "")
-                            if translated and _CHINESE_RE.search(translated):
+                            if translated and is_valid_chinese_translation(translated):
                                 douban_map.setdefault(lookup_key, {})["role"] = translated
                                 logger.debug(
                                     "   🤖 [AI缓存] 角色: %s → %s", original_role, translated,
@@ -338,7 +337,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
                         douban_id_str = str(info.get("douban_id", "") or "")
                         if douban_id_str:
                             new_p["DoubanCelebrityId"] = douban_id_str
-                        if info.get("name") and not _CHINESE_RE.search(emby_name):
+                        if info.get("name") and not is_valid_chinese_translation(emby_name):
                             new_p["Name"] = info["name"]
                         db_role = info.get("role", "")
                         if db_role and db_role not in ("演员", "配音", "actor", "actress"):
@@ -431,7 +430,7 @@ def _enrich_actor_map_from_series(actor_map: dict, series_people: list):
             continue
         key = name.lower()
         # 不覆盖已有的豆瓣匹配结果
-        if key not in actor_map and _CHINESE_RE.search(name):
+        if key not in actor_map and is_valid_chinese_translation(name):
             actor_map[key] = {"name": name, "role": role}
 
 
@@ -890,12 +889,12 @@ def audit_selected_sync(req: AuditSelectedRequest):
 # ==========================================
 
 @router.get("/media/{item_id}/details")
-def get_media_details(item_id: str, request: Request):
+def get_media_details(item_id: str):
     """获取剧集的分集数据透视 — 含顶层常驻演员与各分集专属演员。
 
     纯只读接口，数据全部来自本地 SQLite。
     ★ 演员头像与生平数据通过 name 关联 ActorProfile，
-      优先返回 local_image_url (基于当前服务的 base_url 拼接)，
+      优先返回 local_image_url (同源相对路径 /static_actors/...)，
       降级为外部 image_url。
 
     返回结构:
@@ -918,9 +917,10 @@ def get_media_details(item_id: str, request: Request):
             "episodes": [...]
         }
     """
-    # ★ 使用当前 FastAPI 服务的 base_url 拼接静态资源路径，
-    #   而非 emby_host（那是 Emby 媒体服务器地址，不提供 actor_images）。
-    base_url = str(request.base_url).rstrip("/")
+    # ★ 本地静态图统一用同源相对路径（/static_actors/...），
+    #   由 Vite 代理 / 后端静态挂载转发到 FastAPI，localhost 与局域网 IP 访问均可达。
+    #   注意：不可用 request.base_url 拼绝对地址 —— Vite 代理 changeOrigin 会把它写成
+    #   127.0.0.1:8000，手机等局域网设备访问该地址会指向设备自身，导致头像裂图。
 
     db = SessionLocal()
     try:
@@ -977,9 +977,9 @@ def get_media_details(item_id: str, request: Request):
             image_url = ""
 
             if prof:
-                # 优先本地静态文件 — 基于当前 API 服务的 base_url
+                # 优先本地静态文件 — 同源相对路径，浏览器按当前页面 origin 解析
                 if prof.local_image_path:
-                    local_image_url = f"{base_url}/static_actors/{prof.local_image_path}"
+                    local_image_url = f"/static_actors/{prof.local_image_path}"
                 image_url = prof.image_url or ""
 
             return {

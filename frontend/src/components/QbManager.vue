@@ -702,7 +702,7 @@ onMounted(() => {
 })
 </script>
 
-<style scoped>
+<style scoped lang="postcss">
 /* ==================== 页面根容器 ==================== */
 .qb-manager {
   padding: 20px 24px;

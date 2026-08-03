@@ -1,52 +1,21 @@
 <script setup lang="ts">
-import {
-  LayoutDashboard, CalendarClock, Download, Brush, Tags, Users,
-  Library, FolderTree, Server, Settings, History,
-  PanelLeftClose, PanelLeftOpen, Boxes
-} from 'lucide-vue-next'
+import { PanelLeftClose, PanelLeftOpen, Boxes } from 'lucide-vue-next'
+import type { MenuGroup } from '../config/menu'
 
-defineProps({
-  collapsed: { type: Boolean, default: false },
-  activeMenu: { type: String, default: '' }
+// 纯展示组件 (Dumb Component)：菜单数据由父组件 App.vue 通过 menuGroups prop 注入，
+// 本组件不再持有任何写死的菜单 label / icon / index。
+withDefaults(defineProps<{
+  collapsed?: boolean
+  activeMenu?: string
+  menuGroups: MenuGroup[]
+}>(), {
+  collapsed: false,
+  activeMenu: '',
 })
 
 defineEmits(['select', 'toggle-collapse'])
 
 const VERSION = 'v1.0.0'
-
-const menuGroups = [
-  {
-    title: '仪表盘',
-    items: [
-      { index: 'dashboard', label: '大盘', icon: LayoutDashboard }
-    ]
-  },
-  {
-    title: '任务工作流',
-    items: [
-      { index: 'scheduler', label: '定时扫描', icon: CalendarClock },
-      { index: 'qb', label: '下载管理', icon: Download },
-      { index: 'cleanup', label: '种子清理', icon: Brush }
-    ]
-  },
-  {
-    title: '媒体与演员',
-    items: [
-      { index: 'manager', label: '标签管理', icon: Tags },
-      { index: 'actor', label: '演员', icon: Users },
-      { index: 'actorLib', label: '演员库', icon: Library },
-      { index: 'editor', label: '分类', icon: FolderTree }
-    ]
-  },
-  {
-    title: '系统设置',
-    items: [
-      { index: 'emby', label: 'Emby', icon: Server },
-      { index: 'mp', label: '配置', icon: Settings },
-      { index: 'history', label: '记录', icon: History }
-    ]
-  }
-]
 </script>
 
 <template>

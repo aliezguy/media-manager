@@ -27,11 +27,16 @@ from database import SessionLocal
 from services.db_crud import save_media_to_db, extract_provider_ids
 from services.actor_profile_service import ensure_profiles_for_people
 from utils.task_manager import task_manager
+from services.translation_utils import (
+    is_valid_chinese_translation,
+    SOURCE_OFFICIAL, SOURCE_AI_FALLBACK, SOURCE_AI_DIRECT,
+    CONFIDENCE_OFFICIAL, CONFIDENCE_AI_FALLBACK, CONFIDENCE_AI_DIRECT, CONFIDENCE_NONE,
+)
+from services.translation_cache import (
+    lookup_actor_name, lookup_role_name, upsert_actor_translation,
+)
 
 logger = logging.getLogger("uvicorn")
-
-# 中文字符正则（供分集汉化率校验用）
-_EP_CHINESE_RE = re.compile(r'[一-鿿]')
 
 
 def _count_chinese_roles_ep(people: list) -> tuple:
@@ -42,7 +47,7 @@ def _count_chinese_roles_ep(people: list) -> tuple:
         return 0, 0
     chinese_count = sum(
         1 for a in actors
-        if a.get("Role") and _EP_CHINESE_RE.search(a.get("Role", ""))
+        if a.get("Role") and is_valid_chinese_translation(a.get("Role", ""))
     )
     return chinese_count, total
 
@@ -164,6 +169,17 @@ class DoubanSinizer:
         result["total_actors"] = len(actors)
         logger.info(f"   👥 Emby 中前 {len(actors)} 位演员待处理 (共 {len(people)} 位人员)")
 
+        # ★ 构建 演员名→TMDB Person ID 映射（供缓存全局查表首选锚点）
+        provider_tmdb_ids: dict = {}
+        for p in actors:
+            p_pids = (p.get("ProviderIds") or {}) or {}
+            p_tmdb = (
+                p_pids.get("Tmdb") or p_pids.get("tmdb")
+                or p.get("Tmdb") or p.get("tmdb") or ""
+            )
+            if p_tmdb:
+                provider_tmdb_ids[(p.get("Name") or "").strip().lower()] = str(p_tmdb).strip()
+
         # 2. 提取 IMDB / TMDB ID → 豆瓣 ID（精准 Frodo API 匹配）
         provider_ids = item_data.get("ProviderIds", {}) or {}
         douban_id = self._find_douban_id(
@@ -186,43 +202,117 @@ class DoubanSinizer:
 
         logger.info(f"   🎬 豆瓣抓取到 {len(douban_actors)} 位演员")
 
-        # 4. 匹配并更新
-        updated_actors, match_details = self._match_and_update(actors, douban_actors)
+        # 4. 匹配并更新（含纯净缓存拦截 + 官方中文校验）
+        match_db = SessionLocal()
+        updated_actors: list = []
+        match_details: list = []
+        fallback_names: dict = {}
+        fallback_roles: dict = {}
+        direct_names: dict = {}
+        direct_roles: dict = {}
+        try:
+            updated_actors, match_details, fallback_names, fallback_roles, direct_names, direct_roles = (
+                self._match_and_update(
+                    actors, douban_actors,
+                    db=match_db, emby_item_id=item_id, parent_id="",
+                    provider_tmdb_ids=provider_tmdb_ids,
+                )
+            )
+
+            # 5. AI 翻译分流：
+            #   fallback_*（官方查了但伪中文）→ conf=3 'ai_fallback'
+            #   direct_*（无官方数据）         → conf=2 'ai_direct'
+            translator = get_translator()
+            if translator.is_available():
+                # 合并待翻译词并标注来源（同名同词时官方查过者优先记 fallback，不降级）
+                ai_names: dict = {}
+                for _k, v in fallback_names.items():
+                    ai_names[v] = SOURCE_AI_FALLBACK
+                for _k, v in direct_names.items():
+                    ai_names.setdefault(v, SOURCE_AI_DIRECT)
+                ai_roles: dict = {}
+                for _k, v in fallback_roles.items():
+                    ai_roles[v] = SOURCE_AI_FALLBACK
+                for _k, v in direct_roles.items():
+                    ai_roles.setdefault(v, SOURCE_AI_DIRECT)
+
+                def _apply_ai_conf(entry: dict, kind: str, src: str) -> int:
+                    """按来源把置信度/来源写入 person 私有键，返回置信度。"""
+                    conf = CONFIDENCE_AI_FALLBACK if src == SOURCE_AI_FALLBACK else CONFIDENCE_AI_DIRECT
+                    entry[f"_cn_{kind}_conf"] = conf
+                    entry[f"_cn_{kind}_src"] = src
+                    return conf
+
+                # 5.1 人名翻译（兜底 + 直出合并批处理）
+                if ai_names:
+                    _fb = sum(1 for s in ai_names.values() if s == SOURCE_AI_FALLBACK)
+                    _dd = len(ai_names) - _fb
+                    logger.info(
+                        f"   🤖 [AI翻译] 翻译 {len(ai_names)} 个人名"
+                        f" (ai_fallback={_fb} / ai_direct={_dd})..."
+                    )
+                    try:
+                        name_map = translator.translate_names(list(ai_names.keys()), context=item_name)
+                        for a in updated_actors:
+                            old_name = a.get("Name", "")
+                            if old_name in name_map:
+                                new_name = (name_map.get(old_name) or "").strip()
+                                if is_valid_chinese_translation(new_name):
+                                    a["Name"] = new_name
+                                    _src = ai_names[old_name]
+                                    _conf = _apply_ai_conf(a, "name", _src)
+                                    _tmdb = provider_tmdb_ids.get(old_name.lower(), "")
+                                    upsert_actor_translation(
+                                        match_db, new_name, _tmdb, _src, _conf,
+                                    )
+                                    logger.info(
+                                        f"   🤖 [AI翻译] 人名 {old_name} → {new_name} ({_src}/{_conf})"
+                                    )
+                    except Exception:
+                        logger.debug("   ⚠ [AI] 批量人名翻译异常，跳过")
+
+                # 5.2 角色名翻译（兜底 + 直出合并批处理）
+                if ai_roles:
+                    logger.info(f"   🤖 [AI翻译] 翻译 {len(ai_roles)} 个角色名...")
+                    try:
+                        role_map = translator.translate_roles(list(ai_roles.keys()), context=item_name)
+                        # 常见英文名名单，翻译后如果变成了音译中文（如 Jason→杰森），回退为原名
+                        common_english_names = {
+                            "jason", "linda", "michael", "david", "tom", "jack",
+                            "john", "mary", "robert", "james", "william", "emma",
+                            "olivia", "sarah", "anna", "lisa", "chris", "mike",
+                            "peter", "paul", "george", "henry", "sam", "alex",
+                        }
+                        for a in updated_actors:
+                            old_role = a.get("Role", "")
+                            if old_role in role_map:
+                                new_role = role_map[old_role]
+                                # 如果原名是常见英文名但 AI 翻译成了中文（音译），保留原名
+                                if old_role.lower() in common_english_names and self._is_chinese(new_role):
+                                    logger.info(f"   🤖 [AI翻译] 角色 {old_role} (常见英文名，保持原样)")
+                                elif is_valid_chinese_translation(new_role):
+                                    a["Role"] = new_role
+                                    _src = ai_roles[old_role]
+                                    _conf = _apply_ai_conf(a, "role", _src)
+                                    logger.info(
+                                        f"   🤖 [AI翻译] 角色 {old_role} → {new_role} ({_src}/{_conf})"
+                                    )
+                                else:
+                                    logger.info(f"   🤖 [AI翻译] 角色 {old_role} AI 返回伪中文，丢弃")
+                    except Exception:
+                        logger.debug("   ⚠ [AI] 批量角色翻译异常，跳过")
+            else:
+                logger.info(f"   ℹ️ [AI翻译] 未配置 AI Provider，跳过翻译")
+
+            match_db.commit()
+        except Exception as _me:
+            match_db.rollback()
+            logger.warning(f"   ⚠ [Douban] 缓存/匹配阶段异常: {_me}")
+        finally:
+            match_db.close()
+
         result["details"] = match_details
         result["matched"] = sum(1 for d in match_details if d["matched"])
-
-        # 5. AI 翻译兜底: 翻译仍未汉化的英文角色名（不翻译人名字）
-        translator = get_translator()
-        if translator.is_available():
-            roles_to_translate = []
-            for a in updated_actors:
-                role = a.get("Role", "")
-                # 角色不含中文且不是占位符则需要翻译
-                if role and not self._is_chinese(role) and role not in ("演员", "配音", "actor", "actress"):
-                    roles_to_translate.append(role)
-
-            if roles_to_translate:
-                logger.info(f"   🤖 [AI翻译] 翻译 {len(roles_to_translate)} 个角色名...")
-                role_map = translator.translate_roles(roles_to_translate, context=item_name)
-                # 常见英文名名单，翻译后如果变成了音译中文（如 Jason→杰森），回退为原名
-                common_english_names = {
-                    "jason", "linda", "michael", "david", "tom", "jack",
-                    "john", "mary", "robert", "james", "william", "emma",
-                    "olivia", "sarah", "anna", "lisa", "chris", "mike",
-                    "peter", "paul", "george", "henry", "sam", "alex",
-                }
-                for a in updated_actors:
-                    old_role = a.get("Role", "")
-                    if old_role in role_map:
-                        new_role = role_map[old_role]
-                        # 如果原名是常见英文名但 AI 翻译成了中文（音译），保留原名
-                        if old_role.lower() in common_english_names and self._is_chinese(new_role):
-                            logger.info(f"   🤖 [AI翻译] 角色 {old_role} (常见英文名，保持原样)")
-                        else:
-                            a["Role"] = new_role
-                            logger.info(f"   🤖 [AI翻译] 角色 {old_role} → {new_role}")
-        else:
-            logger.info(f"   ℹ️ [AI翻译] 未配置 AI Provider，跳过翻译")
 
         # 5b. ★ AI 批量推理缺失角色名
         # 收集 Role 为空/占位符的演员，利用 LLM 影视知识精准推理
@@ -444,9 +534,10 @@ class DoubanSinizer:
                         try:
                             ep_people = ep.get("People", []) or []
 
-                            # 7c. 中文化分集演员（含 AI 兜底 + 动态缓存）
+                            # 7c. 中文化分集演员（纯净缓存拦截 + 官方校验 + AI 兜底）
                             localized_people = self._localize_episode_people(
                                 ep_people, douban_match_map, series_name=item_name,
+                                db=ep_db, emby_item_id=ep_id, parent_id=item_id,
                             )
 
                             # ★ 分集也应用截断
@@ -879,11 +970,33 @@ class DoubanSinizer:
     # ------------------------------------------------------------------
 
     def _match_and_update(
-        self, emby_actors: list[dict], douban_actors: list[dict]
-    ) -> tuple[list[dict], list[dict]]:
-        """将 Emby 演员与豆瓣演员进行对齐，返回更新后的列表和匹配详情。"""
+        self, emby_actors: list[dict], douban_actors: list[dict],
+        db=None, emby_item_id: str = "", parent_id: str = "",
+        provider_tmdb_ids: dict = None,
+    ) -> tuple[list[dict], list[dict], dict, dict, dict, dict]:
+        """将 Emby 演员与豆瓣演员进行对齐，返回更新后的列表和匹配详情。
+
+        「纯净缓存拦截」+「AI 兜底/直出分流」：
+          - 先查本地缓存（演员名全局复用 / 角色名局部复用，confidence>=阈值），命中即复用；
+          - 官方（豆瓣）译名必须经 is_valid_chinese_translation 校验：
+              * 有效中文 → conf=4 'official'；
+              * 官方返回伪中文（全英文/拼音）→ 进入 fallback_names/fallback_roles
+                （语义=官方查了但无中文，靠 AI 兜底 → conf=3 'ai_fallback'）；
+              * 官方根本没匹配到 → 进入 direct_names/direct_roles
+                （语义=无官方数据，直接扔给 AI → conf=2 'ai_direct'）。
+          - 有效译名回写 person 私有键 _cn_*_conf / _cn_*_src，供 save_media_to_db 落库。
+
+        Returns:
+            (updated, details, fallback_names, fallback_roles, direct_names, direct_roles)
+        """
         updated = []
         details = []
+        # {emby_name_lower: original_name} — 官方查了但伪中文 → ai_fallback
+        fallback_names: dict = {}
+        fallback_roles: dict = {}
+        # {emby_name_lower: original_name} — 无官方数据 → ai_direct
+        direct_names: dict = {}
+        direct_roles: dict = {}
         douban_names = {da["name"] for da in douban_actors}
         used_douban = set()
 
@@ -901,6 +1014,33 @@ class DoubanSinizer:
                     "matched": False, "reason": "Emby名称为空",
                 })
                 continue
+
+            # ★ 纯净缓存拦截：先查本地缓存（命中 confidence>=阈值 直接复用，跳过外部译名）
+            cache_name = ""
+            cache_name_conf = 0
+            cache_name_src = ""
+            cache_role = ""
+            cache_role_conf = 0
+            cache_role_src = ""
+            if db is not None:
+                hit = lookup_actor_name(
+                    db,
+                    (provider_tmdb_ids or {}).get(emby_name.lower(), ""),
+                    emby_name,
+                )
+                if hit and is_valid_chinese_translation(hit["name"]):
+                    cache_name = hit["name"]
+                    cache_name_conf = hit["confidence_level"] or 0
+                    cache_name_src = hit["translation_source"] or ""
+                if emby_role:
+                    rhit = lookup_role_name(
+                        db, emby_role, emby_item_id, parent_id or None,
+                        actor_name=emby_name,
+                    )
+                    if rhit:
+                        cache_role = rhit["role"]
+                        cache_role_conf = rhit["confidence_level"] or 0
+                        cache_role_src = rhit["translation_source"] or ""
 
             # 级别 1: 直接中文名匹配
             if emby_name in douban_names:
@@ -947,20 +1087,69 @@ class DoubanSinizer:
                 is_chinese = self._is_chinese(emby_name)
                 old_name = emby_name
 
-                if not is_chinese:
-                    new_entry["Name"] = matched_da["name"]
+                # ---- 演员名：缓存优先 → 官方校验 → 伪中文 fallback / 无官方 direct ----
+                if cache_name:
+                    new_entry["Name"] = cache_name
+                    new_entry["_cn_name_conf"] = cache_name_conf
+                    new_entry["_cn_name_src"] = cache_name_src
+                elif not is_chinese:
+                    douban_name = matched_da.get("name", "")
+                    if douban_name and is_valid_chinese_translation(douban_name):
+                        # 有效官方中文 → conf=4 official
+                        new_entry["Name"] = douban_name
+                        new_entry["_cn_name_conf"] = CONFIDENCE_OFFICIAL
+                        new_entry["_cn_name_src"] = SOURCE_OFFICIAL
+                        if db is not None:
+                            _tmdb = (provider_tmdb_ids or {}).get(emby_name.lower(), "")
+                            upsert_actor_translation(
+                                db, douban_name, _tmdb, SOURCE_OFFICIAL, CONFIDENCE_OFFICIAL,
+                            )
+                    elif douban_name:
+                        # 官方返回伪中文（全英文/拼音）→ ai_fallback
+                        fallback_names[emby_name.lower()] = emby_name
+                    else:
+                        # 官方匹配到但无中文名 → ai_direct
+                        direct_names[emby_name.lower()] = emby_name
+                else:
+                    # Emby 名已是中文：无翻译动作，标记为「未翻译」
+                    new_entry["_cn_name_conf"] = CONFIDENCE_NONE
+                    new_entry["_cn_name_src"] = ""
 
-                douban_role = matched_da["role"]
-                # 豆瓣返回"演员"/"配音"等占位符时不覆盖 Emby 原有角色名
-                if douban_role and douban_role not in ("演员", "配音", "actor", "actress"):
-                    new_entry["Role"] = douban_role
+                # ---- 角色名：缓存优先 → 官方校验 → 伪中文 fallback / 无官方 direct ----
+                douban_role = matched_da.get("role", "")
+                if cache_role:
+                    new_entry["Role"] = cache_role
+                    new_entry["_cn_role_conf"] = cache_role_conf
+                    new_entry["_cn_role_src"] = cache_role_src
+                elif douban_role and douban_role not in ("演员", "配音", "actor", "actress"):
+                    if is_valid_chinese_translation(douban_role):
+                        # 有效官方中文角色 → conf=4 official
+                        new_entry["Role"] = douban_role
+                        new_entry["_cn_role_conf"] = CONFIDENCE_OFFICIAL
+                        new_entry["_cn_role_src"] = SOURCE_OFFICIAL
+                    else:
+                        # 官方伪中文角色 → ai_fallback（保留 Emby 原始角色，不污染）
+                        new_entry["_cn_role_conf"] = 0
+                        new_entry["_cn_role_src"] = ""
+                        fallback_roles[emby_name.lower()] = emby_role or douban_role
+                else:
+                    # 官方未提供角色名（空/占位符）：若 Emby 角色为英文 → ai_direct
+                    if emby_role and not self._is_chinese(emby_role):
+                        direct_roles[emby_name.lower()] = emby_role
+                    elif emby_role and self._is_chinese(emby_role):
+                        new_entry["_cn_role_conf"] = CONFIDENCE_NONE
+                        new_entry["_cn_role_src"] = ""
 
                 updated.append(new_entry)
 
+                # 实际应用名/角色：缓存命中时以缓存为准（仅作日志/详情展示）
+                _applied_name = cache_name or (matched_da["name"] if not is_chinese else old_name)
+                _applied_role = cache_role or matched_da.get("role", emby_role)
+
                 log_msg = (
                     f"   ✅ [{match_level}] {old_name}"
-                    + (f" → {matched_da['name']}" if not is_chinese else " (已是中文)")
-                    + (f" | 角色: {emby_role or '(无)'} → {douban_role}" if douban_role and douban_role not in ('演员','配音','actor','actress') else (f" | 角色: {emby_role or '(无)'} (豆瓣返回'{douban_role}'已跳过)" if douban_role else ""))
+                    + (f" → {_applied_name}" if _applied_name != old_name else " (已是中文)")
+                    + (f" | 角色: {emby_role or '(无)'} → {_applied_role}" if _applied_role and _applied_role != emby_role else (f" | 角色: {emby_role or '(无)'} (豆瓣返回'{douban_role}'已跳过)" if douban_role else ""))
                 )
                 logger.info(log_msg)
 
@@ -969,28 +1158,63 @@ class DoubanSinizer:
                     "emby_name": old_name,
                     "douban_name": matched_da["name"],
                     "old_name": old_name,
-                    "new_name": matched_da["name"] if not is_chinese else old_name,
+                    "new_name": _applied_name,
                     "old_role": emby_role,
-                    "new_role": matched_da.get("role", emby_role),
+                    "new_role": _applied_role,
                     "matched": True,
-                    "level": match_level,
+                    "level": "缓存复用" if cache_name else match_level,
                 })
             else:
-                updated.append(ea)
-                logger.info(f"   ⏭ [未匹配] {emby_name}")
-                details.append({
-                    "index": i,
-                    "emby_name": emby_name,
-                    "douban_name": "",
-                    "old_name": emby_name,
-                    "new_name": emby_name,
-                    "old_role": emby_role,
-                    "new_role": emby_role,
-                    "matched": False,
-                    "reason": "未能在豆瓣演员中找到匹配",
-                })
+                # ★ 豆瓣未匹配但缓存命中 → 仍复用缓存译名
+                if cache_name or cache_role:
+                    new_entry = dict(ea)
+                    if cache_name:
+                        new_entry["Name"] = cache_name
+                        new_entry["_cn_name_conf"] = cache_name_conf
+                        new_entry["_cn_name_src"] = cache_name_src
+                    if cache_role:
+                        new_entry["Role"] = cache_role
+                        new_entry["_cn_role_conf"] = cache_role_conf
+                        new_entry["_cn_role_src"] = cache_role_src
+                    # 缓存未覆盖的剩余英文名/角色 → 无官方数据 → ai_direct
+                    if not cache_name and emby_name and not self._is_chinese(emby_name):
+                        direct_names[emby_name.lower()] = emby_name
+                    if not cache_role and emby_role and not self._is_chinese(emby_role):
+                        direct_roles[emby_name.lower()] = emby_role
+                    updated.append(new_entry)
+                    logger.info(f"   💾 [缓存复用] {emby_name} → {cache_name or emby_name}")
+                    details.append({
+                        "index": i,
+                        "emby_name": emby_name,
+                        "douban_name": cache_name or "",
+                        "old_name": emby_name,
+                        "new_name": cache_name or emby_name,
+                        "old_role": emby_role,
+                        "new_role": cache_role or emby_role,
+                        "matched": True,
+                        "level": "缓存复用",
+                    })
+                else:
+                    updated.append(ea)
+                    logger.info(f"   ⏭ [未匹配] {emby_name}")
+                    # 无官方数据 → 若英文则标记 ai_direct
+                    if emby_name and not self._is_chinese(emby_name):
+                        direct_names[emby_name.lower()] = emby_name
+                    if emby_role and not self._is_chinese(emby_role):
+                        direct_roles[emby_name.lower()] = emby_role
+                    details.append({
+                        "index": i,
+                        "emby_name": emby_name,
+                        "douban_name": "",
+                        "old_name": emby_name,
+                        "new_name": emby_name,
+                        "old_role": emby_role,
+                        "new_role": emby_role,
+                        "matched": False,
+                        "reason": "未能在豆瓣演员中找到匹配",
+                    })
 
-        # 追加未匹配的豆瓣演员
+        # 追加未匹配的豆瓣演员（官方新增，仍强制中文校验防污染）
         for da in douban_actors:
             if da["name"] in used_douban:
                 continue
@@ -1004,6 +1228,20 @@ class DoubanSinizer:
             douban_id_str = str(da.get("id", "") or "")
             if douban_id_str:
                 new_actor["DoubanCelebrityId"] = douban_id_str
+            da_name = da.get("name", "")
+            if is_valid_chinese_translation(da_name):
+                new_actor["_cn_name_conf"] = CONFIDENCE_OFFICIAL
+                new_actor["_cn_name_src"] = SOURCE_OFFICIAL
+            else:
+                # 官方查到但伪中文 → ai_fallback（唯一 key，避免同名覆盖）
+                fallback_names[da_name.lower()] = da_name
+            da_role = da.get("role", "")
+            if da_role and is_valid_chinese_translation(da_role):
+                new_actor["_cn_role_conf"] = CONFIDENCE_OFFICIAL
+                new_actor["_cn_role_src"] = SOURCE_OFFICIAL
+            elif da_role:
+                # 官方伪中文角色 → ai_fallback
+                fallback_roles[da_role.lower()] = da_role
             updated.append(new_actor)
             logger.info(f"   ➕ [新增] {da['name']} | 角色: {da['role']}")
             details.append({
@@ -1018,7 +1256,7 @@ class DoubanSinizer:
             if a.get("Type") == "Actor" and not (a.get("Role") or "").strip():
                 a["Role"] = "演员"
 
-        return updated, details
+        return updated, details, fallback_names, fallback_roles, direct_names, direct_roles
 
     # ------------------------------------------------------------------
     # 5. Emby 回写
@@ -1324,26 +1562,38 @@ class DoubanSinizer:
     def _localize_episode_people(
         self, ep_people: list, douban_match_map: dict,
         series_name: str = "",
+        db=None, emby_item_id: str = "", parent_id: str = "",
     ) -> list:
-        """对分集演员列表中文化替换（含 AI 兜底 + 动态缓存）。
+        """对分集演员列表中文化替换（含缓存拦截 + AI 兜底 + 动态缓存）。
 
-        三级漏斗策略：
-        a. 全量字典匹配：先查 douban_match_map（豆瓣全量演员）
-        b. AI 兜底翻译：未命中时调 AI translate_names / translate_roles
-        c. 动态缓存学习：AI 成功结果即时写入 douban_match_map
+        四级漏斗策略：
+        a. 纯净缓存拦截：查本地 DB（演员名全局 / 角色名局部，confidence>=3）命中即复用
+        b. 全量字典匹配：查 douban_match_map（豆瓣全量演员 + Series 层已汉化数据）
+        c. AI 兜底翻译：未命中时调 AI translate_names / translate_roles
+        d. 动态缓存学习：AI 成功结果即时写入 douban_match_map
+
+        所有官方/AI 译名均经 is_valid_chinese_translation 校验，伪中文直接丢弃；
+        有效译名附带 _cn_*_conf / _cn_*_src 私有键，供 save_media_to_db 落库置信度。
 
         Args:
             ep_people:        Emby 分集的 People 列表
             douban_match_map: {emby_name_lower: {"name": "豆瓣中文名", "role": "豆瓣角色"}}
                               此字典会被原地修改（引用传递），用于跨分集缓存
             series_name:      剧集名称，作为 AI 翻译上下文
+            db:               可选 SQLAlchemy Session，用于纯净缓存拦截
+            emby_item_id:     当前分集 ID（角色缓存局部查询）
+            parent_id:        所属 Series ID（角色缓存向上追溯）
 
         Returns:
             中文化后的 People 列表
         """
-        # 收集本轮需要 AI 翻译的未命中项
-        _pending_ai_names = {}
-        _pending_ai_roles = {}
+        # 收集本轮需要 AI 翻译的未命中项（按来源分流）
+        #   _fallback_ai_* : 官方查了但伪中文/无中文 → ai_fallback(3)
+        #   _direct_ai_*   : 无官方数据             → ai_direct(2)
+        _fallback_ai_names = {}
+        _direct_ai_names = {}
+        _fallback_ai_roles = {}
+        _direct_ai_roles = {}
 
         localized = []
         for p in ep_people:
@@ -1356,8 +1606,49 @@ class DoubanSinizer:
             emby_role = (p.get("Role") or "").strip()
             lookup_key = emby_name.lower()
 
+            # ★ 漏斗 a: 纯净缓存拦截（命中 confidence>=阈值 直接复用，跳过外部译名）
+            cache_name = ""
+            cache_name_conf = 0
+            cache_name_src = ""
+            cache_role = ""
+            cache_role_conf = 0
+            cache_role_src = ""
+            if db is not None:
+                p_pids = (p.get("ProviderIds") or {}) or {}
+                p_tmdb = (
+                    p_pids.get("Tmdb") or p_pids.get("tmdb")
+                    or p.get("Tmdb") or p.get("tmdb") or ""
+                )
+                _hit = lookup_actor_name(db, p_tmdb, emby_name)
+                if _hit and is_valid_chinese_translation(_hit["name"]):
+                    cache_name = _hit["name"]
+                    cache_name_conf = _hit["confidence_level"] or 0
+                    cache_name_src = _hit["translation_source"] or ""
+                if emby_role:
+                    _rhit = lookup_role_name(
+                        db, emby_role, emby_item_id, parent_id or None,
+                        actor_name=emby_name,
+                    )
+                    if _rhit:
+                        cache_role = _rhit["role"]
+                        cache_role_conf = _rhit["confidence_level"] or 0
+                        cache_role_src = _rhit["translation_source"] or ""
+
+            if cache_name or cache_role:
+                new_p = dict(p)
+                if cache_name:
+                    new_p["Name"] = cache_name
+                    new_p["_cn_name_conf"] = cache_name_conf
+                    new_p["_cn_name_src"] = cache_name_src
+                if cache_role:
+                    new_p["Role"] = cache_role
+                    new_p["_cn_role_conf"] = cache_role_conf
+                    new_p["_cn_role_src"] = cache_role_src
+                localized.append(new_p)
+                continue
+
             if lookup_key in douban_match_map:
-                # ---- 漏斗 a: 全量字典命中 ----
+                # ---- 漏斗 b: 全量字典命中（官方豆瓣结果，仍强制中文校验） ----
                 info = douban_match_map[lookup_key]
                 new_p = dict(p)
                 # ★ 注入豆瓣头像外链，供 actor_profile_service 超级漏斗短路使用
@@ -1366,68 +1657,139 @@ class DoubanSinizer:
                 douban_id_str = str(info.get("douban_id", "") or "")
                 if douban_id_str:
                     new_p["DoubanCelebrityId"] = douban_id_str
+                # ---- 演员名：官方校验 → 伪中文 fallback / 无中文 direct ----
                 db_name = info.get("name", "")
-                if db_name and not self._is_chinese(emby_name):
-                    new_p["Name"] = db_name
+                if not self._is_chinese(emby_name):
+                    if db_name and is_valid_chinese_translation(db_name):
+                        new_p["Name"] = db_name
+                        new_p["_cn_name_conf"] = CONFIDENCE_OFFICIAL
+                        new_p["_cn_name_src"] = SOURCE_OFFICIAL
+                    elif db_name:
+                        # 官方伪中文 → ai_fallback
+                        _fallback_ai_names[lookup_key] = emby_name
+                    else:
+                        # 官方匹配到但无中文名 → ai_direct
+                        _direct_ai_names[lookup_key] = emby_name
+                else:
+                    # Emby 名已是中文：无翻译动作
+                    new_p["_cn_name_conf"] = CONFIDENCE_NONE
+                    new_p["_cn_name_src"] = ""
+                # ---- 角色名：官方校验 → 伪中文 fallback / 无中文 direct ----
                 db_role = info.get("role", "")
                 if db_role and db_role not in ("演员", "配音", "actor", "actress"):
-                    new_p["Role"] = db_role
+                    if is_valid_chinese_translation(db_role):
+                        new_p["Role"] = db_role
+                        new_p["_cn_role_conf"] = CONFIDENCE_OFFICIAL
+                        new_p["_cn_role_src"] = SOURCE_OFFICIAL
+                    else:
+                        # 官方伪中文角色 → ai_fallback
+                        _fallback_ai_roles[lookup_key] = emby_role or db_role
+                elif emby_role and not self._is_chinese(emby_role):
+                    # 官方无角色名/占位符 且 Emby 角色英文 → ai_direct
+                    _direct_ai_roles[lookup_key] = emby_role
+                elif emby_role:
+                    new_p["_cn_role_conf"] = CONFIDENCE_NONE
+                    new_p["_cn_role_src"] = ""
                 localized.append(new_p)
             else:
-                # ---- 漏斗 b: 标记待 AI 翻译 ----
+                # ---- 漏斗 c: 无官方数据 → ai_direct ----
                 if emby_name and not self._is_chinese(emby_name):
-                    _pending_ai_names[lookup_key] = emby_name
+                    _direct_ai_names[lookup_key] = emby_name
                 if emby_role and not self._is_chinese(emby_role):
-                    _pending_ai_roles[lookup_key] = emby_role
+                    _direct_ai_roles[lookup_key] = emby_role
                 localized.append(p)
 
-        # ---- 漏斗 b/c: AI 批量翻译 + 缓存回写 ----
-        if _pending_ai_names or _pending_ai_roles:
+        # ---- 漏斗 c/d: AI 批量翻译 + 中文校验 + 缓存回写 ----
+        if _fallback_ai_names or _direct_ai_names or _fallback_ai_roles or _direct_ai_roles:
             translator = get_translator()
             if translator.is_available():
-                # b1. 批量翻译人名
-                if _pending_ai_names:
-                    unique_names = list(set(_pending_ai_names.values()))
+                # 合并待翻译词并标注来源（同名同词时官方查过者优先记 fallback，不降级）
+                ai_name_items: dict = {}
+                for _k, v in _fallback_ai_names.items():
+                    ai_name_items[v] = SOURCE_AI_FALLBACK
+                for _k, v in _direct_ai_names.items():
+                    ai_name_items.setdefault(v, SOURCE_AI_DIRECT)
+                ai_role_items: dict = {}
+                for _k, v in _fallback_ai_roles.items():
+                    ai_role_items[v] = SOURCE_AI_FALLBACK
+                for _k, v in _direct_ai_roles.items():
+                    ai_role_items.setdefault(v, SOURCE_AI_DIRECT)
+                # original_name → lookup_key 反查映射
+                _orig_to_lk_name = {}
+                for lk, v in _fallback_ai_names.items():
+                    _orig_to_lk_name.setdefault(v, lk)
+                for lk, v in _direct_ai_names.items():
+                    _orig_to_lk_name.setdefault(v, lk)
+                _orig_to_lk_role = {}
+                for lk, v in _fallback_ai_roles.items():
+                    _orig_to_lk_role.setdefault(v, lk)
+                for lk, v in _direct_ai_roles.items():
+                    _orig_to_lk_role.setdefault(v, lk)
+
+                def _ai_conf(src: str) -> int:
+                    return CONFIDENCE_AI_FALLBACK if src == SOURCE_AI_FALLBACK else CONFIDENCE_AI_DIRECT
+
+                # c1. 批量翻译人名（兜底 + 直出合并批处理）
+                if ai_name_items:
+                    unique_names = list(ai_name_items.keys())
                     try:
                         name_map = translator.translate_names(unique_names, context=series_name)
-                        for lookup_key, original_name in _pending_ai_names.items():
-                            translated = name_map.get(original_name, "")
-                            if translated and self._is_chinese(translated):
-                                douban_match_map.setdefault(lookup_key, {})["name"] = translated
+                        for original_name, src in ai_name_items.items():
+                            translated = (name_map.get(original_name) or "").strip()
+                            if translated and is_valid_chinese_translation(translated):
+                                lk = _orig_to_lk_name.get(original_name)
+                                if lk:
+                                    douban_match_map.setdefault(lk, {})["name"] = translated
+                                if db is not None:
+                                    upsert_actor_translation(
+                                        db, translated, "", src, _ai_conf(src),
+                                    )
                                 logger.debug(
-                                    "   🤖 [AI缓存] 人名: %s → %s", original_name, translated,
+                                    "   🤖 [AI缓存] 人名: %s → %s (%s)",
+                                    original_name, translated, src,
                                 )
                     except Exception:
                         logger.debug("   ⚠ [AI] 批量人名翻译异常，跳过")
 
-                # b2. 批量翻译角色名
-                if _pending_ai_roles:
-                    unique_roles = list(set(_pending_ai_roles.values()))
+                # c2. 批量翻译角色名（兜底 + 直出合并批处理）
+                if ai_role_items:
                     unique_roles = [
-                        r for r in unique_roles
+                        r for r in ai_role_items.keys()
                         if r and r.lower() not in ("actor", "actress", "guest", "guest star", "unknown")
                     ]
                     if unique_roles:
                         try:
                             role_map = translator.translate_roles(unique_roles, context=series_name)
-                            for lookup_key, original_role in _pending_ai_roles.items():
-                                translated = role_map.get(original_role, "")
-                                if translated and self._is_chinese(translated):
-                                    douban_match_map.setdefault(lookup_key, {})["role"] = translated
+                            for original_role, src in ai_role_items.items():
+                                if original_role.lower() in ("actor", "actress", "guest", "guest star", "unknown"):
+                                    continue
+                                translated = (role_map.get(original_role) or "").strip()
+                                if translated and is_valid_chinese_translation(translated):
+                                    lk = _orig_to_lk_role.get(original_role)
+                                    if lk:
+                                        douban_match_map.setdefault(lk, {})["role"] = translated
                                     logger.debug(
-                                        "   🤖 [AI缓存] 角色: %s → %s", original_role, translated,
+                                        "   🤖 [AI缓存] 角色: %s → %s (%s)",
+                                        original_role, translated, src,
                                     )
                         except Exception:
                             logger.debug("   ⚠ [AI] 批量角色翻译异常，跳过")
 
-                # b3. 用更新后的 douban_match_map 重新应用翻译
-                if _pending_ai_names or _pending_ai_roles:
+                # c3. 用更新后的 douban_match_map 重新应用翻译（仅本轮 AI 项，带置信度标记）
+                if ai_name_items or ai_role_items:
                     for i, p in enumerate(localized):
                         person_type = p.get("Type", "Actor")
                         if person_type not in ("Actor", "GuestStar"):
                             continue
                         emby_name = (p.get("Name") or "").strip()
                         lookup_key = emby_name.lower()
+                        is_fb_name = lookup_key in _fallback_ai_names
+                        is_dir_name = lookup_key in _direct_ai_names
+                        is_fb_role = lookup_key in _fallback_ai_roles
+                        is_dir_role = lookup_key in _direct_ai_roles
+                        # 非本轮 AI 项跳过，避免覆盖漏斗 a/b 已有的官方/缓存置信度
+                        if not (is_fb_name or is_dir_name or is_fb_role or is_dir_role):
+                            continue
                         if lookup_key in douban_match_map:
                             info = douban_match_map[lookup_key]
                             new_p = dict(p)
@@ -1438,11 +1800,25 @@ class DoubanSinizer:
                             if douban_id_str:
                                 new_p["DoubanCelebrityId"] = douban_id_str
                             db_name = info.get("name", "")
-                            if db_name and not self._is_chinese(emby_name):
+                            if db_name and not self._is_chinese(emby_name) \
+                                    and is_valid_chinese_translation(db_name):
                                 new_p["Name"] = db_name
+                                if is_fb_name:
+                                    new_p["_cn_name_conf"] = CONFIDENCE_AI_FALLBACK
+                                    new_p["_cn_name_src"] = SOURCE_AI_FALLBACK
+                                else:
+                                    new_p["_cn_name_conf"] = CONFIDENCE_AI_DIRECT
+                                    new_p["_cn_name_src"] = SOURCE_AI_DIRECT
                             db_role = info.get("role", "")
-                            if db_role and db_role not in ("演员", "配音", "actor", "actress"):
+                            if db_role and db_role not in ("演员", "配音", "actor", "actress") \
+                                    and is_valid_chinese_translation(db_role):
                                 new_p["Role"] = db_role
+                                if is_fb_role:
+                                    new_p["_cn_role_conf"] = CONFIDENCE_AI_FALLBACK
+                                    new_p["_cn_role_src"] = SOURCE_AI_FALLBACK
+                                else:
+                                    new_p["_cn_role_conf"] = CONFIDENCE_AI_DIRECT
+                                    new_p["_cn_role_src"] = SOURCE_AI_DIRECT
                             localized[i] = new_p
 
         # ★ 空角色强制兜底：所有处理完毕后，仍为空的 Role 默认赋 "演员"

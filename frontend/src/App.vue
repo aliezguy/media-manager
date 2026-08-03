@@ -1,19 +1,9 @@
 <script setup lang="ts">
 import { ref, shallowRef, onMounted, onUnmounted, computed } from 'vue'
-import { Files, Connection, VideoCameraFilled, Timer, Box, EditPen, Brush, DataAnalysis, Calendar, User } from '@element-plus/icons-vue'
+import type { Component } from 'vue'
 
 import Sidebar from './components/Sidebar.vue'
-import TagManager from './components/TagManager.vue'
-import EmbySettings from './components/EmbySettings.vue'
-import MpConfig from './components/MpConfig.vue'
-import WashHistory from './components/WashHistory.vue'
-import QbManager from './components/QbManager.vue'
-import FileEditor from './components/FileEditor.vue'
-import TorrentCleanup from './components/TorrentCleanup.vue'
-import TaskDashboard from './components/TaskDashboard.vue'
-import ScheduledTasks from './components/ScheduledTasks.vue'
-import ActorLocalizationStudio from './components/ActorLocalizationStudio.vue'
-import ActorLibrary from './components/ActorLibrary.vue'
+import { menuGroups } from './config/menu'
 
 const isCollapse = ref(false)
 const activeMenu = ref('emby')
@@ -21,26 +11,17 @@ const windowWidth = ref(window.innerWidth)
 
 const isMobile = computed(() => windowWidth.value < 768)
 
-const currentComponent = shallowRef(EmbySettings)
+// 单一数据源派生：拍平分组 → 组件解析 + 移动端 Tab 栏
+const menuItems = computed(() => menuGroups.flatMap(g => g.items))
 
-// 用于组件解析 + 移动端底部 Tab 栏（index 必须与 Sidebar 中的菜单项保持一致）
-const menuItems = [
-  { index: 'manager', label: '标签管理', icon: Files, component: TagManager },
-  { index: 'qb', label: '下载管理', icon: Box, component: QbManager },
-  { index: 'cleanup', label: '种子清理', icon: Brush, component: TorrentCleanup },
-  { index: 'dashboard', label: '大盘', icon: DataAnalysis, component: TaskDashboard },
-  { index: 'actor', label: '演员中文化', icon: User, component: ActorLocalizationStudio },
-  { index: 'actorLib', label: '演员库', icon: User, component: ActorLibrary },
-  { index: 'scheduler', label: '定时扫描', icon: Calendar, component: ScheduledTasks },
-  { index: 'emby', label: 'Emby', icon: Connection, component: EmbySettings },
-  { index: 'mp', label: '配置', icon: VideoCameraFilled, component: MpConfig },
-  { index: 'history', label: '记录', icon: Timer, component: WashHistory },
-  { index: 'editor', label: '分类', icon: EditPen, component: FileEditor }
-]
+const currentComponent = shallowRef<Component>(
+  menuItems.value.find(i => i.index === activeMenu.value)?.component
+  ?? menuItems.value[0]!.component // menuGroups 为静态非空配置，安全兜底
+)
 
 const handleSelect = (index: string) => {
   activeMenu.value = index
-  const item = menuItems.find(i => i.index === index)
+  const item = menuItems.value.find(i => i.index === index)
   if (item) currentComponent.value = item.component
 }
 
@@ -68,6 +49,7 @@ onUnmounted(() => {
       <Sidebar
         :collapsed="isCollapse"
         :active-menu="activeMenu"
+        :menu-groups="menuGroups"
         @select="handleSelect"
         @toggle-collapse="isCollapse = !isCollapse"
       />
@@ -98,7 +80,7 @@ onUnmounted(() => {
           :class="{ active: activeMenu === item.index }"
           @click="handleSelect(item.index)"
         >
-          <el-icon :size="20"><component :is="item.icon" /></el-icon>
+          <component :is="item.icon" :size="20" />
           <span class="tabbar-label">{{ item.label }}</span>
         </div>
       </div>

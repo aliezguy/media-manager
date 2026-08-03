@@ -497,7 +497,7 @@ const removeKeyword = (tag: string) => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="postcss">
 /* ==================== 容器 ==================== */
 .mp-container {
   @apply mx-auto flex max-w-[1200px] flex-col gap-5 p-4 pb-10 md:p-5;

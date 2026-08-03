@@ -2,9 +2,12 @@
 import { ref, reactive, onMounted, computed } from 'vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Search, VideoPlay, MagicStick, Check, Filter, Download, Calendar, Loading } from '@element-plus/icons-vue'
+import {
+  Search, Database, Check, SlidersHorizontal, Calendar,
+  Loader2, Sparkles, Download, Clapperboard, Save, Plus, RefreshCw,
+} from 'lucide-vue-next'
 
-const API_URL = ''
+const API_URL = import.meta.env.VITE_API_URL || ''
 
 // === 类型定义 ===
 interface Config {
@@ -228,39 +231,51 @@ const stopBatch = () => { isBatchRunning.value = false; ElMessage.info('停止�
 
 <template>
   <div class="manager-container">
-    <!-- ==================== Toolbar ==================== -->
-    <div class="toolbar">
+    <!-- ==================== 顶部全息控制台 ==================== -->
+    <div class="hud-header">
+      <!-- 媒体库组 -->
       <div class="tool-group">
-        <span class="tool-label">📚 媒体库</span>
-        <el-select v-model="selectedLib" placeholder="请选择库" style="width:140px" :disabled="isBatchRunning">
-          <el-option v-for="l in libraries" :key="l.Id" :label="l.Name" :value="l.Id"/>
+        <span class="tool-label"><Database class="w-3.5 h-3.5" /> 媒体库</span>
+        <el-select
+          v-model="selectedLib"
+          placeholder="请选择库"
+          style="width: 150px"
+          :disabled="isBatchRunning"
+        >
+          <el-option v-for="l in libraries" :key="l.Id" :label="l.Name" :value="l.Id" />
         </el-select>
-        <button class="btn-pill btn-pill-blue" @click="loadItems(false)" :disabled="isBatchRunning">
-          <el-icon :size="14"><VideoPlay /></el-icon> 加载50条
+        <button class="ghost-btn" @click="loadItems(false)" :disabled="isBatchRunning">
+          <Database />
+          加载50条
         </button>
-        <button class="btn-pill btn-pill-outline" @click="loadItems(true)" :disabled="loading || isBatchRunning">
-          <el-icon v-if="loading" :size="14" class="is-loading"><Loading /></el-icon>
-          <el-icon v-else :size="14"><Check /></el-icon> 全部
+        <button class="ghost-btn soft" @click="loadItems(true)" :disabled="loading || isBatchRunning">
+          <Loader2 v-if="loading" class="animate-spin" />
+          <Check v-else />
+          全部
         </button>
       </div>
 
+      <!-- 筛选组 -->
       <div class="tool-group">
-        <span class="tool-label"><el-icon :size="14"><Filter /></el-icon> 筛选</span>
-        <el-select v-model="filterStatus" style="width:100px" :disabled="isBatchRunning">
-          <el-option label="全部" value="all"/><el-option label="无标签" value="no"/><el-option label="有标签" value="yes"/>
+        <span class="tool-label"><SlidersHorizontal class="w-3.5 h-3.5" /> 筛选</span>
+        <el-select v-model="filterStatus" style="width: 100px" :disabled="isBatchRunning">
+          <el-option label="全部" value="all" />
+          <el-option label="无标签" value="no" />
+          <el-option label="有标签" value="yes" />
         </el-select>
-        <el-select v-model="filterYear" filterable clearable placeholder="年份" style="width:100px" :disabled="isBatchRunning">
-          <template #prefix><el-icon><Calendar /></el-icon></template>
-          <el-option v-for="y in uniqueYears" :key="y" :label="y" :value="y"/>
+        <el-select v-model="filterYear" filterable clearable placeholder="年份" style="width: 110px" :disabled="isBatchRunning">
+          <template #prefix><Calendar class="w-3.5 h-3.5" /></template>
+          <el-option v-for="y in uniqueYears" :key="y" :label="y" :value="y" />
         </el-select>
-        <el-select v-model="filterTag" filterable clearable placeholder="搜标签" style="width:130px" :disabled="isBatchRunning">
-          <el-option v-for="t in uniqueTags" :key="t" :label="t" :value="t"/>
+        <el-select v-model="filterTag" filterable clearable placeholder="搜标签" style="width: 140px" :disabled="isBatchRunning">
+          <el-option v-for="t in uniqueTags" :key="t" :label="t" :value="t" />
         </el-select>
       </div>
 
+      <!-- 搜索 -->
       <div class="tool-group search-group">
         <div class="search-box">
-          <el-icon :size="14" class="search-icon"><Search /></el-icon>
+          <Search class="search-icon" />
           <input
             v-model="searchTerm"
             type="text"
@@ -273,38 +288,41 @@ const stopBatch = () => { isBatchRunning.value = false; ElMessage.info('停止�
       </div>
     </div>
 
-    <!-- ==================== Batch Action Bar ==================== -->
+    <!-- ==================== 批量操作全息条 ==================== -->
     <transition name="el-zoom-in-top">
       <div v-if="multipleSelection.length > 0 || isBatchRunning" class="batch-bar">
         <div class="batch-bar-inner">
           <div v-if="!isBatchRunning" class="batch-info">
-            <el-icon :size="16"><Check /></el-icon>
-            已选 <b>{{ multipleSelection.length }}</b> 项
+            <Check class="w-4 h-4 text-blue-400" />
+            <span>已选 <b>{{ multipleSelection.length }}</b> 项</span>
           </div>
           <div v-else class="batch-info running">
-            <el-icon :size="16" class="is-loading"><Loading /></el-icon>
-            {{ currentBatchAction }} — {{ batchProgress.finished }}/{{ batchProgress.total }}
-            (✅{{ batchProgress.success }} ❌{{ batchProgress.fail }})
+            <Loader2 class="w-4 h-4 animate-spin" />
+            <span>{{ currentBatchAction }} — {{ batchProgress.finished }}/{{ batchProgress.total }}</span>
+            <span class="batch-counts">✅{{ batchProgress.success }} ❌{{ batchProgress.fail }}</span>
           </div>
           <div class="batch-btns">
-            <button v-if="isBatchRunning" class="btn-pill btn-pill-danger" @click="stopBatch">停止</button>
+            <button v-if="isBatchRunning" class="hud-btn hud-btn-red" @click="stopBatch">停止</button>
             <template v-else>
-              <button class="btn-pill btn-pill-green" @click="batchAnalyze">
-                <el-icon :size="14"><MagicStick /></el-icon> AI 分析
+              <button class="ai-btn" @click="batchAnalyze">
+                <Sparkles class="w-3.5 h-3.5" /> AI 分析
               </button>
-              <button class="btn-pill btn-pill-blue" @click="batchSave">
-                <el-icon :size="14"><Download /></el-icon> 写入 Emby
+              <button class="hud-btn hud-btn-green" @click="batchSave">
+                <Download class="w-3.5 h-3.5" /> 写入 Emby
               </button>
             </template>
           </div>
         </div>
         <div v-if="isBatchRunning" class="batch-progress-track">
-          <div class="batch-progress-fill" :style="{ width: Math.round((batchProgress.finished/batchProgress.total)*100) + '%' }"></div>
+          <div
+            class="batch-progress-fill"
+            :style="{ width: Math.round((batchProgress.finished / batchProgress.total) * 100) + '%' }"
+          ></div>
         </div>
       </div>
     </transition>
 
-    <!-- ==================== Card List ==================== -->
+    <!-- ==================== 情报卡片列表 ==================== -->
     <div v-loading="loading" class="card-list">
       <div
         v-for="row in pagedTableData"
@@ -312,104 +330,105 @@ const stopBatch = () => { isBatchRunning.value = false; ElMessage.info('停止�
         class="tag-card"
         :class="{ selected: isSelected(row) }"
       >
-        <!-- Checkbox -->
-        <div
-          class="card-check"
-          :class="{ checked: isSelected(row) }"
-          @click.stop="toggleSelect(row)"
-        >
-          <el-icon v-if="isSelected(row)" :size="14" color="#fff"><Check /></el-icon>
+        <!-- 头部行：Checkbox + 标题 + 年份 + 状态 -->
+        <div class="card-header-row">
+          <div
+            class="card-check"
+            :class="{ checked: isSelected(row) }"
+            @click.stop="toggleSelect(row)"
+          >
+            <Check v-if="isSelected(row)" class="w-3 h-3 text-white" :stroke-width="3" />
+          </div>
+          <span class="card-title">{{ row.name }}</span>
+          <span class="card-year">{{ row.year }}</span>
+          <span
+            v-if="row.status"
+            class="card-status"
+            :class="{ done: row.status.includes('存') || row.status.includes('批量') }"
+          >{{ row.status }}</span>
         </div>
 
-        <!-- Body -->
-        <div class="card-body">
-          <!-- Title row -->
-          <div class="card-title-row">
-            <span class="card-title">{{ row.name }}</span>
-            <span class="card-year">{{ row.year }}</span>
-            <span
-              v-if="row.status"
-              class="card-status"
-              :class="{ done: row.status.includes('存') || row.status.includes('批量') }"
-            >{{ row.status }}</span>
-          </div>
-
-          <!-- Current tags -->
-          <div class="card-tags-row">
-            <span class="tags-label">标签</span>
-            <span
-              v-for="tag in row.editing_tags"
-              :key="tag"
-              class="tag-chip tag-editing"
-            >
-              {{ tag }}
-              <span class="tag-close" @click.stop="removeTag(row, tag)">&times;</span>
-            </span>
-            <el-input
-              v-if="row.inputVisible"
-              v-model="row.inputValue"
-              size="small"
-              class="tag-inline-input"
-              @blur="addTagInput(row)"
-              @keyup.enter="addTagInput(row)"
-            />
-            <button
-              v-else
-              class="tag-add-btn"
-              @click.stop="row.inputVisible = true"
-              :disabled="isBatchRunning"
-            >+</button>
-          </div>
-
-          <!-- AI suggestions -->
-          <div v-if="row.suggested_tags && row.suggested_tags.length" class="card-ai-row">
-            <span class="ai-label">AI 建议</span>
-            <span
-              v-for="tag in row.suggested_tags"
-              :key="tag"
-              class="tag-chip tag-ai"
-              @click.stop="acceptAiTag(row, tag)"
-            >+ {{ tag }}</span>
-            <button class="ai-link" @click.stop="acceptAllAi(row)">全收</button>
-            <button class="ai-link ai-recalc" @click.stop="generateAI(row, true)">重算</button>
-          </div>
+        <!-- 标签药丸 -->
+        <div class="card-tags-row">
+          <span class="tags-label">标签</span>
+          <span v-for="tag in row.editing_tags" :key="tag" class="tag-chip">
+            {{ tag }}
+            <span class="tag-close" @click.stop="removeTag(row, tag)">&times;</span>
+          </span>
+          <el-input
+            v-if="row.inputVisible"
+            v-model="row.inputValue"
+            size="small"
+            class="tag-inline-input"
+            @blur="addTagInput(row)"
+            @keyup.enter="addTagInput(row)"
+          />
           <button
             v-else
-            class="ai-trigger-btn"
-            :disabled="row.analyzing || isBatchRunning"
-            @click.stop="generateAI(row, false)"
+            class="tag-add-btn"
+            @click.stop="row.inputVisible = true"
+            :disabled="isBatchRunning"
           >
-            <el-icon v-if="row.analyzing" :size="13" class="is-loading"><Loading /></el-icon>
-            <el-icon v-else :size="13"><MagicStick /></el-icon>
-            AI 分析
+            <Plus />
           </button>
         </div>
 
-        <!-- Save action -->
-        <div class="card-save-col">
+        <!-- AI 建议 -->
+        <div v-if="row.suggested_tags && row.suggested_tags.length" class="card-ai-row">
+          <span class="ai-label"><Sparkles class="w-3 h-3" /> AI 建议</span>
+          <span
+            v-for="tag in row.suggested_tags"
+            :key="tag"
+            class="tag-chip tag-ai"
+            @click.stop="acceptAiTag(row, tag)"
+          >+ {{ tag }}</span>
+          <button class="ai-link" @click.stop="acceptAllAi(row)">全收</button>
+        </div>
+
+        <!-- 底部操作区 -->
+        <div class="card-actions">
+          <button
+            v-if="!row.suggested_tags || !row.suggested_tags.length"
+            class="ai-btn"
+            :disabled="row.analyzing || isBatchRunning"
+            @click.stop="generateAI(row, false)"
+          >
+            <Loader2 v-if="row.analyzing" class="w-3.5 h-3.5 animate-spin" />
+            <Sparkles v-else class="w-3.5 h-3.5" />
+            {{ row.analyzing ? '分析中…' : 'AI 分析' }}
+          </button>
+          <span v-else class="ai-suggested-hint">
+            <Sparkles class="w-3 h-3 text-indigo-400" />
+            {{ row.suggested_tags.length }} 条建议
+            <button
+              class="ai-link ai-recalc"
+              :disabled="row.analyzing || isBatchRunning"
+              @click.stop="generateAI(row, true)"
+            >
+              <RefreshCw class="w-3 h-3" /> 重算
+            </button>
+          </span>
           <button
             class="save-btn"
             :disabled="row.saving || isBatchRunning"
             @click.stop="saveTags(row)"
           >
-            <el-icon v-if="row.saving" :size="14" class="is-loading"><Loading /></el-icon>
-            <template v-else>保存</template>
+            <Loader2 v-if="row.saving" class="w-3.5 h-3.5 animate-spin" />
+            <template v-else><Save class="w-3.5 h-3.5" /> 保存</template>
           </button>
         </div>
       </div>
 
-      <!-- Empty state -->
+      <!-- 空状态 -->
       <div v-if="!loading && !tableData.length" class="empty-state">
-        <div class="empty-icon-circle">
-          <el-icon :size="36"><VideoPlay /></el-icon>
-        </div>
+        <div class="empty-icon-circle"><Clapperboard class="w-8 h-8" /></div>
         <p class="empty-title">{{ selectedLib ? '暂无数据' : '未选择媒体库' }}</p>
         <p class="empty-desc">{{ selectedLib ? '请加载数据或尝试搜索' : '请先选择媒体库并加载数据' }}</p>
       </div>
     </div>
 
-    <!-- ==================== Pagination ==================== -->
-    <div class="pagination-bar" v-if="filteredTableData.length > 0">
+    <!-- ==================== 分页 ==================== -->
+    <div v-if="filteredTableData.length > 0" class="pagination-bar">
       <el-pagination
         v-model:current-page="currentPage"
         v-model:page-size="pageSize"
@@ -423,523 +442,380 @@ const stopBatch = () => { isBatchRunning.value = false; ElMessage.info('停止�
   </div>
 </template>
 
-<style scoped>
-/* ==================== Layout ==================== */
+<style scoped lang="postcss">
+/* ==================== 全息情报终端容器 ==================== */
 .manager-container {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  height: 100%;
-  padding: 8px 16px;
+  @apply flex flex-col gap-3 h-full p-3 md:p-4;
 }
 
-/* ==================== Toolbar ==================== */
-.toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  align-items: center;
-  background: var(--bg-card);
-  padding: 12px 16px;
-  border-radius: var(--radius-lg);
-  border: 1px solid var(--border-color);
-  flex-shrink: 0;
+/* ==================== 顶部全息控制台 ==================== */
+.hud-header {
+  @apply sticky top-0 z-30 flex flex-wrap items-center gap-3 p-4 bg-[#0B1120]/80 backdrop-blur-xl border-b border-white/10 flex-shrink-0;
 }
 
 .tool-group {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  @apply flex items-center gap-2.5;
 }
 
 .tool-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  white-space: nowrap;
-  display: flex;
-  align-items: center;
-  gap: 4px;
+  @apply flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400 whitespace-nowrap;
 }
 
 .search-group {
-  margin-left: auto;
+  @apply ml-auto;
 }
 
-/* Search box */
+/* 高科技幽灵主按钮 —— “加载50条” */
+.ghost-btn {
+  @apply inline-flex items-center gap-2 h-9 px-4 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/30 hover:bg-blue-500/20 hover:shadow-[0_0_15px_rgba(59,130,246,0.2)] transition-all duration-200 text-sm font-medium cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed;
+}
+.ghost-btn svg {
+  @apply w-4 h-4;
+}
+.ghost-btn.soft {
+  @apply bg-white/[0.03] text-slate-300 border-white/10 hover:bg-white/[0.06] hover:text-white hover:border-white/20 hover:shadow-none;
+}
+
+/* 搜索框 —— 暗色半透明 + 聚焦蓝光 */
 .search-box {
-  position: relative;
-  display: flex;
-  align-items: center;
-  width: 200px;
+  @apply relative flex items-center h-9 w-56;
 }
-
 .search-icon {
-  position: absolute;
-  left: 10px;
-  color: var(--text-tertiary);
-  pointer-events: none;
+  @apply absolute left-3 w-4 h-4 text-slate-500 pointer-events-none;
 }
-
 .search-input {
-  width: 100%;
-  padding: 7px 12px 7px 30px;
-  background: var(--bg-input);
-  border: none;
-  border-radius: var(--radius-full);
-  color: var(--text-primary);
-  font-size: 13px;
-  font-family: inherit;
-  outline: none;
-  box-shadow: 0 0 0 1px var(--border-color);
-  transition: box-shadow 0.2s;
+  @apply w-full h-9 pl-9 pr-3 rounded-lg bg-white/[0.03] border border-white/10 text-white text-sm font-mono outline-none transition-all duration-200 placeholder:text-slate-600 disabled:opacity-50;
 }
-.search-input::placeholder { color: var(--text-tertiary); }
-.search-input:focus { box-shadow: 0 0 0 2px var(--accent-blue); }
-.search-input:disabled { opacity: 0.5; }
-
-/* Pill buttons (component-scoped) */
-.btn-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 14px;
-  border: none;
-  border-radius: var(--radius-full);
-  font-size: 12px;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s;
-  white-space: nowrap;
-}
-.btn-pill:disabled { opacity: 0.4; cursor: not-allowed; }
-
-.btn-pill-blue {
-  background: var(--accent-blue);
-  color: #fff;
-}
-.btn-pill-blue:hover:not(:disabled) {
-  background: #2563eb;
+.search-input:focus {
+  @apply border-blue-400/60 bg-blue-500/[0.06];
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.5), 0 0 12px rgba(59, 130, 246, 0.25);
 }
 
-.btn-pill-outline {
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
+/* el-select 统一 h-9 暗色触发头 + 聚焦蓝光 */
+.hud-header :deep(.el-select__wrapper) {
+  @apply h-9 rounded-lg bg-white/[0.03] transition-all duration-200;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09);
 }
-.btn-pill-outline:hover:not(:disabled) {
-  background: rgba(59, 130, 246, 0.3);
+.hud-header :deep(.el-select__wrapper:hover) {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22);
+}
+.hud-header :deep(.el-select__wrapper.is-focused) {
+  @apply bg-blue-500/[0.06];
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.6), 0 0 12px rgba(59, 130, 246, 0.3);
+}
+.hud-header :deep(.el-select__placeholder) {
+  @apply text-slate-500;
+}
+.hud-header :deep(.el-select__selected-item) {
+  @apply text-slate-200 text-sm;
+}
+.hud-header :deep(.el-select__caret),
+.hud-header :deep(.el-select__prefix) {
+  @apply text-slate-500;
 }
 
-.btn-pill-green {
-  background: var(--accent-green-soft);
-  color: var(--accent-green);
-}
-.btn-pill-green:hover:not(:disabled) {
-  background: rgba(16, 185, 129, 0.3);
-}
-
-.btn-pill-danger {
-  background: var(--accent-red-soft);
-  color: var(--accent-red);
-}
-.btn-pill-danger:hover:not(:disabled) {
-  background: rgba(239, 68, 68, 0.3);
-}
-
-/* ==================== Batch Bar ==================== */
+/* ==================== 批量操作全息条 ==================== */
 .batch-bar {
-  background: var(--bg-card);
-  border: 1px solid var(--accent-blue);
-  border-radius: var(--radius-lg);
-  padding: 12px 16px;
-  flex-shrink: 0;
+  @apply relative flex flex-col gap-2.5 px-4 py-3 rounded-xl bg-[#0B1120]/80 backdrop-blur-xl border border-blue-500/30 flex-shrink-0;
+  box-shadow: 0 0 24px rgba(59, 130, 246, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.batch-bar::before {
+  content: '';
+  @apply absolute left-3 top-2 bottom-2 w-px bg-gradient-to-b from-transparent via-blue-400/60 to-transparent pointer-events-none;
 }
 
 .batch-bar-inner {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
+  @apply flex items-center justify-between gap-3;
 }
 
 .batch-info {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-primary);
+  @apply flex items-center gap-2 text-[13px] text-slate-300 font-mono;
 }
-.batch-info b { color: var(--accent-blue); }
-.batch-info.running { color: var(--accent-yellow); font-weight: 500; }
+.batch-info b {
+  @apply text-blue-400 font-semibold;
+}
+.batch-info.running {
+  @apply text-yellow-400/90 font-medium;
+}
+.batch-counts {
+  @apply text-slate-400;
+}
 
 .batch-btns {
-  display: flex;
-  gap: 6px;
+  @apply flex items-center gap-2;
 }
 
+/* 通用 HUD 幽灵按钮 */
+.hud-btn {
+  @apply inline-flex items-center gap-1.5 h-8 px-3.5 rounded-lg text-xs font-medium border transition-all duration-200 cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed;
+}
+.hud-btn svg {
+  @apply w-3.5 h-3.5;
+}
+.hud-btn-green {
+  @apply bg-emerald-500/10 text-emerald-400 border-emerald-500/25 hover:bg-emerald-500/20 hover:text-emerald-300 hover:shadow-[0_0_12px_rgba(16,185,129,0.25)];
+}
+.hud-btn-red {
+  @apply bg-red-500/10 text-red-400 border-red-500/25 hover:bg-red-500/20 hover:text-red-300 hover:shadow-[0_0_12px_rgba(239,68,68,0.25)];
+}
+
+/* AI 专属按钮 —— 靛蓝 · Sparkles */
+.ai-btn {
+  @apply inline-flex items-center gap-1.5 text-xs font-medium text-indigo-400 bg-indigo-500/10 border border-indigo-500/20 px-3 py-1.5 rounded-lg hover:bg-indigo-500/20 hover:text-indigo-300 hover:shadow-[0_0_10px_rgba(99,102,241,0.3)] transition-all duration-200 cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed;
+}
+.ai-btn svg {
+  @apply w-3.5 h-3.5;
+}
+
+/* 批量进度条 —— 霓虹渐变 */
 .batch-progress-track {
-  width: 100%;
-  height: 4px;
-  background: var(--border-color);
-  border-radius: 2px;
-  margin-top: 10px;
-  overflow: hidden;
+  @apply w-full h-1 bg-white/5 rounded-full overflow-hidden;
 }
-
 .batch-progress-fill {
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent-blue), #60a5fa);
-  border-radius: 2px;
-  transition: width 0.3s;
+  @apply h-full rounded-full transition-all duration-300;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6, #06b6d4);
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.6);
 }
 
-/* ==================== Card List ==================== */
+/* ==================== 情报卡片列表 ==================== */
 .card-list {
-  flex: 1;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+  @apply flex-1 overflow-y-auto flex flex-col py-2 pr-1;
+}
+.card-list :deep(.el-loading-mask) {
+  @apply bg-[#0B1120]/50;
+  backdrop-filter: blur(2px);
 }
 
-/* ==================== Tag Card ==================== */
+/* 毛玻璃悬浮卡片 */
 .tag-card {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 14px 16px;
-  background: var(--bg-card);
-  border-radius: var(--radius-lg);
-  border: 1px solid transparent;
-  transition: all 0.2s;
-}
-.tag-card:hover {
-  border-color: var(--border-color);
-  background: var(--bg-card-hover);
+  @apply flex flex-col gap-3 p-4 mb-3 bg-white/[0.02] border border-white/5 rounded-xl hover:bg-white/[0.04] hover:border-blue-500/30 hover:shadow-lg transition-all duration-300;
 }
 .tag-card.selected {
-  border-color: var(--accent-blue);
-  box-shadow: 0 0 0 1px var(--accent-blue);
+  @apply bg-blue-500/[0.06] border-blue-400/40;
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.4), 0 0 20px rgba(59, 130, 246, 0.15);
 }
 
-/* Checkbox */
+/* 头部行 */
+.card-header-row {
+  @apply flex items-center gap-2.5;
+}
+
+/* Checkbox —— 垂直居中 */
 .card-check {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  border: 2px solid var(--border-color);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s;
-  flex-shrink: 0;
-  margin-top: 2px;
+  @apply w-5 h-5 rounded-md border-2 border-slate-600 flex items-center justify-center cursor-pointer transition-all duration-200 flex-shrink-0;
 }
-.card-check:hover { border-color: var(--accent-blue); }
+.card-check:hover {
+  @apply border-blue-400/70;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.25);
+}
 .card-check.checked {
-  background: var(--accent-blue);
-  border-color: var(--accent-blue);
-}
-
-/* Body */
-.card-body {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-/* Title */
-.card-title-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  @apply bg-blue-500/80 border-blue-400;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
 }
 
 .card-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
+  @apply text-white text-[15px] font-bold tracking-wide;
 }
-
 .card-year {
-  font-size: 12px;
-  color: var(--text-tertiary);
+  @apply text-slate-500 text-xs font-mono ml-3;
 }
-
 .card-status {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent-blue);
-  background: var(--accent-blue-soft);
-  padding: 2px 8px;
-  border-radius: var(--radius-full);
+  @apply ml-auto text-[10px] font-mono tracking-wider px-2 py-0.5 rounded-md text-blue-300 bg-blue-500/10 border border-blue-500/20 whitespace-nowrap;
 }
 .card-status.done {
-  color: var(--accent-green);
-  background: var(--accent-green-soft);
+  @apply text-emerald-300 bg-emerald-500/10 border-emerald-500/20;
 }
 
-/* Tags */
+/* 标签区 */
 .card-tags-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+  @apply flex items-center gap-2 flex-wrap;
 }
-
 .tags-label {
-  font-size: 11px;
-  color: var(--text-tertiary);
-  font-weight: 500;
-  margin-right: 2px;
+  @apply text-[10px] font-mono uppercase tracking-[0.18em] text-slate-500;
 }
 
+/* 微发光数据药丸 */
 .tag-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 3px 10px;
-  border-radius: var(--radius-full);
-  font-size: 12px;
-  font-weight: 500;
+  @apply inline-flex items-center px-2.5 py-1 rounded-md bg-blue-900/20 text-blue-300 border border-blue-500/30 text-xs font-mono transition-colors hover:bg-blue-800/40 hover:border-blue-400;
 }
-
-.tag-editing {
-  background: rgba(100, 116, 139, 0.15);
-  color: var(--text-secondary);
-}
-
 .tag-close {
-  cursor: pointer;
-  margin-left: 2px;
-  font-size: 14px;
-  line-height: 1;
-  opacity: 0.6;
-  transition: opacity 0.15s;
+  @apply ml-1.5 cursor-pointer text-sm leading-none opacity-60 transition-opacity hover:opacity-100 hover:text-red-400;
 }
-.tag-close:hover { opacity: 1; color: var(--accent-red); }
 
+/* 添加标签 —— 虚线幽灵 */
 .tag-add-btn {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  border: 1px dashed var(--border-color);
-  background: transparent;
-  color: var(--text-tertiary);
-  font-size: 14px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
+  @apply inline-flex items-center justify-center w-6 h-6 rounded-md border border-dashed border-white/20 text-slate-400 hover:text-white hover:border-white/50 cursor-pointer transition-all duration-200 disabled:opacity-40;
 }
-.tag-add-btn:hover {
-  border-color: var(--accent-blue);
-  color: var(--accent-blue);
-  background: var(--accent-blue-soft);
+.tag-add-btn svg {
+  @apply w-3.5 h-3.5;
 }
 
+/* 行内添加标签输入框 */
 .tag-inline-input {
-  width: 80px;
+  @apply w-24;
+}
+.card-tags-row :deep(.el-input__wrapper) {
+  @apply rounded-md bg-white/[0.03] transition-all duration-200;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+}
+.card-tags-row :deep(.el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.6), 0 0 10px rgba(59, 130, 246, 0.3);
+}
+.card-tags-row :deep(.el-input__inner) {
+  @apply text-white text-xs font-mono;
 }
 
-/* AI row */
+/* AI 建议区 */
 .card-ai-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+  @apply flex items-center gap-2 flex-wrap;
 }
-
 .ai-label {
-  font-size: 11px;
-  color: var(--accent-purple);
-  font-weight: 500;
-  margin-right: 2px;
+  @apply inline-flex items-center gap-1 text-[10px] font-mono uppercase tracking-[0.18em] text-purple-400;
 }
-
 .tag-ai {
-  background: rgba(239, 68, 68, 0.12);
-  color: var(--accent-red);
-  border: 1px solid rgba(239, 68, 68, 0.25);
-  cursor: pointer;
-  font-size: 11px;
-  transition: all 0.2s;
+  @apply inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-purple-500/10 text-purple-300 border border-purple-500/25 text-xs font-mono cursor-pointer transition-all duration-200 hover:bg-purple-500/20 hover:border-purple-400 hover:shadow-[0_0_8px_rgba(139,92,246,0.3)];
 }
-.tag-ai:hover {
-  background: rgba(239, 68, 68, 0.25);
-  transform: scale(1.05);
-}
-
 .ai-link {
-  border: none;
-  background: none;
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--accent-blue);
-  cursor: pointer;
-  padding: 0;
-  font-family: inherit;
-  transition: color 0.15s;
+  @apply inline-flex items-center gap-1 text-xs font-medium text-purple-400 bg-transparent border-none p-0 font-mono cursor-pointer transition-colors hover:text-purple-300 disabled:opacity-40 disabled:cursor-not-allowed;
 }
-.ai-link:hover { color: #60a5fa; }
-.ai-link.ai-recalc {
-  color: var(--text-tertiary);
+.ai-suggested-hint {
+  @apply inline-flex items-center gap-1.5 text-xs text-indigo-300/80 font-mono;
 }
-.ai-link.ai-recalc:hover { color: var(--accent-yellow); }
-
-/* AI trigger button */
-.ai-trigger-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 12px;
-  border: 1px dashed var(--border-color);
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--text-tertiary);
-  font-size: 12px;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s;
-  width: fit-content;
-}
-.ai-trigger-btn:hover:not(:disabled) {
-  border-color: var(--accent-purple);
-  color: var(--accent-purple);
-  background: rgba(139, 92, 246, 0.08);
-}
-.ai-trigger-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-/* Save column */
-.card-save-col {
-  flex-shrink: 0;
-  display: flex;
-  align-items: flex-start;
-  padding-top: 2px;
+.ai-recalc {
+  @apply text-slate-500 hover:text-yellow-400;
 }
 
+/* 底部操作区 */
+.card-actions {
+  @apply flex items-center justify-between mt-1 pt-3 border-t border-white/5;
+}
+
+/* 极客保存按钮 */
 .save-btn {
-  padding: 7px 18px;
-  border: none;
-  border-radius: var(--radius-full);
-  background: var(--accent-blue);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 0.2s;
-  white-space: nowrap;
+  @apply inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-300 bg-emerald-500/10 border border-emerald-500/25 px-3.5 py-1.5 rounded-lg hover:bg-emerald-500/20 hover:text-emerald-200 hover:shadow-[0_0_10px_rgba(16,185,129,0.25)] transition-all duration-200 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed;
 }
-.save-btn:hover:not(:disabled) {
-  background: #2563eb;
-  box-shadow: var(--shadow-glow-blue);
-}
-.save-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+.save-btn svg {
+  @apply w-3.5 h-3.5;
 }
 
-/* ==================== Empty State ==================== */
+/* ==================== 空状态 ==================== */
 .empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 60px 20px;
-  text-align: center;
+  @apply flex flex-col items-center justify-center py-16 text-center;
 }
-
 .empty-icon-circle {
-  width: 72px;
-  height: 72px;
-  border-radius: 50%;
-  background: var(--bg-card);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-tertiary);
-  margin-bottom: 16px;
+  @apply w-16 h-16 rounded-2xl bg-white/[0.03] border border-white/10 flex items-center justify-center text-slate-500 mb-4;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
-
 .empty-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text-primary);
-  margin: 0 0 4px;
+  @apply text-slate-300 text-base font-semibold mb-1;
 }
-
 .empty-desc {
-  font-size: 13px;
-  color: var(--text-tertiary);
-  margin: 0;
+  @apply text-slate-600 text-[13px] font-mono;
 }
 
-/* ==================== Pagination ==================== */
+/* ==================== 分页 ==================== */
 .pagination-bar {
-  display: flex;
-  justify-content: center;
-  padding: 10px 0 4px;
-  flex-shrink: 0;
+  @apply flex justify-center pt-3 pb-1 flex-shrink-0;
+}
+.pagination-bar :deep(.el-pagination) {
+  --el-pagination-bg-color: rgba(255, 255, 255, 0.05);
+  --el-pagination-button-bg-color: rgba(255, 255, 255, 0.05);
+  --el-pagination-hover-color: #60a5fa;
+  --el-pagination-text-color: #94a3b8;
+}
+.pagination-bar :deep(.el-pagination__total) {
+  @apply text-slate-500 font-mono text-xs;
+}
+.pagination-bar :deep(.el-pager li) {
+  @apply text-slate-400 rounded-lg;
+  background: rgba(255, 255, 255, 0.05);
+  margin: 0 2px;
+}
+.pagination-bar :deep(.el-pager li.is-active) {
+  @apply text-white bg-blue-500;
+  box-shadow: 0 0 12px rgba(59, 130, 246, 0.5);
+}
+.pagination-bar :deep(.el-pagination .btn-prev),
+.pagination-bar :deep(.el-pagination .btn-next) {
+  @apply text-slate-400 rounded-lg;
+  background: rgba(255, 255, 255, 0.05);
+}
+.pagination-bar :deep(.el-pagination .btn-prev:hover:not(:disabled)),
+.pagination-bar :deep(.el-pagination .btn-next:hover:not(:disabled)) {
+  @apply text-blue-300;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.2);
+}
+.pagination-bar :deep(.el-pagination .btn-prev:disabled),
+.pagination-bar :deep(.el-pagination .btn-next:disabled) {
+  @apply opacity-40;
+}
+.pagination-bar :deep(.el-pagination .el-select__wrapper) {
+  @apply h-8 rounded-lg bg-white/[0.03] transition-all;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09);
+}
+.pagination-bar :deep(.el-pagination .el-select__wrapper.is-focused) {
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.6), 0 0 10px rgba(59, 130, 246, 0.3);
+}
+.pagination-bar :deep(.el-pagination .el-select__selected-item) {
+  @apply text-slate-200 text-xs;
 }
 
-/* ==================== Mobile ==================== */
+/* ==================== 下拉弹层 —— 全息暗色（popper 被传送到 body，需全局） ==================== */
+:global(.el-select__popper) {
+  --el-select-dropdown-bg-color: #0b1120;
+}
+:global(.el-select__popper .el-select-dropdown) {
+  background: #0b1120;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6), 0 0 20px rgba(59, 130, 246, 0.08);
+  overflow: hidden;
+}
+:global(.el-select__popper .el-select-dropdown__item) {
+  color: #94a3b8;
+}
+:global(.el-select__popper .el-select-dropdown__item.hover),
+:global(.el-select__popper .el-select-dropdown__item:hover) {
+  background: rgba(59, 130, 246, 0.12);
+  color: #93c5fd;
+}
+:global(.el-select__popper .el-select-dropdown__item.is-selected) {
+  color: #60a5fa;
+  font-weight: 600;
+}
+:global(.el-select__popper .el-select-dropdown__item.is-disabled) {
+  color: #475569;
+}
+
+/* ==================== 移动端 ==================== */
 @media screen and (max-width: 768px) {
   .manager-container {
-    padding: 4px;
-    gap: 6px;
+    @apply p-2 gap-2;
   }
-
-  .toolbar {
-    padding: 10px;
-    gap: 8px;
-    flex-direction: column;
-    align-items: stretch;
+  .hud-header {
+    @apply flex-col items-stretch;
   }
-
   .tool-group {
-    flex-wrap: wrap;
+    @apply flex-wrap;
   }
-
   .search-group {
-    margin-left: 0;
-    width: 100%;
+    @apply ml-0 w-full;
   }
-
   .search-box {
-    width: 100%;
+    @apply w-full;
   }
-
   .tag-card {
-    padding: 10px 12px;
-    gap: 8px;
-    flex-wrap: wrap;
+    @apply p-3;
   }
-
-  .card-save-col {
-    width: 100%;
-    justify-content: flex-end;
-  }
-
   .batch-bar-inner {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
+    @apply flex-col items-start gap-2;
   }
-
   .batch-btns {
-    width: 100%;
+    @apply w-full;
   }
-
-  .batch-btns .btn-pill {
-    flex: 1;
-    justify-content: center;
+  .batch-btns .ai-btn,
+  .batch-btns .hud-btn {
+    @apply flex-1 justify-center;
   }
 }
 </style>

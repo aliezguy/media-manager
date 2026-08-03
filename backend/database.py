@@ -127,6 +127,26 @@ def _run_migrations():
                     "📦 [Migration] actor_profiles: douban_id → douban_celebrity_id"
                 )
 
+            # ---- actor_profiles / actor_records: 新增置信度与译名来源列 ----
+            for table_name in ("actor_profiles", "actor_records"):
+                try:
+                    cols = [
+                        row[1] for row in
+                        conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+                    ]
+                except Exception:
+                    continue  # 表尚未创建 — create_all 会处理
+
+                for col_name, col_type in (
+                    ("confidence_level", "INTEGER DEFAULT 0"),
+                    ("translation_source", "VARCHAR DEFAULT ''"),
+                ):
+                    if col_name not in cols:
+                        conn.execute(text(
+                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                        ))
+                        logger.info("📦 [Migration] %s 添加字段: %s", table_name, col_name)
+
             conn.commit()
     except Exception as e:
         logger.debug("   [Migration] 跳过（表尚未创建或已是最新）: %s", e)

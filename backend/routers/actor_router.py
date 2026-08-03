@@ -18,7 +18,7 @@ from fastapi import APIRouter, Query, HTTPException, BackgroundTasks
 from config.settings import load_config
 from database import SessionLocal
 from models import ActorProfile
-from services.actor_profile_service import _download_image
+from services.actor_profile_service import _download_image, is_image_content
 from utils.task_manager import task_manager
 
 logger = logging.getLogger("uvicorn")
@@ -693,6 +693,160 @@ def recover_missing_images():
         raise HTTPException(
             status_code=500,
             detail=f"极速恢复失败: {str(e)}",
+        )
+    finally:
+        db.close()
+
+
+# ================================================================
+# 一键清洗无效头像 — 根治「数据库有记录但物理文件丢失/损坏」的脏数据
+# ================================================================
+
+# 有效图片魔数签名 → 根治「HTML 错误页冒充图片」的假阳性。
+# douban 等 CDN 反爬时返回 ~1KB 的 HTML 错误页，_download_image 会原样
+# 落盘成 folder.jpg：文件"存在"且"非 0 字节"，但浏览器无法渲染成 <img>。
+_DEBUG_NAMES = {"洪顺昌", "许曦文"}  # 命中则逐项打印校验明细
+
+
+def _is_placeholder_path(value):
+    """排除占位符脏文本：None / 空串 / 纯空白 / 'None' / 'null'（忽略大小写）"""
+    if value is None:
+        return True
+    stripped = value.strip()
+    return stripped == "" or stripped.lower() in {"none", "null"}
+
+
+def _read_magic(path, length=16):
+    """读取文件头魔数；读取失败返回 None"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(length)
+    except OSError:
+        return None
+
+
+def _is_valid_image_file(path):
+    """物理文件深度校验 — 全部满足才算有效。
+
+    ① os.path.isfile：文件必须存在 且 是普通文件（拒绝目录冒充）
+    ② os.path.getsize > 0：0 字节/空文件必须清洗
+    ③ 文件头魔数确认为真实图片 (jpeg/png/webp/gif)：拒绝 HTML 错误页等
+       非图片内容（极小但魔数合法的文件是真实图片，会保留）
+
+    ★ 魔数判据与 _download_image 下载守卫共用 is_image_content，
+       保证「下载拒绝的内容」与「清洗判无效的内容」永远一致。
+
+    Returns:
+        (is_valid: bool, reason: str | None)  — reason 仅在无效时非空
+    """
+    if not os.path.isfile(path):
+        return False, "not_file"        # 不存在 / 目录 / 特殊文件
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False, "unreadable"      # 存在但不可读（权限/损坏）
+    if size == 0:
+        return False, "zero_byte"
+    head = _read_magic(path)
+    if head is None:
+        return False, "unreadable"
+    if not is_image_content(head):
+        return False, "invalid_content"  # HTML 错误页 / 其他非图片内容
+    return True, None
+
+
+@router.post("/actors/cleanup_images")
+def cleanup_broken_images():
+    """一键清洗无效头像 — 消除 DB 与物理文件之间的脏数据（加固版）。
+
+    此前的版本仅用 os.path.exists + 非 0 字节判断，产生「假阳性」：
+    CDN 反爬的 HTML 错误页被以 folder.jpg 落盘 → 存在且非 0 字节
+    → 判定有效，但前端 <img> 加载失败显示「缺头像」，名不副实。
+
+    本次加固校验维度（全部满足才算"有效"）:
+      1. local_image_path 非占位符（排除 "", "None", "null", 纯空白）
+      2. 物理文件存在 且 是普通文件 (os.path.isfile，拒绝目录冒充)
+      3. 文件大小 > 0 字节
+      4. 文件头魔数确认为真实图片 (jpeg/png/webp/gif)，拒绝 HTML 冒充
+
+    Returns:
+        {"status": "success", "total_checked": int, "cleaned_count": int,
+         "empty_file_count": int, "detail_by_reason": {reason: count},
+         "cleaned": [{name, path, reason}, ...]}
+    """
+    db = SessionLocal()
+    try:
+        actors = (
+            db.query(ActorProfile)
+            .filter(
+                ActorProfile.local_image_path.isnot(None),
+                ActorProfile.local_image_path != "",
+            )
+            .all()
+        )
+
+        total_checked = len(actors)
+        cleaned = []
+        by_reason = {}  # reason → 数量
+
+        for actor in actors:
+            raw_path = actor.local_image_path or ""
+            abs_path = os.path.join(PEOPLE_DIR, raw_path)
+
+            is_valid = False
+            if _is_placeholder_path(raw_path):
+                reason = "placeholder"          # ① 占位符脏文本
+            else:
+                is_valid, reason = _is_valid_image_file(abs_path)  # ②③④
+
+            # ★ 针对性 Debug 日志：洪顺昌 / 许曦文
+            if actor.name in _DEBUG_NAMES:
+                logger.info(
+                    "🔎 [CleanupImages][DEBUG] %s | db_path=%r | abs=%r | "
+                    "valid=%s reason=%s",
+                    actor.name, raw_path, abs_path, is_valid, reason,
+                )
+
+            if is_valid:
+                continue  # 真实图片，无需处理
+
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+            cleaned.append({
+                "name": actor.name,
+                "path": raw_path,
+                "reason": reason,
+            })
+
+            # ★ 清洗脏数据：图片字段 + 来源一起重置，等待下次穿透刷新重新抓取
+            actor.local_image_path = ""
+            actor.image_url = ""
+            actor.source = ""
+
+        db.commit()
+
+        cleaned_count = len(cleaned)
+        empty_file_count = by_reason.get("zero_byte", 0)
+        logger.info(
+            "🧹 [CleanupImages] 无效头像清洗完成: checked=%d cleaned=%d detail=%s",
+            total_checked, cleaned_count, by_reason,
+        )
+        return {
+            "status": "success",
+            "total_checked": total_checked,
+            "cleaned_count": cleaned_count,
+            "empty_file_count": empty_file_count,
+            "detail_by_reason": by_reason,
+            "cleaned": cleaned[:200],  # 控制响应体积，全量明细见服务端日志
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(
+            "❌ [CleanupImages] 清洗异常: %s\n%s",
+            e, traceback.format_exc(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"无效头像清洗失败: {str(e)}",
         )
     finally:
         db.close()

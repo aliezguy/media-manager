@@ -4,7 +4,7 @@ import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Search, RefreshRight, VideoCamera, Picture, Loading, VideoPlay, Download,
-  Tickets, DataAnalysis, MagicStick, Connection, Compass
+  Tickets, DataAnalysis, MagicStick, Connection, Compass, Close
 } from '@element-plus/icons-vue'
 
 // ==================== 类型定义 ====================
@@ -555,6 +555,20 @@ const getPosterUrl = (item: MediaItem) => {
   return config.emby_host + '/emby/Items/' + item.id + '/Images/Primary?api_key=' + config.emby_api_key
 }
 
+// ★ 头像 URL 归一化 — 修复局域网访问裂图：
+// 后端经 Vite 代理(changeOrigin)拼出的 local_image_url 是 http://127.0.0.1:8000/static_actors/...，
+// 手机等局域网设备访问该地址会指向设备自身 → 失败。改写为同源相对路径 /static_actors/...，
+// 由 Vite 代理 / 后端静态挂载转发，localhost 与局域网 IP 访问均正常。
+const resolveActorAvatar = (act: { local_image_url?: string; image_url?: string }) => {
+  const url = act.local_image_url || act.image_url
+  if (!url) return ''
+  // 指向本机回环地址的绝对 URL → 剥离协议+主机，保留路径交给同源代理
+  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//i.test(url)) {
+    return url.replace(/^https?:\/\/[^/]+/i, '')
+  }
+  return url
+}
+
 const getSyncTag = (item: MediaItem) => {
   if (!item.syncResult) return null
   if (item.syncResult.success) return '✓ 匹配 ' + item.syncResult.matched + '/' + item.syncResult.total_actors
@@ -883,7 +897,16 @@ onUnmounted(() => {
     </div>
 
     <!-- 分集数据透视抽屉 -->
-    <el-drawer v-model="detailsDrawerVisible" title="分集数据透视" direction="rtl" size="600px">
+    <el-drawer v-model="detailsDrawerVisible" title="分集数据透视" direction="rtl" size="600px" :close-on-click-modal="true" :close-on-press-escape="true" :show-close="false">
+      <!-- ★ 自定义头部插槽：完全掌控布局，彻底绕开 EP 默认关闭按钮的定位/样式问题 -->
+      <template #header="{ close }">
+        <div class="details-drawer-header">
+          <span class="details-drawer-title">分集数据透视</span>
+          <button type="button" class="details-drawer-close" aria-label="关闭" @click="close">
+            <el-icon :size="18"><Close /></el-icon>
+          </button>
+        </div>
+      </template>
       <div v-loading="detailsLoading" class="details-container">
         <!-- 剧集信息 -->
         <div v-if="detailsData.series" class="details-series-info">
@@ -902,7 +925,7 @@ onUnmounted(() => {
             <div v-for="(act, idx) in detailsData.series.actors" :key="'sa-' + idx" class="actor-avatar-item">
               <div class="actor-avatar-box" style="width:56px;height:56px">
                 <img v-if="act.local_image_url || act.image_url"
-                     :src="act.local_image_url || act.image_url"
+                     :src="resolveActorAvatar(act)"
                      referrerpolicy="no-referrer" class="actor-avatar-img" />
                 <span v-else class="actor-avatar-txt" style="font-size:22px">{{ act.name ? act.name.charAt(0) : '?' }}</span>
               </div>
@@ -929,7 +952,7 @@ onUnmounted(() => {
                     <div v-for="(act, idx) in ep.actors" :key="'epa-' + idx" class="actor-avatar-item">
                       <div class="actor-avatar-box" style="width:48px;height:48px">
                         <img v-if="act.local_image_url || act.image_url"
-                             :src="act.local_image_url || act.image_url"
+                             :src="resolveActorAvatar(act)"
                              referrerpolicy="no-referrer" class="actor-avatar-img" />
                         <span v-else class="actor-avatar-txt" style="font-size:18px">{{ act.name ? act.name.charAt(0) : '?' }}</span>
                       </div>
@@ -1045,7 +1068,7 @@ onUnmounted(() => {
     </el-dialog>
   </div>
 </template>
-<style scoped>
+<style scoped lang="postcss">
 /* ==================== 根容器 ==================== */
 .studio-root {
   min-height: 100vh;
@@ -1387,15 +1410,58 @@ onUnmounted(() => {
 .details-empty { text-align: center; padding: 40px 0; font-size: 13px; color: #475569; }
 
 /* 抽屉 / 折叠面板暗色覆盖 */
-:deep(.el-drawer) { background: #0F172A !important; }
-:deep(.el-drawer__header) {
-  color: #F1F5F9;
-  margin-bottom: 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-  padding-bottom: 14px;
+/* ★ 移动端适配：Element Plus drawer 无默认 max-width，固定 600px 会撑破手机视口。
+   min(600px, 90vw)：桌面保持 600px，手机端限制为视口 90%（rtl 抽屉锚定右侧，左侧留出遮罩可点击关闭） */
+:deep(.el-drawer) {
+  background: #0F172A !important;
+  max-width: min(600px, 90vw);
 }
-:deep(.el-drawer__close-btn) { color: #64748B; }
-:deep(.el-drawer__close-btn:hover) { color: #fff; }
+/* 同页面 el-dialog 同样加视口上限（500px 固定宽在手机端也会溢出） */
+:deep(.el-dialog) { max-width: 90vw; }
+/* ★ 自定义抽屉头部（#header 插槽）：Flex 布局 + 安全区域适配。
+   不再触碰 EP 默认关闭按钮（:show-close="false" 已屏蔽），布局完全由本容器掌控 */
+.details-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  /* 整个头部内容往下推，避开刘海屏 / 状态栏 / 浏览器顶部 UI；
+     相对旧版整体再下移 16px（非刘海 32px，刘海屏 = 安全区 + 16px），视觉更舒展 */
+  padding-top: max(32px, calc(env(safe-area-inset-top, 0px) + 16px));
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.details-drawer-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #F1F5F9;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.details-drawer-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 9999px;
+  border: none;
+  cursor: pointer;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.14);
+  transition: background-color 0.2s;
+  -webkit-tap-highlight-color: transparent;
+}
+.details-drawer-close:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+.details-drawer-close:active {
+  transform: scale(0.92);
+}
 :deep(.el-collapse-item__header) {
   background: rgba(255, 255, 255, 0.03);
   border-color: rgba(255, 255, 255, 0.06);

@@ -204,6 +204,8 @@ class ActorProfile(Base):
     birth_date = Column(String)
     birth_place = Column(String)
     overview = Column(Text)
+    confidence_level = Column(Integer, default=0)     # 中文名译名置信度: 4官方 / 3AI / 5手动
+    translation_source = Column(String, default="")   # "official" / "ai_llm" / "manual"
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
@@ -221,4 +223,6 @@ class ActorRecord(Base):
     role = Column(String)
     type = Column(String, nullable=False, default="Actor")
     sort_order = Column(Integer, default=0)
+    confidence_level = Column(Integer, default=0)     # 角色译名置信度: 4官方 / 3AI / 5手动
+    translation_source = Column(String, default="")   # 角色译名来源
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)

@@ -858,7 +858,7 @@ onMounted(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="postcss">
 /* ==================== 页面根容器 ==================== */
 .scheduler-root {
   padding: 20px 24px;

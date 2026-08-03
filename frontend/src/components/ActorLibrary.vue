@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { Search, Refresh, PictureFilled, MagicStick } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
+import { Search, Refresh, PictureFilled, MagicStick, User, Brush } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 // 演员信息（后端 /api/actors 返回项）
 interface Actor {
   name: string
   local_image_path?: string
   image_url?: string
-  tmdb_id?: number
+  tmdb_id?: number | string
   douban_celebrity_id?: number | string
   overview?: string
   birth_date?: string
@@ -35,6 +35,13 @@ const repairTaskPercent = ref(0)
 const repairTaskMessage = ref('')
 const repairTaskDone = ref(false)
 let _repairTimer: ReturnType<typeof setInterval> | null = null
+
+// ==================== 无效头像清洗状态 ====================
+const cleanupLoading = ref(false) // 校验/清理无效头像 进行中
+
+// ==================== 图片加载失败集合 ====================
+// 加载失败的演员名 → 从「头像」降级为「科技缺省图」
+const brokenImages = reactive(new Set<string>())
 
 // ==================== 筛选选项 ====================
 const filterOptions = [
@@ -65,6 +72,7 @@ const fetchActors = async () => {
     const data = await res.json()
     actors.value = data.items || []
     total.value = data.total || 0
+    brokenImages.clear() // 新数据到达 → 允许之前裂图重试加载
   } catch (e) {
     ElMessage.error('获取演员列表失败: ' + (e instanceof Error ? e.message : String(e)))
     actors.value = []
@@ -177,17 +185,53 @@ const handleRepairMissing = async () => {
   }
 }
 
-// ==================== 图片 URL 拼接 + 防裂兜底 ====================
-// 兜底占位图（Element Plus 内置灰底占位）
-const FALLBACK_AVATAR = 'data:image/svg+xml,' + encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" width="280" height="280" fill="%231e293b">' +
-  '<rect width="280" height="280" fill="%23111827"/>' +
-  '<circle cx="140" cy="110" r="40" fill="%23334155"/>' +
-  '<ellipse cx="140" cy="190" rx="65" ry="40" fill="%23334155"/>' +
-  '<text x="140" y="260" text-anchor="middle" fill="%2364748b" font-size="13" font-family="sans-serif">暂无头像</text>' +
-  '</svg>'
-)
+// ==================== 一键清洗无效头像 ====================
+const handleCleanupImages = async () => {
+  if (cleanupLoading.value) return
+  // 深色二次确认弹窗
+  try {
+    await ElMessageBox.confirm(
+      '将扫描全部演员的本地头像文件，<br/>对「数据库有记录但物理文件已丢失 / 空文件」的脏数据进行清除。<br/><span style="color:#fbbf24">此操作不可撤销，清除后相关演员将进入「待更新」状态。</span>',
+      '⚠️ 校验 / 清理无效头像',
+      {
+        confirmButtonText: '确认清洗',
+        cancelButtonText: '取消',
+        type: 'warning',
+        dangerouslyUseHTMLString: true,
+        customClass: 'cleanup-confirm',
+        confirmButtonClass: 'el-button--danger',
+      }
+    )
+  } catch {
+    return // 用户取消
+  }
 
+  cleanupLoading.value = true
+  try {
+    const res = await fetch('/api/actors/cleanup_images', { method: 'POST' })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+      throw new Error(err.detail || `HTTP ${res.status}`)
+    }
+    const data = await res.json()
+    if (data.cleaned_count > 0) {
+      ElMessage.warning(
+        `已清洗 ${data.cleaned_count} 条无效头像` +
+        (data.empty_file_count ? `（含 ${data.empty_file_count} 个空文件）` : '') +
+        `，共检查 ${data.total_checked} 位演员`
+      )
+    } else {
+      ElMessage.success(`共检查 ${data.total_checked} 位演员，头像全部有效 ✅`)
+    }
+    await fetchActors() // 刷新列表 → brokenImages 清空 → 裂图重试 / 标签复位
+  } catch (e) {
+    ElMessage.error(`清洗失败: ${e instanceof Error ? e.message : String(e)}`)
+  } finally {
+    cleanupLoading.value = false
+  }
+}
+
+// ==================== 图片 URL 拼接 + 高科技缺省图 ====================
 const getAvatarUrl = (actor: Actor) => {
   // L1: 本地图片 — 代理转发到 FastAPI /people 静态目录
   if (actor.local_image_path) {
@@ -197,35 +241,55 @@ const getAvatarUrl = (actor: Actor) => {
   if (actor.image_url) {
     return actor.image_url
   }
-  // L3: 内联 SVG 兜底（无网络依赖，永不裂图）
-  return FALLBACK_AVATAR
+  // L3: 无任何图片源 → 渲染科技缺省图
+  return ''
 }
 
-const handleImageError = (e: Event) => {
-  // 图片加载失败（404/跨域/超时）→ 静默降级为内联占位图
-  const img = e.target as HTMLImageElement
-  if (img.src !== FALLBACK_AVATAR) {
-    img.src = FALLBACK_AVATAR
-  }
+// 是否有可用头像：有图片来源 且 未加载失败
+const hasAvatar = (actor: Actor) => {
+  if (brokenImages.has(actor.name)) return false
+  return !!(actor.local_image_path || actor.image_url)
 }
 
+// 图片加载失败（404/跨域/超时）→ 降级为科技缺省图
+const handleImageError = (name: string) => {
+  brokenImages.add(name)
+}
+
+// 本地是否有已下载的头像文件
 const hasLocalImage = (actor: Actor) => {
   return !!(actor.local_image_path && actor.local_image_path.trim() !== '')
 }
 
-// ==================== 格式化工具 ====================
-const formatDate = (isoString: string) => {
-  if (!isoString) return ''
-  const d = new Date(isoString)
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
+// 是否有可用的图片来源（本地路径 或 外部直链）
+const hasImageSource = (actor: Actor) => {
+  return !!(actor.local_image_path || actor.image_url)
 }
 
-const trimOverview = (text: string, maxLen = 120) => {
-  if (!text) return ''
-  return text.length > maxLen ? text.slice(0, maxLen) + '…' : text
+// 状态药丸三态: has(本地已存·绿) / broken(缺头像·黄) / no(需更新·红)
+// 只有当 图片来源有效 && 图片加载成功 && 本地文件真实存在 时才允许显示「本地已存」
+const pillState = (actor: Actor): 'has' | 'broken' | 'no' => {
+  // 无任何图片来源 → 需更新
+  if (!hasImageSource(actor)) return 'no'
+  // 图片加载失败 (404/跨域/超时) → 立刻剥夺「本地已存」，降级为「缺头像」
+  if (brokenImages.has(actor.name)) return 'broken'
+  // 唯一允许显示「本地已存」的场景
+  return hasLocalImage(actor) ? 'has' : 'no'
+}
+
+const pillLabel = (actor: Actor) => {
+  const s = pillState(actor)
+  if (s === 'has') return '本地已存'
+  if (s === 'broken') return '缺头像'
+  return '需更新'
+}
+
+// ==================== 底部信息排版 ====================
+// 左侧 ID 主标识：TMDB → 豆瓣；无 ID 时留空（由 v-if 隐藏）
+const idLabel = (actor: Actor) => {
+  if (actor.tmdb_id) return `TMDB ${actor.tmdb_id}`
+  if (actor.douban_celebrity_id) return `豆瓣 ${actor.douban_celebrity_id}`
+  return ''
 }
 
 // ==================== 生命周期 ====================
@@ -269,14 +333,28 @@ onUnmounted(() => {
       </div>
 
       <div class="bar-right">
-        <el-button
-          type="warning"
-          :icon="MagicStick"
-          :loading="repairing"
+        <!-- 校验/清理无效头像 — 危险警示色幽灵按钮 -->
+        <button
+          class="cleanup-btn"
+          :disabled="cleanupLoading"
+          @click="handleCleanupImages"
+        >
+          <el-icon :class="{ 'is-spinning': cleanupLoading }">
+            <Brush />
+          </el-icon>
+          {{ cleanupLoading ? '清洗中...' : '校验/清理无效头像' }}
+        </button>
+
+        <button
+          class="repair-btn"
+          :disabled="repairing"
           @click="handleRepairMissing"
         >
-          一键修复空数据
-        </el-button>
+          <el-icon :class="{ 'is-spinning': repairing }">
+            <MagicStick />
+          </el-icon>
+          {{ repairing ? '修复中...' : '一键修复空数据' }}
+        </button>
         <span class="total-hint">
           共 <strong>{{ total }}</strong> 位演员
         </span>
@@ -292,91 +370,85 @@ onUnmounted(() => {
             :key="actor.name"
             class="actor-card"
           >
-            <!-- 刷新按钮（右上角悬浮） -->
-            <el-tooltip content="强制刷新演员信息" placement="top">
-              <el-button
-                class="refresh-btn"
-                circle
-                size="small"
-                :icon="Refresh"
-                :loading="refreshingActor === actor.name"
-                @click.stop="refreshActor(actor.name)"
-              />
-            </el-tooltip>
+            <!-- 头像区：完美 2:3 肖像比例 -->
+            <div class="avatar-area">
+              <!-- 刷新按钮（右上角悬浮） -->
+              <el-tooltip content="强制刷新演员信息" placement="top">
+                <button
+                  class="refresh-btn"
+                  :disabled="refreshingActor === actor.name"
+                  @click.stop="refreshActor(actor.name)"
+                >
+                  <el-icon :class="{ 'is-spinning': refreshingActor === actor.name }">
+                    <Refresh />
+                  </el-icon>
+                </button>
+              </el-tooltip>
 
-            <!-- 头像容器 -->
-            <div class="avatar-container">
+              <!-- 状态药丸（左上角发光）：三态联动
+                   has    → 图片来源有效 + 加载成功 + 本地文件真实存在 → 「本地已存」(绿)
+                   broken → 图片加载失败 (404/跨域/超时) → 「缺头像」(黄·警示)
+                   no     → 无任何图片来源 → 「需更新」(红) -->
+              <span
+                class="status-pill"
+                :class="`status-${pillState(actor)}`"
+              >
+                <span class="status-dot"></span>
+                {{ pillLabel(actor) }}
+              </span>
+
+              <!-- 有图：真实头像 -->
               <img
+                v-if="hasAvatar(actor)"
                 :src="getAvatarUrl(actor)"
                 :alt="actor.name"
                 class="avatar-img"
                 loading="lazy"
                 referrerpolicy="no-referrer"
-                @error="handleImageError"
+                @error="handleImageError(actor.name)"
               />
 
-              <!-- 状态徽章（左上角磨砂玻璃） -->
-              <el-tag
-                class="status-badge"
-                :class="hasLocalImage(actor) ? 'status-has' : 'status-no'"
-                size="small"
-                effect="dark"
-              >
-                {{ hasLocalImage(actor) ? '本地已存' : '需更新' }}
-              </el-tag>
+              <!-- 无图 / 加载失败：科技缺省图 -->
+              <div v-else class="avatar-fallback">
+                <el-icon :size="48" class="fallback-icon">
+                  <User />
+                </el-icon>
+                <span class="fallback-text">NO IMAGE DATA</span>
+              </div>
+
+              <!-- 底部融合遮罩：图片平滑过渡到文字区 -->
+              <div class="avatar-mask"></div>
             </div>
 
-            <!-- 信息区域 -->
+            <!-- 信息区：微排版四层结构，所有卡片高度绝对一致 -->
             <div class="info-section">
-              <!-- 姓名 -->
+              <!-- 第一层：演员名 -->
               <div class="actor-name" :title="actor.name">{{ actor.name }}</div>
 
-              <!-- ID 徽章行 -->
-              <div class="id-badges">
-                <el-tag
-                  v-if="actor.tmdb_id"
-                  size="small"
-                  type="info"
-                  class="id-tag"
-                >
-                  TMDB {{ actor.tmdb_id }}
-                </el-tag>
-                <el-tag
-                  v-if="actor.douban_celebrity_id"
-                  size="small"
-                  class="id-tag douban-tag"
-                >
-                  豆瓣 {{ actor.douban_celebrity_id }}
-                </el-tag>
-                <span
-                  v-if="!actor.tmdb_id && !actor.douban_celebrity_id"
-                  class="no-id-hint"
-                >
-                  暂无 ID
-                </span>
-              </div>
+              <!-- 第二层：元数据 Meta（生日 & 出生地，v-if 条件拼接） -->
+              <p
+                v-if="actor.birth_date || actor.birth_place"
+                class="actor-meta"
+                :title="[actor.birth_date, actor.birth_place].filter(Boolean).join(' · ')"
+              >
+                <template v-if="actor.birth_date">{{ actor.birth_date }}</template>
+                <template v-if="actor.birth_date && actor.birth_place"> · </template>
+                <template v-if="actor.birth_place">{{ actor.birth_place }}</template>
+              </p>
 
-              <!-- 简介 -->
-              <div class="overview-text" v-if="actor.overview">
-                {{ trimOverview(actor.overview) }}
-              </div>
+              <!-- 第三层：人物简介（无数据直接留空，绝不显示刺眼占位文案） -->
+              <p
+                v-if="actor.overview"
+                class="actor-bio"
+                :title="actor.overview"
+              >
+                {{ actor.overview }}
+              </p>
 
-              <!-- 底部 Meta -->
+              <!-- 尾部沉底：ID + 来源（mt-auto 永远贴底） -->
               <div class="meta-row">
-                <span v-if="actor.birth_date" class="meta-item">
-                  🎂 {{ actor.birth_date }}
-                </span>
-                <span v-if="actor.birth_place" class="meta-item">
-                  📍 {{ actor.birth_place }}
-                </span>
-              </div>
-              <div class="meta-row meta-update" v-if="actor.update_time">
-                <span class="update-time">
-                  更新于 {{ formatDate(actor.update_time) }}
-                </span>
-                <span v-if="actor.source" class="source-badge">
-                  {{ actor.source }}
-                </span>
+                <span v-if="idLabel(actor)" class="meta-id" :title="idLabel(actor)">{{ idLabel(actor) }}</span>
+                <span v-if="actor.source" class="source-tag">{{ actor.source }}</span>
               </div>
             </div>
           </div>
@@ -436,7 +508,7 @@ onUnmounted(() => {
   </div>
 </template>
 
-<style scoped>
+<style scoped lang="postcss">
 /* ==================== 容器 ==================== */
 .actor-library {
   padding: 20px;
@@ -444,308 +516,266 @@ onUnmounted(() => {
   background-color: var(--bg-primary);
 }
 
-/* ==================== 顶部操作栏 ==================== */
+/* ==================== 顶部操作栏 — 毛玻璃 ==================== */
 .top-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-  margin-bottom: 24px;
-  padding: 16px 20px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  @apply flex items-center justify-between flex-wrap gap-3 mb-6 p-4
+    rounded-2xl bg-[#0F172A]/40 border border-white/5 backdrop-blur-xl;
 }
 
 .bar-left {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  flex: 1;
+  @apply flex items-center gap-3 flex-wrap flex-1;
 }
 
 .bar-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
+  @apply flex items-center gap-3 flex-wrap;
 }
 
+/* 搜索框 — 电光蓝发光 Input */
 .search-input {
-  width: 280px;
+  width: 260px;
+}
+.search-input :deep(.el-input__wrapper) {
+  box-shadow: 0 0 0 1px var(--border-color) !important;
+  transition: box-shadow 0.2s ease;
+}
+.search-input :deep(.el-input__wrapper:hover) {
+  box-shadow: 0 0 0 1px var(--text-tertiary) !important;
+}
+.search-input :deep(.el-input__wrapper.is-focus) {
+  box-shadow: 0 0 0 1px var(--accent-blue), 0 0 12px rgba(59, 130, 246, 0.35) !important;
 }
 
 .filter-select {
-  width: 140px;
+  width: 132px;
+}
+
+/* 「校验/清理无效头像」— 危险警示感高科技幽灵按钮 */
+.cleanup-btn {
+  @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg
+    bg-yellow-500/10 text-yellow-500 border border-yellow-500/30
+    hover:bg-yellow-500/20 hover:shadow-[0_0_15px_rgba(234,179,8,0.2)]
+    transition-all font-medium text-sm cursor-pointer;
+}
+.cleanup-btn:disabled {
+  @apply opacity-60 cursor-not-allowed;
+}
+
+/* 「一键修复空数据」— 高级警示色幽灵按钮 */
+.repair-btn {
+  @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg
+    bg-yellow-500/10 text-yellow-500 border border-yellow-500/30
+    hover:bg-yellow-500/20 hover:shadow-[0_0_10px_rgba(234,179,8,0.2)]
+    transition-all cursor-pointer;
+}
+.repair-btn:disabled {
+  @apply opacity-60 cursor-not-allowed;
 }
 
 .total-hint {
-  color: var(--text-tertiary);
-  font-size: 13px;
-  white-space: nowrap;
+  @apply text-slate-500 text-[13px] whitespace-nowrap;
 }
-
 .total-hint strong {
-  color: var(--accent-blue);
-  font-weight: 700;
+  @apply text-blue-400 font-bold;
 }
 
-/* ==================== 卡片网格 ==================== */
+/* ==================== 卡片网格 — 呼吸感响应式 ==================== */
 .card-grid-wrapper {
   min-height: 400px;
 }
 
 .card-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
-  gap: 20px;
+  @apply grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-6 gap-6;
 }
 
-/* ==================== 单张卡片 ==================== */
+/* ==================== 单张卡片 — 毛玻璃全息 ==================== */
 .actor-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  overflow: hidden;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
-  position: relative;
+  @apply flex flex-col bg-[#0F172A]/60 border border-white/5 backdrop-blur-xl rounded-2xl
+    overflow-hidden shadow-lg hover:shadow-blue-900/20 hover:-translate-y-1
+    hover:border-blue-500/30 transition-all duration-300 cursor-pointer;
 }
 
-.actor-card:hover {
-  transform: translateY(-4px);
-  box-shadow: var(--shadow-lg);
-  border-color: var(--text-tertiary);
-}
-
-/* ---- 刷新按钮（右上角悬浮） ---- */
+/* ---- 刷新按钮（右上角悬浮毛玻璃） ---- */
 .refresh-btn {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 10;
-  /* 磨砂玻璃底 */
-  background: rgba(15, 23, 42, 0.65) !important;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.12) !important;
-  color: #cbd5e1 !important;
-  width: 32px;
-  height: 32px;
-  opacity: 0;
-  transform: translateY(-4px);
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  @apply absolute top-2 right-2 z-10 inline-flex items-center justify-center
+    w-8 h-8 rounded-full bg-slate-900/60 border border-white/10 text-slate-300
+    backdrop-blur-md opacity-0 -translate-y-1 transition-all duration-200 cursor-pointer;
 }
-
 .actor-card:hover .refresh-btn {
-  opacity: 1;
-  transform: translateY(0);
+  @apply opacity-100 translate-y-0;
 }
-
 .refresh-btn:hover {
-  background: var(--accent-blue) !important;
-  border-color: var(--accent-blue) !important;
-  color: #fff !important;
+  @apply bg-blue-500/20 border-blue-500/40 text-blue-300;
+}
+.refresh-btn:disabled {
+  @apply opacity-100 translate-y-0 cursor-wait;
 }
 
-/* ---- 头像区 ---- */
-.avatar-container {
-  height: 280px;
-  width: 100%;
-  position: relative;
-  background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-  overflow: hidden;
+/* ---- 状态药丸（左上角发光） ---- */
+.status-pill {
+  @apply absolute top-2 left-2 z-10 inline-flex items-center gap-1.5
+    px-2 py-0.5 rounded-full text-[10px] font-medium backdrop-blur-md;
+}
+.status-has {
+  @apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/20;
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.12);
+}
+.status-no {
+  @apply bg-red-500/10 text-red-400 border border-red-500/20;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.14);
+}
+/* 缺头像 — 图片加载失败 (警告黄) */
+.status-broken {
+  @apply bg-amber-500/10 text-amber-400 border border-amber-500/25;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.16);
+}
+.status-dot {
+  @apply w-1 h-1 rounded-full;
+}
+.status-has .status-dot {
+  @apply bg-emerald-400;
+  box-shadow: 0 0 6px rgba(52, 211, 153, 0.8);
+}
+.status-no .status-dot {
+  @apply bg-red-400;
+  box-shadow: 0 0 6px rgba(248, 113, 113, 0.8);
+}
+.status-broken .status-dot {
+  @apply bg-amber-400;
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.8);
+}
+
+/* ---- 头像区：完美 2:3 肖像比例 ---- */
+.avatar-area {
+  @apply relative w-full overflow-hidden
+    bg-gradient-to-b from-[#1E293B] to-[#0B1120];
 }
 
 .avatar-img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  transition: transform 0.3s ease;
+  @apply w-full aspect-[2/3] object-cover object-center;
+  display: block;
+  transition: transform 0.45s cubic-bezier(0.4, 0, 0.2, 1);
 }
-
 .actor-card:hover .avatar-img {
-  transform: scale(1.04);
+  transform: scale(1.05);
 }
 
-/* 缺省占位 */
-.avatar-placeholder {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  color: var(--text-tertiary);
-  font-size: 13px;
+/* 高科技缺省图 — 微弱呼吸 User 图标 + 极客字体 */
+.avatar-fallback {
+  @apply w-full aspect-[2/3] flex flex-col items-center justify-center
+    bg-gradient-to-b from-[#1E293B] to-[#0B1120];
+}
+.fallback-icon {
+  @apply text-slate-600 animate-pulse;
+}
+.fallback-text {
+  @apply text-slate-600 font-hud text-[9px] tracking-[0.3em] mt-3 select-none;
 }
 
-/* ---- 状态徽章（左上角磨砂玻璃） ---- */
-.status-badge {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  font-size: 11px;
-  font-weight: 600;
-  padding: 4px 10px;
-  height: auto;
-  line-height: 1.4;
-  letter-spacing: 0.3px;
+/* 底部融合遮罩：图片平滑过渡到下方文字区 */
+.avatar-mask {
+  @apply absolute bottom-0 inset-x-0 h-1/3
+    bg-gradient-to-t from-[#0F172A]/60 to-transparent pointer-events-none;
 }
 
-.status-has {
-  background: rgba(16, 185, 129, 0.25) !important;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid rgba(16, 185, 129, 0.4) !important;
-  color: #6ee7b7 !important;
-}
-
-.status-no {
-  background: rgba(239, 68, 68, 0.25) !important;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid rgba(239, 68, 68, 0.4) !important;
-  color: #fca5a5 !important;
-}
-
-/* ---- 信息区 ---- */
+/* ---- 信息区 — Flex 弹性重组，绝对等高 ---- */
 .info-section {
-  padding: 14px 16px 16px;
+  @apply flex flex-col p-3 flex-1 overflow-hidden;
 }
 
+/* 第一层：演员名 */
 .actor-name {
-  font-size: 16px;
-  font-weight: 700;
-  color: var(--text-primary);
-  margin-bottom: 8px;
-  line-height: 1.3;
-  /* 单行溢出省略 */
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  @apply text-white text-[15px] font-bold tracking-wide truncate;
 }
 
-.id-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 10px;
-  min-height: 22px;
-  align-items: center;
+/* 第二层：元数据 Meta（生日 & 出生地）— 极致收敛 */
+.actor-meta {
+  @apply text-slate-500 text-[10px] font-mono truncate mt-0.5;
 }
 
-.id-tag {
-  font-size: 11px;
-  padding: 0 8px;
-  height: 20px;
-  line-height: 20px;
+/* 第三层：人物简介 — 6 行扩容 + 呼吸感（行高拉距/字号压低/对比度减弱，消解文本压迫） */
+.actor-bio {
+  @apply text-slate-400/80 text-[11px] leading-relaxed mt-2.5 mb-1 line-clamp-[6];
 }
 
-.douban-tag {
-  background: rgba(7, 193, 96, 0.12) !important;
-  border-color: rgba(7, 193, 96, 0.3) !important;
-  color: #5ecc82 !important;
-}
-
-.no-id-hint {
-  font-size: 12px;
-  color: var(--text-tertiary);
-  font-style: italic;
-}
-
-/* 简介 — 两行截断 */
-.overview-text {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--text-tertiary);
-  margin-bottom: 12px;
-  min-height: 39px;
-}
-
-/* 底部 Meta */
+/* 尾部沉底：mt-auto 自动推开上方空间 → 即使无简介也死死钉在卡片最底部 */
 .meta-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-  font-size: 12px;
-  color: var(--text-tertiary);
+  @apply mt-auto pt-2.5 pb-0.5 flex items-center justify-between gap-2 border-t border-white/5;
 }
 
-.meta-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
+/* 底部左侧：ID */
+.meta-id {
+  @apply text-slate-600 text-[9px] font-mono truncate;
 }
 
-.meta-update {
-  margin-top: 6px;
-  justify-content: space-between;
-}
-
-.update-time {
-  color: var(--text-tertiary);
-  font-size: 11px;
-}
-
-.source-badge {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: var(--accent-blue-soft);
-  color: var(--accent-blue);
-  font-weight: 600;
+/* 底部右侧：来源 — 微型发光药丸 */
+.source-tag {
+  @apply text-blue-400 text-[8px] font-mono uppercase px-1.5 py-0.5 rounded
+    border border-blue-500/20 bg-blue-500/10 shrink-0;
 }
 
 /* ==================== 空状态 ==================== */
 .empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 80px 20px;
-  color: var(--text-tertiary);
-  gap: 12px;
+  @apply flex flex-col items-center justify-center gap-3 py-20 text-slate-500;
 }
-
 .empty-state p {
-  font-size: 15px;
-  text-align: center;
-  line-height: 1.6;
+  @apply text-[15px] text-center leading-6;
 }
-
 .empty-state strong {
-  color: var(--text-primary);
+  @apply text-slate-200;
 }
 
 /* ==================== 批量修复进度对话框 ==================== */
 .repair-dialog-body {
-  padding: 8px 0;
+  @apply py-2;
+}
+.repair-message {
+  @apply text-slate-300 text-sm mb-4 leading-relaxed min-h-[42px];
 }
 
-.repair-message {
-  color: var(--text-secondary);
-  font-size: 14px;
-  margin-bottom: 16px;
-  line-height: 1.5;
-  min-height: 42px;
+/* ==================== 清洗确认弹窗 — 深色科技风 ====================
+   ElMessageBox teleport 到 body，scoped 样式需 :global 穿透 */
+:global(.cleanup-confirm) {
+  @apply rounded-xl border border-white/10;
+  background: rgba(15, 23, 42, 0.97) !important;
+  box-shadow: 0 0 30px rgba(234, 179, 8, 0.08);
+}
+:global(.cleanup-confirm .el-message-box__title) {
+  @apply text-amber-400 font-bold;
+}
+:global(.cleanup-confirm .el-message-box__content) {
+  @apply text-slate-300 text-sm leading-relaxed;
+}
+:global(.cleanup-confirm .el-message-box__btns .el-button--cancel) {
+  @apply text-slate-400 bg-white/5 border border-white/10 hover:bg-white/10;
 }
 
 /* ==================== 分页栏 ==================== */
 .pagination-bar {
-  display: flex;
-  justify-content: center;
-  margin-top: 28px;
-  padding: 16px 0;
+  @apply flex justify-center mt-7 pt-4;
+}
+
+/* ---- 分页器黑化 — 融入暗黑科技风 ---- */
+.pagination-bar :deep(.el-pagination button),
+.pagination-bar :deep(.el-pagination .el-pager li) {
+  @apply bg-transparent text-slate-400 rounded-md transition-colors;
+}
+.pagination-bar :deep(.el-pagination .el-pager li.is-active) {
+  @apply bg-blue-600 text-white shadow-[0_0_8px_rgba(59,130,246,0.5)];
+}
+.pagination-bar :deep(.el-pagination .el-pager li:hover:not(.is-active)),
+.pagination-bar :deep(.el-pagination button:hover:not(:disabled)) {
+  @apply bg-blue-500/10 text-blue-400;
+}
+.pagination-bar :deep(.el-pagination button:disabled) {
+  @apply bg-transparent text-slate-600;
+}
+
+/* ==================== 图标旋转 ==================== */
+.is-spinning {
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 /* ==================== 响应式 ==================== */
@@ -755,14 +785,11 @@ onUnmounted(() => {
   }
 
   .top-bar {
-    padding: 12px;
-    flex-direction: column;
-    align-items: stretch;
+    @apply p-3 flex-col items-stretch;
   }
 
   .bar-left {
-    flex-direction: column;
-    width: 100%;
+    @apply flex-col w-full;
   }
 
   .search-input {
@@ -774,24 +801,11 @@ onUnmounted(() => {
   }
 
   .bar-right {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .card-grid {
-    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-    gap: 12px;
-  }
-
-  .avatar-container {
-    height: 220px;
+    @apply justify-center;
   }
 
   .actor-name {
-    font-size: 14px;
+    @apply text-sm;
   }
 }
 </style>

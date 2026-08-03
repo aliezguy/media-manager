@@ -218,6 +218,9 @@ def save_media_to_db(
                     role=role,
                     type=person_type,
                     sort_order=idx,
+                    # ★ 角色译名来源与置信度（由汉化链路写入 person 私有键）
+                    confidence_level=p.get("_cn_role_conf") or 0,
+                    translation_source=p.get("_cn_role_src") or "",
                 ))
 
     except Exception:

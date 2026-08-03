@@ -597,6 +597,32 @@ def fetch_tmdb_person_details(
 # 图片下载器
 # ==========================================
 
+# 有效图片魔数签名 — 下载守卫与清洗脚本共用的唯一判据。
+# 只认魔数，不依赖 Content-Type 头（CDN 可能省略或谎报）。
+_IMAGE_MAGIC_CHECKS = (
+    (b"\xff\xd8\xff", "jpeg"),               # JFIF/EXIF
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"RIFF", "webp"),                        # 需二次验 RIFF....WEBP
+    (b"GIF8", "gif"),
+)
+
+
+def is_image_content(content: bytes) -> bool:
+    """校验响应体是否确为真实图片。
+
+    根治「CDN 反爬返回 HTML 错误页却被落盘成 folder.jpg」的脏数据源头：
+    反爬页通常是 ~1KB 的 HTML 文本，魔数校验会直接判负，拒绝落盘。
+    """
+    if not content or len(content) < 4:
+        return False
+    for magic, _name in _IMAGE_MAGIC_CHECKS:
+        if content.startswith(magic):
+            if magic == b"RIFF":
+                return content[8:12] == b"WEBP"
+            return True
+    return False
+
+
 def _download_image(url: str, save_path: str, connect_timeout: float = 10.0, read_timeout: float = 30.0) -> bool:
     """下载图片到本地，带伪装 UA 和自定义超时保护。
 
@@ -609,7 +635,8 @@ def _download_image(url: str, save_path: str, connect_timeout: float = 10.0, rea
         read_timeout:    读取超时秒数（默认 30.0，L0.5 熔断用 3.0）
 
     Returns:
-        True 当文件成功写入且大小 > 0。
+        True 当下载内容经魔数校验确认为真实图片且成功写入。
+        False 当网络失败 / 非 200 / 空内容 / 非图片内容（如 CDN 反爬 HTML 页）。
     """
     if not url:
         return False
@@ -633,15 +660,20 @@ def _download_image(url: str, save_path: str, connect_timeout: float = 10.0, rea
                 follow_redirects=True,
             ) as client:
                 resp = client.get(url)
-                if resp.status_code == 200 and len(resp.content) > 0:
+                content = resp.content
+                if (
+                    resp.status_code == 200
+                    and len(content) > 0
+                    and is_image_content(content)   # ★ 魔数守卫：拒绝 HTML 冒充
+                ):
                     with open(save_path, "wb") as f:
-                        f.write(resp.content)
+                        f.write(content)
                     logger.info("   💾 [Profile] 下载成功 (httpx): %s", save_path)
                     return True
                 else:
                     logger.warning(
-                        "   ⚠ [Profile] httpx 下载失败 HTTP %d: %s",
-                        resp.status_code, url[:80],
+                        "   ⚠ [Profile] httpx 下载失败 HTTP %d / 非图片内容 %d bytes: %s",
+                        resp.status_code, len(content), url[:80],
                     )
         except ImportError:
             pass
@@ -657,15 +689,20 @@ def _download_image(url: str, save_path: str, connect_timeout: float = 10.0, rea
             headers=_DOWNLOAD_HEADERS,
             timeout=(connect_timeout, read_timeout),  # (connect_timeout, read_timeout)
         )
-        if resp.status_code == 200 and len(resp.content) > 0:
+        content = resp.content
+        if (
+            resp.status_code == 200
+            and len(content) > 0
+            and is_image_content(content)   # ★ 魔数守卫：拒绝 HTML 冒充
+        ):
             with open(save_path, "wb") as f:
-                f.write(resp.content)
+                f.write(content)
             logger.info("   💾 [Profile] 下载成功 (requests): %s", save_path)
             return True
 
         logger.warning(
-            "   ⚠ [Profile] 下载失败 HTTP %d: %s",
-            resp.status_code, url[:80],
+            "   ⚠ [Profile] 下载失败 HTTP %d / 非图片内容 %d bytes: %s",
+            resp.status_code, len(content), url[:80],
         )
         return False
 
