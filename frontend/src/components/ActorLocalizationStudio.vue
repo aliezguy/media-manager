@@ -913,7 +913,7 @@ onUnmounted(() => {
           <h3 class="details-series-title">{{ detailsData.series.title }}</h3>
           <p class="details-series-overview">{{ detailsData.series.overview || '暂无简介' }}</p>
           <div class="details-series-meta">
-            <span>共 {{ detailsData.series.recursive_item_count || detailsData.episodes.length }} 个子项</span>
+            <span>共 {{ detailsData.episodes.length || detailsData.series.recursive_item_count }} 个子项</span>
             <span v-if="detailsData.series.actors.length">常驻演员 {{ detailsData.series.actors.length }} 人</span>
           </div>
         </div>

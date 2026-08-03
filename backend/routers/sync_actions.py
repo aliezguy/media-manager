@@ -577,6 +577,14 @@ def _audit_and_save_single_item(
                         max_actors=max_actors,
                     )
 
+        # ★ 用实际入库分集数刷新父 Series 计数（不信任 stale RecursiveItemCount）
+        if item_type == "Series" and episodes_processed > 0:
+            series_mm = db.query(MediaMetadata).filter(
+                MediaMetadata.emby_item_id == item_id
+            ).first()
+            if series_mm:
+                series_mm.recursive_item_count = episodes_processed
+
         db.flush()
         return {
             "synced": is_synced,
