@@ -52,6 +52,13 @@ DEFAULT_CONFIG = {
     # 演职员中文化 — 每个媒体最大入库演员数（抓取全量，回写截断）
     "max_actors_per_media": 50,
 
+    # ★ 请求预算（P3 豆瓣请求治理）— 进程级每 Provider 令牌桶上限
+    "request_budget": {
+        "douban_per_series": 30,
+        "tmdb_per_min": 60,
+        "emby_writeback_per_series": 50,
+    },
+
     # ★ 汉化/审计可配置定时任务（next_run_at 由后端动态计算，不落盘）
     #   library_ids: 选中的媒体库 ID 列表（多选），执行时逐个串行
     "localization_job": {
