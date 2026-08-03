@@ -1522,6 +1522,11 @@ def _fetch_episodes_light(host: str, api_key: str, user_id: str,
     - 不请求 People / ProviderIds / Overview 等大字段
     - 仅拿到 Emby Episode ID + 集号 + 季号，用于创建 MediaMetadata 锚点
     - 后续所有富化数据（简介、客串演员）由 TMDB Season API 提供
+
+    契约：返回的每项 dict 保证至少含 `Type`（Episode）。Emby 分集接口通常自带
+    Type，但缺省时不补齐会把 media_type 存成空串（save_media_to_db 用
+    emby_item.get("Type", "")），导致按 media_type=="Episode" 查询漏掉刚入库
+    分集。作为数据源头适配器，在此统一补齐，避免给下游调用方埋雷。
     """
     base = f"{host}/emby/Users/{user_id}/Items" if user_id else f"{host}/emby/Items"
     all_eps = []
@@ -1562,6 +1567,10 @@ def _fetch_episodes_light(host: str, api_key: str, user_id: str,
             )
             break
 
+    # ★ 数据源头适配器契约：返回的轻量 dict 必须至少含 Type 字段（见 docstring）
+    for ep in all_eps:
+        ep.setdefault("Type", "Episode")
+
     return all_eps
 
 
@@ -1594,6 +1603,102 @@ def _compute_episode_diff(
         (s, e) for (s, e) in missing if e < db_max.get(s, -1)
     )
     return {"missing": missing, "interior_gaps": interior}
+
+
+def reconcile_series_episodes(
+    series_id: str, host: str = "", api_key: str = "",
+    user_id: str = "", library_id: str = "",
+) -> dict:
+    """轻量对账 Series 分集：拉 Emby 列表 → 对比 DB → 补库 → 刷新计数。
+
+    供 webhook（新增分集）调用，解决「实际 12 集只入库 7 集」。
+    - 只拉轻量字段（_fetch_episodes_light），避免重复抓取大字段
+    - 内部空集缺口 → 全量同步一次该剧（_process_episodes 全量）
+    - 仅尾部新增 → 只补缺失分集，不重扫已入库分集
+    - 无论哪种，均用 Emby 实际分集数刷新父 Series recursive_item_count
+
+    Returns:
+        {"success": bool, "episodes_total": int, "synced_episodes": int,
+         "interior_gaps": list, "full_sync": bool}
+    """
+    cfg = load_config()
+    host = host or cfg.get("emby_host", "").rstrip("/")
+    api_key = api_key or cfg.get("emby_api_key", "")
+    user_id = user_id or cfg.get("emby_user_id", "")
+
+    empty = {"success": False, "episodes_total": 0, "synced_episodes": 0,
+             "interior_gaps": [], "full_sync": False}
+    if not host or not api_key:
+        logger.warning("⚠ [Reconcile] Emby 未配置，跳过 %s 对账", series_id)
+        return empty
+
+    emby_eps = _fetch_episodes_light(host, api_key, user_id, series_id)
+    if not emby_eps:
+        logger.warning("⚠ [Reconcile] %s 无分集数据（Emby 未找到或为空）", series_id)
+        return empty
+
+    db = SessionLocal()
+    try:
+        db_eps = [
+            (r.parent_index_number or 0, r.index_number or 0)
+            for r in db.query(MediaMetadata).filter(
+                MediaMetadata.parent_id == series_id,
+                MediaMetadata.media_type == "Episode",
+            ).all()
+        ]
+        diff = _compute_episode_diff(
+            db_eps,
+            [(ep.get("ParentIndexNumber") or 0, ep.get("IndexNumber") or 0) for ep in emby_eps],
+        )
+
+        # ★ 补库：内部空集 → 全量同步一次；仅尾部新增 → 只补缺失分集
+        if diff["interior_gaps"]:
+            synced = _process_episodes(
+                db, emby_eps, series_id, library_id,
+                apply_localization=False, douban_actor_map=None, series_name="",
+            )
+            logger.info(
+                "   📺 [Reconcile] %s 检测到内部空集 %s，全量同步 %d 个分集",
+                series_id, diff["interior_gaps"], synced,
+            )
+        elif diff["missing"]:
+            missing_eps = [
+                ep for ep in emby_eps
+                if (ep.get("ParentIndexNumber") or 0, ep.get("IndexNumber") or 0) in diff["missing"]
+            ]
+            synced = _process_episodes(
+                db, missing_eps, series_id, library_id,
+                apply_localization=False, douban_actor_map=None, series_name="",
+            )
+            logger.info(
+                "   📺 [Reconcile] %s 补充 %d 个新增分集", series_id, synced,
+            )
+        else:
+            synced = 0
+
+        # ★ 用 Emby 实际分集数刷新父 Series 计数（不信任 stale RecursiveItemCount）
+        series_mm = db.query(MediaMetadata).filter(
+            MediaMetadata.emby_item_id == series_id
+        ).first()
+        if series_mm:
+            series_mm.recursive_item_count = len(emby_eps)
+        db.commit()
+
+        return {
+            "success": True,
+            "episodes_total": len(emby_eps),
+            "synced_episodes": synced,
+            "interior_gaps": diff["interior_gaps"],
+            "full_sync": bool(diff["interior_gaps"]),
+        }
+    except Exception:
+        db.rollback()
+        logger.error(
+            "❌ [Reconcile] %s 对账异常:\n%s", series_id, traceback.format_exc(),
+        )
+        return empty
+    finally:
+        db.close()
 
 
 def _fetch_tmdb_seasons(tmdb_base: str, api_key: str, tmdb_id: str) -> list[int]:
