@@ -24,7 +24,7 @@ interface Library {
 }
 
 // 媒体汉化状态
-type MediaStatus = 'pending' | 'synced' | 'locked' | 'syncing'
+type MediaStatus = 'pending' | 'synced' | 'locked' | 'syncing' | 'failed'
 
 // Emby 演员（People 结构，兼容大小写字段）
 interface ActorPerson {
@@ -240,7 +240,7 @@ const isAllChecked = computed({
 })
 
 const checkedIds = computed(() => items.value.filter(i => i.checked).map(i => i.id))
-const pendingCheckedIds = computed(() => items.value.filter(i => i.checked && i.status === 'pending').map(i => i.id))
+const pendingCheckedIds = computed(() => items.value.filter(i => i.checked && i.status !== 'synced' && i.status !== 'locked').map(i => i.id))
 
 const connectEmby = async () => {
   try {
@@ -529,12 +529,13 @@ const handleToggleAuto = async (val: boolean) => {
   finally { autoUpdating.value = false }
 }
 
-const statusLabel = (s: MediaStatus): string => ({ pending: '未汉化', synced: '已汉化', locked: '已锁定', syncing: '汉化中' }[s] || s)
+const statusLabel = (s: MediaStatus): string => ({ pending: '未汉化', synced: '已汉化', locked: '已锁定', syncing: '汉化中', failed: '汉化失败' }[s] || s)
 const statusPillClass = (s: MediaStatus): string => ({
   pending: 'pill-pending',
   synced: 'pill-synced',
   locked: 'pill-locked',
   syncing: 'pill-syncing',
+  failed: 'pill-failed',
 }[s] || 'pill-locked')
 
 const getPosterGradient = (name: string) => {
@@ -1296,6 +1297,11 @@ onUnmounted(() => {
   border: 1px solid rgba(59, 130, 246, 0.3);
   box-shadow: 0 0 10px rgba(59, 130, 246, 0.22);
   animation: pulse-glow 1.6s ease-in-out infinite;
+}
+.pill-failed {
+  color: #F87171;
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.26);
 }
 @keyframes pulse-glow {
   0%, 100% { box-shadow: 0 0 6px rgba(59, 130, 246, 0.12); }
