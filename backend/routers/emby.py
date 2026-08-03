@@ -18,6 +18,10 @@ import time
 # 引入服务层函数 (确保 services/emby_service.py 也是最新版)
 from services.emby_service import get_item_info, update_item_tags
 
+# 供 _handle_library_new_for_sinicize 使用（模块级 import 以便测试 monkeypatch）
+from routers.sync_actions import _ensure_item_audited, reconcile_series_episodes
+from services.douban_service import DoubanSinizer
+
 router = APIRouter()
 logger = logging.getLogger("uvicorn")
 
@@ -778,26 +782,54 @@ async def _handle_library_new_for_sinicize(payload: dict):
 
     从 Emby Webhook (item.created / library.new) 提取 item_id，
     依次执行前置审计和演员中文化，实现"新增即汉化"的实时响应。
-    """
-    from routers.sync_actions import _ensure_item_audited
-    from services.douban_service import DoubanSinizer
 
+    ★ Episode 分支：不再只审计单集，改为轻量对账父 Series——
+      内部空集 → 整体汉化父 Series；仅尾部新增 → 汉化本单集（走父系列定位）。
+    """
     item = payload.get("Item", {})
     item_id = item.get("Id", "")
     item_name = item.get("Name", "?")
+    item_type = item.get("Type", "")
 
     if not item_id:
         logger.warning("⚠ [AutoSinicize] Webhook payload 中缺少 Item.Id，跳过")
         return
 
     logger.info(
-        "🚀 [AutoSinicize] 收到 Emby 事件: %s — %s (%s)",
-        payload.get("Event", "?"), item_name, item_id,
+        "🚀 [AutoSinicize] 收到 Emby 事件: %s — %s (%s, type=%s)",
+        payload.get("Event", "?"), item_name, item_id, item_type,
     )
 
+    sinizer = DoubanSinizer()
     try:
-        # ★ 第一步：前置审计 — 确保本地有演员数据
-        logger.info("   📖 [AutoSinicize] Step 1/2: 前置审计 %s", item_id)
+        # ★ Episode：轻量对账父 Series
+        if item_type == "Episode":
+            series_id = item.get("SeriesId") or item.get("ParentId") or ""
+            if series_id:
+                rec = reconcile_series_episodes(series_id)
+                if rec.get("success"):
+                    if rec.get("full_sync"):
+                        logger.info(
+                            "   📺 [AutoSinicize] %s 检测到内部空集缺口 %s，整体汉化父 Series",
+                            item_name, rec.get("interior_gaps"),
+                        )
+                        sinizer.sinicize(series_id)
+                    else:
+                        logger.info(
+                            "   🎬 [AutoSinicize] %s 对账完成(共 %d 集)，汉化本单集",
+                            item_name, rec.get("episodes_total", 0),
+                        )
+                        sinizer.sinicize(item_id)
+                    return
+                logger.warning(
+                    "   ⚠ [AutoSinicize] %s 父系列对账失败，退回单集审计", item_name,
+                )
+            else:
+                logger.warning(
+                    "   ⚠ [AutoSinicize] %s 无法定位父 Series，退回单集审计", item_name,
+                )
+
+        # ★ 非分集 / Episode 兜底：前置审计 + 汉化
         if not _ensure_item_audited(item_id):
             logger.warning(
                 "   ⚠ [AutoSinicize] %s 审计后仍无演员数据（Emby 未刮削），跳过汉化",
@@ -805,9 +837,7 @@ async def _handle_library_new_for_sinicize(payload: dict):
             )
             return
 
-        # ★ 第二步：演员中文化
         logger.info("   🎬 [AutoSinicize] Step 2/2: 执行汉化 %s", item_id)
-        sinizer = DoubanSinizer()
         result = sinizer.sinicize(item_id)
 
         if result.get("success"):
