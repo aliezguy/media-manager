@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import services.request_budget as rb
+from services.douban_api import DoubanApi
 
 
 @pytest.fixture
@@ -71,3 +72,87 @@ def test_build_limits_falls_back_on_config_error(monkeypatch):
         raise RuntimeError("config 损坏")
     monkeypatch.setattr(rb, "load_config", _boom)
     assert rb._build_limits() == {"douban": 30, "tmdb": 60, "emby_writeback": 50}
+
+
+# ==================== 接入点 1：DoubanApi.__invoke / __post ====================
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """记录调用并返回固定 payload 的假 session。"""
+    def __init__(self, payload):
+        self._payload = payload
+        self.calls = []
+
+    def get(self, *a, **k):
+        self.calls.append(("get", a, k))
+        return _FakeResp(self._payload)
+
+    def post(self, *a, **k):
+        self.calls.append(("post", a, k))
+        return _FakeResp(self._payload)
+
+
+def _make_douban_api(monkeypatch):
+    api = DoubanApi()
+    monkeypatch.setattr(DoubanApi, "_apply_cooldown", lambda: None)  # 跳过 1.5s 冷却
+    return api
+
+
+def test_douban_invoke_acquires_budget_and_proceeds(monkeypatch):
+    import services.douban_api as da
+    api = _make_douban_api(monkeypatch)
+    fake = _FakeSession({"foo": "bar"})
+    monkeypatch.setattr(DoubanApi, "_session", fake)
+    calls = []
+    monkeypatch.setattr(da, "budget_acquire", lambda provider, timeout=30.0: calls.append(provider) or True)
+
+    result = api._DoubanApi__invoke("/search/weixin", q="测试")
+
+    assert calls == ["douban"]
+    assert fake.calls and fake.calls[0][0] == "get"
+    assert result == {"foo": "bar"}
+
+
+def test_douban_invoke_skips_when_budget_exhausted(monkeypatch):
+    import services.douban_api as da
+    api = _make_douban_api(monkeypatch)
+    monkeypatch.setattr(da, "budget_acquire", lambda provider, timeout=30.0: False)
+
+    result = api._DoubanApi__invoke("/search/weixin", q="测试")
+
+    assert result["error"] == "budget_exhausted"
+
+
+def test_douban_post_acquires_budget_and_proceeds(monkeypatch):
+    import services.douban_api as da
+    api = _make_douban_api(monkeypatch)
+    fake = _FakeSession({"id": 1})
+    monkeypatch.setattr(DoubanApi, "_session", fake)
+    calls = []
+    monkeypatch.setattr(da, "budget_acquire", lambda provider, timeout=30.0: calls.append(provider) or True)
+
+    result = api._DoubanApi__post("/movie/1", name="x")
+
+    assert calls == ["douban"]
+    assert fake.calls and fake.calls[0][0] == "post"
+    assert result == {"id": 1}
+
+
+def test_douban_post_skips_when_budget_exhausted(monkeypatch):
+    import services.douban_api as da
+    api = _make_douban_api(monkeypatch)
+    monkeypatch.setattr(da, "budget_acquire", lambda provider, timeout=30.0: False)
+
+    result = api._DoubanApi__post("/movie/1", name="x")
+
+    assert result["error"] == "budget_exhausted"

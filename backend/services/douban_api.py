@@ -10,6 +10,7 @@ Douban Frodo API 客户端 — 封装豆瓣 API v2 签名、鉴权与数据抓�
 """
 
 import requests  # type: ignore
+from services.request_budget import acquire as budget_acquire
 from typing import Optional, Dict, Any, List
 import logging
 import json
@@ -120,6 +121,9 @@ class DoubanApi:
 
     def __invoke(self, url: str, **kwargs) -> Dict[str, Any]:
         DoubanApi._apply_cooldown()
+        if not budget_acquire("douban"):
+            logger.warning("  ➜ 豆瓣请求预算超限（排队超时），本次 GET 跳过: %s", url)
+            return self._make_error_dict("budget_exhausted", "豆瓣请求预算超限，排队超时跳过")
         DoubanApi._ensure_session()
         if DoubanApi._session is None:
             return self._make_error_dict("session_not_initialized", "Session未初始化")
@@ -163,6 +167,9 @@ class DoubanApi:
 
     def __post(self, url: str, **kwargs) -> Dict[str, Any]:
         DoubanApi._apply_cooldown()
+        if not budget_acquire("douban"):
+            logger.warning("  ➜ 豆瓣请求预算超限（排队超时），本次 POST 跳过: %s", url)
+            return self._make_error_dict("budget_exhausted", "豆瓣请求预算超限，排队超时跳过")
         DoubanApi._ensure_session()
         if DoubanApi._session is None:
             return self._make_error_dict("session_not_initialized", "Session未初始化")
