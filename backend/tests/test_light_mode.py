@@ -191,3 +191,80 @@ def test_save_media_to_db_default_full_mode(monkeypatch):
     )
     assert captured["light_mode"] is False
     db.close()
+
+
+class _NoTranslator:
+    def is_available(self):
+        return False
+
+
+def _make_sinizer(monkeypatch):
+    """复用 test_episode_via_parent 的 _fresh_db 模式：内存库 + emby 配置。"""
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    TestSession = sessionmaker(bind=engine)
+    monkeypatch.setattr(ds, "SessionLocal", TestSession)
+    monkeypatch.setattr(ds, "load_config", lambda: {
+        "emby_host": "http://emby.test", "emby_api_key": "k",
+        "emby_user_id": "u", "max_actors_per_media": 50,
+    })
+    return ds.DoubanSinizer()
+
+
+def _stub_sinicize_flow(s, monkeypatch):
+    """stub sinicize 全链路下游，返回两个 spy 列表。"""
+    calls = {"save_light_profiles": [], "ensure_light_modes": []}
+
+    monkeypatch.setattr(s, "_get_emby_item", lambda sid: {
+        "Id": sid, "Name": "九门", "Type": "Series",
+        "People": [{"Name": "Sun Honglei", "Type": "Actor", "Role": "Li Yan"}],
+        "ProviderIds": {"Imdb": "tt0000001"}, "ProductionYear": "2020",
+    })
+    monkeypatch.setattr(s, "_find_douban_id", lambda *a, **k: "123")
+    monkeypatch.setattr(s, "_fetch_douban_actors", lambda did: [
+        {"name": "孙红雷", "role": "李岩", "avatar": "http://douban.test/a.jpg", "id": "c1"},
+    ])
+
+    def fake_match(emby_actors, douban_actors, db=None, emby_item_id="", parent_id="",
+                   provider_tmdb_ids=None):
+        return ([
+            dict(a, Name="孙红雷", Role="李岩",
+                 _cn_name_conf=4, _cn_name_src="official",
+                 _cn_role_conf=4, _cn_role_src="official")
+            for a in emby_actors
+        ], [], {}, {}, {}, {})
+    monkeypatch.setattr(s, "_match_and_update", fake_match)
+    monkeypatch.setattr(ds, "get_translator", lambda: _NoTranslator())
+    monkeypatch.setattr(s, "_write_back_emby", lambda *a, **k: True)
+
+    def fake_save(db, **kw):  # db 是真实 save_media_to_db 的首个位置参数
+        calls["save_light_profiles"].append(kw.get("light_profiles", False))
+    monkeypatch.setattr(ds, "save_media_to_db", fake_save)
+
+    monkeypatch.setattr(s, "_fetch_episodes", lambda *a, **k: [
+        {"Id": "e1", "Name": "第 1 集", "ParentIndexNumber": 1, "IndexNumber": 1,
+         "People": [{"Name": "Sun Honglei", "Type": "Actor", "Role": "Li Yan"}]},
+    ])
+
+    def fake_ensure(db, people, light_mode=False):
+        calls["ensure_light_modes"].append(light_mode)
+    monkeypatch.setattr(ds, "ensure_profiles_for_people", fake_ensure)
+
+    monkeypatch.setattr(s, "_localize_episode_people", lambda *a, **k: [
+        {"Name": "孙红雷", "Role": "李岩", "Type": "Actor"},
+    ])
+    monkeypatch.setattr(s, "_write_back_episode", lambda *a, **k: True)
+    return calls
+
+
+def test_sinicize_series_uses_light_mode(monkeypatch):
+    s = _make_sinizer(monkeypatch)
+    calls = _stub_sinicize_flow(s, monkeypatch)
+
+    result = s.sinicize("s1")
+
+    assert result["success"] is True
+    # 顶层 Series 入库走 light_profiles=True（在 499 之前执行，若为 False 顶层演员仍会打 TMDB）
+    assert True in calls["save_light_profiles"]
+    # 分集前置批处理走 light_mode=True
+    assert calls["ensure_light_modes"] == [True]

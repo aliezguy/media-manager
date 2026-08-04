@@ -387,6 +387,7 @@ class DoubanSinizer:
                 provider_ids=pids,
                 images=None,          # 自动从 item_data 提取
                 people=all_people,    # 中文化后的完整人员列表
+                light_profiles=True,  # ★ 系列汉化顶层演员也走 light_mode（P3-3a）
                 library_id=series_library_id,
                 status="synced" if write_ok else "failed",
                 matched_actors=result["matched"],
@@ -496,7 +497,7 @@ class DoubanSinizer:
 
                     ep_db = SessionLocal()
                     try:
-                        ensure_profiles_for_people(ep_db, unique_people)
+                        ensure_profiles_for_people(ep_db, unique_people, light_mode=True)
                         ep_db.commit()
                         logger.info(
                             "   ✅ [Douban/Series] 前置批处理完成: %d 位演员已过漏斗",
