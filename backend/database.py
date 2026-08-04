@@ -48,6 +48,13 @@ def _run_migrations():
                     ))
                     logger.info("📦 [Migration] media_sync_status 添加字段: %s", col_name)
 
+            # ★ P3-3b: douban_cast_cache（JSON 缓存列，SQLite 落为 TEXT，与 create_all 一致）
+            if "douban_cast_cache" not in existing:
+                conn.execute(text(
+                    "ALTER TABLE media_sync_status ADD COLUMN douban_cast_cache TEXT"
+                ))
+                logger.info("📦 [Migration] media_sync_status 添加字段: douban_cast_cache")
+
             # ---- actor_records: 移除废弃的 image_url 列 ----
             # SQLite 不支持 DROP COLUMN，采用 DROP + 重建策略
             try:

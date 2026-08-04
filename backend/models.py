@@ -164,6 +164,8 @@ class MediaSyncStatus(Base):
     total_actors = Column(Integer, default=0)
     error_message = Column(Text)
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    # ★ 系列级豆瓣 cast 缓存（P3-3b）：{"fetched_at": ISO8601, "cast": {name: {avatar, douban_id, role}}}
+    douban_cast_cache = Column(JSON, nullable=True)
 
     def to_dict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
