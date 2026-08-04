@@ -59,7 +59,7 @@ def test_lookup_role_name_by_item():
     db.add(ActorRecord(emby_item_id="E1", name="布莱恩", role="沃尔特·怀特",
                        confidence_level=CONFIDENCE_OFFICIAL, translation_source=SOURCE_OFFICIAL))
     db.commit()
-    hit = lookup_role_name(db, "沃尔特·怀特", "E1", parent_id="S1")
+    hit = lookup_role_name(db, "沃尔特·怀特", "E1", parent_id="S1", actor_name="布莱恩")
     assert hit and hit["role"] == "沃尔特·怀特"
     db.close()
 
@@ -69,7 +69,7 @@ def test_lookup_role_name_traces_up_to_parent():
     db.add(ActorRecord(emby_item_id="S1", name="布莱恩", role="沃尔特·怀特",
                        confidence_level=CONFIDENCE_OFFICIAL, translation_source=SOURCE_OFFICIAL))
     db.commit()
-    hit = lookup_role_name(db, "沃尔特·怀特", "E1", parent_id="S1")
+    hit = lookup_role_name(db, "沃尔特·怀特", "E1", parent_id="S1", actor_name="布莱恩")
     assert hit and hit["role"] == "沃尔特·怀特"
     db.close()
 
@@ -79,7 +79,41 @@ def test_lookup_role_name_below_threshold_ignored():
     db.add(ActorRecord(emby_item_id="S1", name="布莱恩", role="Walter White",
                        confidence_level=CONFIDENCE_NONE, translation_source=""))
     db.commit()
-    assert lookup_role_name(db, "Walter White", "E1", parent_id="S1") is None
+    assert lookup_role_name(db, "Walter White", "E1", parent_id="S1", actor_name="布莱恩") is None
+    db.close()
+
+
+def test_lookup_role_name_cross_actor_contamination_blocked():
+    """★「相原龙」Bug 回归：不同演员查询同名角色，绝不能继承他人 conf=4 缓存。"""
+    db = _fresh_db()
+    # Actor A（仁科克基）已入库官方角色 相原龙 / conf=4
+    db.add(ActorRecord(emby_item_id="S1", name="仁科克基", role="相原龙",
+                       confidence_level=CONFIDENCE_OFFICIAL, translation_source=SOURCE_OFFICIAL))
+    db.commit()
+    # Actor B（斉川あい）查询同样的角色字符串 "相原龙" → 策略 1 必须未命中
+    assert lookup_role_name(db, "相原龙", "E1", parent_id="S1", actor_name="斉川あい") is None
+    db.close()
+
+
+def test_lookup_role_name_same_actor_hit():
+    """正控：同一演员查询自己的角色 → 命中并返回原置信度。"""
+    db = _fresh_db()
+    db.add(ActorRecord(emby_item_id="S1", name="仁科克基", role="相原龙",
+                       confidence_level=CONFIDENCE_OFFICIAL, translation_source=SOURCE_OFFICIAL))
+    db.commit()
+    hit = lookup_role_name(db, "相原龙", "E1", parent_id="S1", actor_name="仁科克基")
+    assert hit and hit["role"] == "相原龙" and hit["confidence_level"] == CONFIDENCE_OFFICIAL
+    db.close()
+
+
+def test_lookup_role_name_simplified_traditional_variant_reuse():
+    """良性复用回归：简体已缓存 conf=4，繁体变体查询同角色 → 仍命中复用。"""
+    db = _fresh_db()
+    db.add(ActorRecord(emby_item_id="S1", name="五十岚隼士", role="日比野未来 / 坂宏人",
+                       confidence_level=CONFIDENCE_OFFICIAL, translation_source=SOURCE_OFFICIAL))
+    db.commit()
+    hit = lookup_role_name(db, "日比野未来 / 坂宏人", "E1", parent_id="S1", actor_name="五十嵐隼士")
+    assert hit and hit["role"] == "日比野未来 / 坂宏人" and hit["confidence_level"] == CONFIDENCE_OFFICIAL
     db.close()
 
 

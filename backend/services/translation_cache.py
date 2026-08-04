@@ -11,7 +11,8 @@
 从而防止「伪中文（英文原名）」污染缓存后被当作有效译名。
 """
 import logging
-import re
+
+from pypinyin import lazy_pinyin
 
 from models import ActorProfile, ActorRecord
 from services.translation_utils import (
@@ -65,17 +66,22 @@ def lookup_role_name(
     在限定上下文（本媒体项，分集另含其 Series）内查询 actor_records，
     已入库且 confidence >= 阈值的中文角色名可直接复用。
 
+    ★ 演员身份锚定（防跨演员污染）：角色复用必须同时满足「角色字符串」与
+      「演员身份」匹配。actor_name 为空时直接返回 None，绝不做无身份背书的
+      纯角色字符串复用——否则上游脏数据会把 A 演员的角色错误赋给 B 演员
+      （「相原龙」污染即此类：10 个配角同填 相原龙，被统一认证为 official/4）。
+
     Args:
         db:           SQLAlchemy Session
         role:         待翻译的角色名（Emby 原始值）
         emby_item_id: 当前媒体项 ID
         parent_id:    分集时传入 Series ID，实现向上追溯
-        actor_name:   可选，演员名用于增强匹配
+        actor_name:   演员名（必填）：命中行的 name 必须与当前演员身份匹配
 
     Returns:
         {"role", "confidence_level", "translation_source"}，未命中返回 None。
     """
-    if not role:
+    if not role or not actor_name:
         return None
     scope_ids = [emby_item_id]
     if parent_id:
@@ -87,27 +93,27 @@ def lookup_role_name(
     def _hit(r) -> bool:
         return (r.confidence_level or 0) >= CONFIDENCE_REUSE_THRESHOLD
 
-    # 策略 1: role 精确匹配（限定上下文内，同一角色值已入库）
+    # 策略 1: role 精确匹配 + 演员身份校验（限定上下文内，同一演员的同一角色已入库）
     for r in rows:
-        if r.role and r.role == role and _hit(r) and is_valid_chinese_translation(r.role):
+        if (r.role and r.role == role and _hit(r)
+                and is_valid_chinese_translation(r.role)
+                and _same_actor(r.name, actor_name)):
             logger.info("   💾 [Cache] 角色名缓存命中(role): %s (conf=%s)", r.role, r.confidence_level)
             return {
                 "role": r.role,
                 "confidence_level": r.confidence_level,
                 "translation_source": r.translation_source or "",
             }
-    # 策略 2: 演员名归一化匹配，提取该演员已入库的中文角色
-    if actor_name:
-        key = _norm_key(actor_name)
-        for r in rows:
-            if r.name and _norm_key(r.name) == key and r.role and _hit(r) \
-                    and is_valid_chinese_translation(r.role):
-                logger.info("   💾 [Cache] 角色名缓存命中(actor): %s (conf=%s)", r.role, r.confidence_level)
-                return {
-                    "role": r.role,
-                    "confidence_level": r.confidence_level,
-                    "translation_source": r.translation_source or "",
-                }
+    # 策略 2: 演员身份匹配，提取该演员已入库的中文角色
+    for r in rows:
+        if (r.name and _same_actor(r.name, actor_name) and r.role and _hit(r)
+                and is_valid_chinese_translation(r.role)):
+            logger.info("   💾 [Cache] 角色名缓存命中(actor): %s (conf=%s)", r.role, r.confidence_level)
+            return {
+                "role": r.role,
+                "confidence_level": r.confidence_level,
+                "translation_source": r.translation_source or "",
+            }
     return None
 
 
@@ -158,6 +164,19 @@ def upsert_actor_translation(
         profile.tmdb_id = str(tmdb_id).strip()
 
 
-def _norm_key(text: str) -> str:
-    """归一化匹配 key：去空格、转小写、去点号。"""
-    return re.sub(r"[^a-z0-9]", "", text.lower())
+def _pinyin_key(text: str) -> str:
+    """将名字转为拼音 key（无空格、小写）；非汉字（拉丁/假名）原样保留。"""
+    return "".join(lazy_pinyin(text)).lower()
+
+
+def _same_actor(name1: str, name2: str) -> bool:
+    """判定两个演员名是否指向同一演员：精确相等，或拼音相等（容忍简繁体变体）。
+
+    例：'五十嵐隼士' == '五十岚隼士'（简繁体，拼音均为 wushilansunshi）
+        '斉川あい' != '仁科克基'（不同演员，拼音不同）
+    """
+    if not name1 or not name2:
+        return False
+    if name1.strip() == name2.strip():
+        return True
+    return _pinyin_key(name1) == _pinyin_key(name2)
