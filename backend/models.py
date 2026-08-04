@@ -35,11 +35,11 @@ class TaskActionLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(Integer, index=True)
     tmdb_id = Column(Integer, index=True)
-    title = Column(String)
-    action_type = Column(String, nullable=False)
-    target_name = Column(String, nullable=False)
-    target_path = Column(String)
-    reason = Column(String)
+    title = Column(String(255))
+    action_type = Column(String(255), nullable=False)
+    target_name = Column(String(255), nullable=False)
+    target_path = Column(String(255))
+    reason = Column(String(255))
     detail = Column(JSON)
     created_at = Column(DateTime, default=datetime.now)
 
@@ -47,8 +47,8 @@ class MediaTag(Base):
     __tablename__ = "media_tags"
 
     # item_id 是主键，对应 Emby 的 ID
-    item_id = Column(String, primary_key=True, index=True)
-    name = Column(String)
+    item_id = Column(String(255), primary_key=True, index=True)
+    name = Column(String(255))
     # 使用 JSON 类型直接存列表 ['古装', '悬疑']
     tags = Column(JSON)
 
@@ -57,14 +57,14 @@ class WashHistory(Base):
     __tablename__ = "wash_history"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True)
+    name = Column(String(255), index=True)
     season = Column(Integer)
     tmdb_id = Column(Integer)
-    status = Column(String)
-    message = Column(String)
+    status = Column(String(255))
+    message = Column(String(255))
     wash_params = Column(JSON)
     # 🔥 新增字段，默认值为 'complete'
-    wash_type = Column(String, default="complete")
+    wash_type = Column(String(255), default="complete")
     created_at = Column(DateTime, default=datetime.now)
 
 
@@ -74,11 +74,11 @@ class TvShowDetail(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     tmdb_id = Column(Integer, unique=True, index=True, nullable=False)
-    title = Column(String, nullable=False)
+    title = Column(String(255), nullable=False)
     year = Column(Integer)
-    category = Column(String)
+    category = Column(String(255))
     total_episodes = Column(Integer)
-    overview = Column(String)
+    overview = Column(String(255))
     created_at = Column(DateTime, default=datetime.now)
 
 
@@ -90,7 +90,7 @@ class CompletedSeasonRecord(Base):
     tmdb_id = Column(Integer, nullable=False, index=True)
     season_number = Column(Integer, nullable=False)
     downloaded_episodes = Column(Integer, default=0)
-    folder_path = Column(String)
+    folder_path = Column(String(255))
     size_bytes = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.now)
 
@@ -100,10 +100,10 @@ class TorrentRecord(Base):
     __tablename__ = "torrent_records"
 
     id = Column(Integer, primary_key=True, index=True)
-    hash = Column(String, unique=True, index=True, nullable=False)
-    torrent_name = Column(String, nullable=False)
+    hash = Column(String(255), unique=True, index=True, nullable=False)
+    torrent_name = Column(String(255), nullable=False)
     tmdb_id = Column(Integer, index=True)
-    qb_category = Column(String)
+    qb_category = Column(String(255))
     size = Column(Integer)
     added_on = Column(DateTime)
 
@@ -114,10 +114,10 @@ class AutoTaskFlow(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     tmdb_id = Column(Integer, nullable=False, index=True)
-    task_type = Column(String, nullable=False)
-    status = Column(String, nullable=False, default=TaskStatus.INIT.value)
+    task_type = Column(String(255), nullable=False)
+    status = Column(String(255), nullable=False, default=TaskStatus.INIT.value)
     retry_count = Column(Integer, default=0)
-    error_message = Column(String)
+    error_message = Column(String(255))
     context = Column(JSON)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -128,8 +128,8 @@ class ScheduledTask(Base):
     __tablename__ = "scheduled_tasks"
 
     id = Column(Integer, primary_key=True, index=True)
-    directory_path = Column(String, nullable=False)
-    cron_expression = Column(String, nullable=False)
+    directory_path = Column(String(255), nullable=False)
+    cron_expression = Column(String(255), nullable=False)
     is_active = Column(Boolean, default=True)
     last_run_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.now)
@@ -141,8 +141,8 @@ class ScanRunLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(Integer, nullable=False, index=True)
-    status = Column(String, nullable=False)  # SUCCESS / FAILED
-    trigger_type = Column(String, nullable=False)  # CRON / MANUAL
+    status = Column(String(255), nullable=False)  # SUCCESS / FAILED
+    trigger_type = Column(String(255), nullable=False)  # CRON / MANUAL
     scanned_count = Column(Integer, default=0)
     processed_count = Column(Integer, default=0)
     details = Column(JSON)
@@ -153,13 +153,13 @@ class MediaSyncStatus(Base):
     """演职员中文化 — 同步状态持久化"""
     __tablename__ = "media_sync_status"
 
-    emby_item_id = Column(String, primary_key=True, index=True)
-    tmdb_id = Column(String, index=True)
-    imdb_id = Column(String, index=True)
-    douban_id = Column(String, index=True)
-    library_id = Column(String, index=True)
-    title = Column(String)
-    status = Column(String, default="pending")
+    emby_item_id = Column(String(255), primary_key=True, index=True)
+    tmdb_id = Column(String(255), index=True)
+    imdb_id = Column(String(255), index=True)
+    douban_id = Column(String(255), index=True)
+    library_id = Column(String(255), index=True)
+    title = Column(String(255))
+    status = Column(String(255), default="pending")
     matched_actors = Column(Integer, default=0)
     total_actors = Column(Integer, default=0)
     error_message = Column(Text)
@@ -175,10 +175,10 @@ class MediaMetadata(Base):
     """媒体元数据表 — 标题、概述、图片外链"""
     __tablename__ = "media_metadata"
 
-    emby_item_id = Column(String, primary_key=True, index=True)
-    parent_id = Column(String, index=True, nullable=True)
-    media_type = Column(String, nullable=False)
-    title = Column(String)
+    emby_item_id = Column(String(255), primary_key=True, index=True)
+    parent_id = Column(String(255), index=True, nullable=True)
+    media_type = Column(String(255), nullable=False)
+    title = Column(String(255))
     overview = Column(Text)
     index_number = Column(Integer, nullable=True)
     parent_index_number = Column(Integer, nullable=True)   # Season 编号 (仅 Episode)
@@ -196,18 +196,18 @@ class ActorProfile(Base):
     """
     __tablename__ = "actor_profiles"
 
-    name = Column(String, primary_key=True, index=True)
-    local_image_path = Column(String)                 # 相对路径 如 "张/张译.jpg"
+    name = Column(String(255), primary_key=True, index=True)
+    local_image_path = Column(String(255))                 # 相对路径 如 "张/张译.jpg"
     image_url = Column(Text)                          # 外部直链兜底 (豆瓣/TMDB)
-    source = Column(String)                           # "douban" / "tmdb" / "emby"
-    tmdb_id = Column(String, index=True)
-    imdb_id = Column(String, index=True)
-    douban_celebrity_id = Column(String, index=True)
-    birth_date = Column(String)
-    birth_place = Column(String)
+    source = Column(String(255))                           # "douban" / "tmdb" / "emby"
+    tmdb_id = Column(String(255), index=True)
+    imdb_id = Column(String(255), index=True)
+    douban_celebrity_id = Column(String(255), index=True)
+    birth_date = Column(String(255))
+    birth_place = Column(String(255))
     overview = Column(Text)
     confidence_level = Column(Integer, default=0)     # 中文名译名置信度: 4官方 / 3AI / 5手动
-    translation_source = Column(String, default="")   # "official" / "ai_llm" / "manual"
+    translation_source = Column(String(255), default="")   # "official" / "ai_llm" / "manual"
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
@@ -220,11 +220,11 @@ class ActorRecord(Base):
     __tablename__ = "actor_records"
 
     id = Column(Integer, primary_key=True, autoincrement=True, index=True)
-    emby_item_id = Column(String, index=True, nullable=False)
-    name = Column(String, nullable=False)             # → ActorProfile.name
-    role = Column(String)
-    type = Column(String, nullable=False, default="Actor")
+    emby_item_id = Column(String(255), index=True, nullable=False)
+    name = Column(String(255), nullable=False)             # → ActorProfile.name
+    role = Column(String(255))
+    type = Column(String(255), nullable=False, default="Actor")
     sort_order = Column(Integer, default=0)
     confidence_level = Column(Integer, default=0)     # 角色译名置信度: 4官方 / 3AI / 5手动
-    translation_source = Column(String, default="")   # 角色译名来源
+    translation_source = Column(String(255), default="")   # 角色译名来源
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
