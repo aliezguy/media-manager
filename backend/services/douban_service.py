@@ -207,8 +207,8 @@ class DoubanSinizer:
 
         logger.info(f"   🆔 豆瓣条目 ID: {douban_id}")
 
-        # 3. 抓取豆瓣演员列表
-        douban_actors = self._fetch_douban_actors(douban_id)
+        # 3. 抓取豆瓣演员列表（系列级 cast 缓存：新鲜命中 0 次请求）
+        douban_actors = self._load_douban_cast(item_id, douban_id)
         if not douban_actors:
             logger.warning(f"⚠️ [Douban中文化] 豆瓣演员列表为空")
             return result
@@ -697,8 +697,8 @@ class DoubanSinizer:
             finally:
                 db_w.close()
 
-        # 3) 拉 cast + 构建 match_map
-        douban_actors = self._fetch_douban_actors(douban_id)
+        # 3) 拉 cast + 构建 match_map（系列级 cast 缓存：新鲜命中 0 次请求）
+        douban_actors = self._load_douban_cast(series_id, douban_id)
         if not douban_actors:
             logger.warning("⚠ [Douban/Ep] 父 Series %s 豆瓣演员列表为空", series_id)
             return None

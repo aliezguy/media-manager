@@ -148,3 +148,48 @@ def test_load_cast_fetch_failure_returns_none(monkeypatch):
     monkeypatch.setattr(s, "_fetch_douban_actors", lambda did: [])
 
     assert s._load_douban_cast("s1", "123") is None
+
+
+def test_resolve_series_context_uses_fresh_cast_cache(monkeypatch):
+    TestSession = _fresh_db(monkeypatch)
+    _seed_cache(TestSession, series_id="s1", douban_id="12345")
+    s = ds.DoubanSinizer()
+    monkeypatch.setattr(s, "_get_emby_item", lambda sid: {
+        "Id": sid, "Name": "九门", "Type": "Series",
+        "People": [{"Name": "孙红雷", "Type": "Actor", "Role": "主演"}],
+        "ProviderIds": {"Imdb": "tt0000001"},
+    })
+
+    def boom(*a, **k):
+        raise AssertionError("cast 缓存命中不应触发 _fetch_douban_actors")
+    monkeypatch.setattr(s, "_fetch_douban_actors", boom)
+
+    ctx = s._resolve_series_douban_context("s1")
+    assert ctx is not None
+    douban_id, actors, match_map = ctx
+    assert douban_id == "12345"            # DB 缓存 douban_id 命中
+    assert actors[0]["name"] == "孙红雷"    # cast 缓存命中，未发请求
+    assert "sun honglei" in match_map or "孙红雷".lower() in [k for k in match_map]
+
+
+def test_sinicize_uses_load_douban_cast_not_raw_fetch(monkeypatch):
+    """sinicize 走 _load_douban_cast 而非裸 _fetch_douban_actors（异常探针法）。"""
+    TestSession = _fresh_db(monkeypatch)
+    s = ds.DoubanSinizer()
+    monkeypatch.setattr(s, "_get_emby_item", lambda sid: {
+        "Id": sid, "Name": "九门", "Type": "Series",
+        "People": [{"Name": "Sun Honglei", "Type": "Actor", "Role": "Li Yan"}],
+        "ProviderIds": {"Imdb": "tt0000001"},
+    })
+    monkeypatch.setattr(s, "_find_douban_id", lambda *a, **k: "123")
+    captured = {}
+
+    def fake_load(series_id, douban_id):
+        captured["series_id"] = series_id
+        captured["douban_id"] = douban_id
+        raise RuntimeError("LOAD_DOUBAN_CAST_CALLED")
+    monkeypatch.setattr(s, "_load_douban_cast", fake_load)
+
+    with pytest.raises(RuntimeError, match="LOAD_DOUBAN_CAST_CALLED"):
+        s.sinicize("s1")
+    assert captured == {"series_id": "s1", "douban_id": "123"}
