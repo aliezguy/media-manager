@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode, urlparse
 import hmac
 import hashlib
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bs4 import BeautifulSoup
 from pypinyin import lazy_pinyin
@@ -80,6 +80,9 @@ DOUBAN_SUBJECT_URL = "https://movie.douban.com/subject/{douban_id}/celebrities"
 
 # 不再截断演员数量 — 全量抓取以构建饱满的中文化词典供分集匹配
 MAX_ACTORS = 999
+
+# ★ 系列级豆瓣 cast 缓存新鲜度（天），与 actor_profile_service 无头像冷却一致（P3-3b）
+_DOUBAN_CAST_TTL_DAYS = 7
 
 
 def _truncate_actors(people: list, max_count: int) -> list:
@@ -942,6 +945,85 @@ class DoubanSinizer:
             title, imdb_id or "-", tmdb_id or "-",
         )
         return None
+
+    def _load_douban_cast(self, series_id: str, douban_id: str) -> list[dict] | None:
+        """读取系列级豆瓣 cast：新鲜缓存（<7 天）直接复用（0 次豆瓣请求）。
+
+        缓存 JSON 自包含 fetched_at（不依赖 MediaSyncStatus.update_time，
+        后者带 onupdate 每次入库都会被刷新，会导致缓存永不失效）。
+        过期/缺失 → 抓取一次并回写缓存（无记录时自动新建）。
+
+        Returns:
+            douban actor 列表 [{name, avatar, role, id}]（与 _fetch_douban_actors
+            形状一致，供 _build_douban_match_map / _match_and_update 直接使用）；
+            抓取失败返回 None。
+        """
+        # 1) 读缓存
+        db = SessionLocal()
+        try:
+            rec = db.query(MediaSyncStatus).filter(
+                MediaSyncStatus.emby_item_id == series_id
+            ).first()
+            cache = (rec.douban_cast_cache if rec else None) or {}
+            fetched_at = cache.get("fetched_at", "")
+            cast_map = cache.get("cast", {}) or {}
+            if fetched_at and cast_map:
+                try:
+                    fetched_dt = datetime.fromisoformat(fetched_at)
+                    if datetime.now() - fetched_dt < timedelta(days=_DOUBAN_CAST_TTL_DAYS):
+                        logger.info(
+                            "   💾 [Douban/Cast] cast 缓存命中 (series=%s, %d 位演员, 0 次请求)",
+                            series_id, len(cast_map),
+                        )
+                        return [
+                            {
+                                "name": name,
+                                "avatar": info.get("avatar", ""),
+                                "role": info.get("role", ""),
+                                "id": str(info.get("douban_id", "") or ""),
+                            }
+                            for name, info in cast_map.items()
+                        ]
+                except (ValueError, TypeError):
+                    pass  # fetched_at 不可解析 → 视作过期，重新抓取
+        finally:
+            db.close()
+
+        # 2) 过期/缺失 → 抓取一次
+        actors = self._fetch_douban_actors(douban_id)
+        if not actors:
+            return None
+
+        # 3) 回写缓存（无记录时新建，保持与 douban_id 回写语义一致）
+        cast_map = {
+            a["name"]: {
+                "avatar": a.get("avatar", ""),
+                "douban_id": str(a.get("id", "") or ""),
+                "role": a.get("role", ""),
+            }
+            for a in actors
+        }
+        payload = {
+            "fetched_at": datetime.now().isoformat(timespec="seconds"),
+            "cast": cast_map,
+        }
+        db = SessionLocal()
+        try:
+            rec = db.query(MediaSyncStatus).filter(
+                MediaSyncStatus.emby_item_id == series_id
+            ).first()
+            if rec is None:
+                rec = MediaSyncStatus(emby_item_id=series_id, douban_id=douban_id, status="pending")
+                db.add(rec)
+            rec.douban_cast_cache = payload
+            db.commit()
+            logger.info(
+                "   💾 [Douban/Cast] cast 缓存已回写 (series=%s, %d 位演员)",
+                series_id, len(cast_map),
+            )
+        finally:
+            db.close()
+        return actors
 
     def _fetch_douban_actors(self, douban_id: str) -> list[dict]:
         """抓取豆瓣演职员数据，优先用 Frodo API。"""
