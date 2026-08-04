@@ -52,6 +52,14 @@ DEFAULT_CONFIG = {
     # 演职员中文化 — 每个媒体最大入库演员数（抓取全量，回写截断）
     "max_actors_per_media": 50,
 
+    # ★ 数据库配置（P4 双库兼容）— 生产切 MySQL，测试/默认 SQLite
+    "db_type": "sqlite",          # sqlite | mysql
+    "db_host": "",                # MySQL: 192.168.31.135
+    "db_port": "",                # MySQL: 3008
+    "db_user": "",
+    "db_password": "",
+    "db_name": "",                # MySQL: media-ai
+
     # ★ 请求预算（P3 豆瓣请求治理）— 进程级每 Provider 令牌桶上限
     "request_budget": {
         "douban_per_series": 30,

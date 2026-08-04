@@ -1,7 +1,9 @@
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
 import logging
+from config.settings import load_config
 
 logger = logging.getLogger("uvicorn")
 
@@ -15,11 +17,32 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# 4. 将数据库文件指定到 data 目录中
-SQLALCHEMY_DATABASE_URL = f"sqlite:///{os.path.join(DATA_DIR, 'emby_ai.db')}"
+_DEFAULT_SQLITE_URL = f"sqlite:///{os.path.join(DATA_DIR, 'emby_ai.db')}"
 
+
+def _build_database_url(cfg: dict | None = None) -> str:
+    """解析 DB URL。优先序：env DATABASE_URL → config 离散 db_* → 内置 SQLite。"""
+    env_url = os.environ.get("DATABASE_URL")
+    if env_url:
+        return env_url
+    cfg = cfg if cfg is not None else load_config()
+    if cfg.get("db_type") == "mysql":
+        return (f"mysql+pymysql://{cfg['db_user']}:{cfg['db_password']}"
+                f"@{cfg['db_host']}:{cfg['db_port']}/{cfg['db_name']}?charset=utf8mb4")
+    return _DEFAULT_SQLITE_URL
+
+
+def _engine_kwargs(url) -> dict:
+    """按方言决定连接池/连接参数。"""
+    if url.get_backend_name() == "sqlite":
+        return {"connect_args": {"check_same_thread": False}}
+    return {"pool_pre_ping": True, "pool_recycle": 3600}
+
+
+# 4. 引擎创建（P4 双库兼容：按 db_type 动态初始化）
+SQLALCHEMY_DATABASE_URL = _build_database_url()
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+    SQLALCHEMY_DATABASE_URL, **_engine_kwargs(make_url(SQLALCHEMY_DATABASE_URL))
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
