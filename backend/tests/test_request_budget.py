@@ -9,6 +9,8 @@ import pytest
 import services.request_budget as rb
 import services.actor_profile_service as aps
 from services.douban_api import DoubanApi
+import services.douban_service as ds
+from services.douban_service import DoubanSinizer
 
 
 @pytest.fixture
@@ -187,3 +189,49 @@ def test_tmdb_request_skips_when_budget_exhausted(monkeypatch):
 
     assert resp is None
     assert calls == ["tmdb"]
+
+
+# ==================== 接入点 3：douban_service._write_back_episode ====================
+
+def _make_sinizer():
+    s = object.__new__(DoubanSinizer)
+    s.emby_host = "http://emby.test"
+    s.emby_api_key = "k"
+    return s
+
+
+def test_write_back_episode_acquires_budget_and_proceeds(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ds, "budget_acquire", lambda provider, timeout=30.0: calls.append(provider) or True)
+
+    class _OkResp:
+        status_code = 200
+
+    class _Requests:
+        def post(self, *a, **k):
+            return _OkResp()
+
+    monkeypatch.setattr(ds, "requests", _Requests())
+    s = _make_sinizer()
+
+    ok = s._write_back_episode("e1", {"Name": "x"}, [])
+
+    assert ok is True
+    assert calls == ["emby_writeback"]
+
+
+def test_write_back_episode_skips_when_budget_exhausted(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ds, "budget_acquire", lambda provider, timeout=30.0: calls.append(provider) or False)
+
+    class _NoPost:
+        def post(self, *a, **k):
+            raise AssertionError("预算超限不应回写 Emby")
+
+    monkeypatch.setattr(ds, "requests", _NoPost())
+    s = _make_sinizer()
+
+    ok = s._write_back_episode("e1", {"Name": "x"}, [])
+
+    assert ok is False
+    assert calls == ["emby_writeback"]

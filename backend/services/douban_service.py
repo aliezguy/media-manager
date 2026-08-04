@@ -11,6 +11,7 @@ import time
 import logging
 import traceback
 import requests
+from services.request_budget import acquire as budget_acquire
 from typing import Optional
 from urllib.parse import quote, urlencode, urlparse
 import hmac
@@ -2099,6 +2100,10 @@ class DoubanSinizer:
         ]
         for k in readonly_keys:
             update_data.pop(k, None)
+
+        if not budget_acquire("emby_writeback"):
+            logger.warning("   ⚠ [Douban/Episode] Emby 回写预算超限（排队超时），跳过回写 Episode %s", episode_id)
+            return False
 
         try:
             resp = requests.post(
