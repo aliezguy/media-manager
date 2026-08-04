@@ -768,6 +768,7 @@ def resolve_actor_profile(
     db,
     context_info: dict | None = None,
     force_refresh: bool = False,
+    light_mode: bool = False,
 ) -> dict | None:
     """超级漏斗：L0 本地 → L0.5 Emby → L1 豆瓣 → L2 TMDB → UPSERT。
 
@@ -789,6 +790,9 @@ def resolve_actor_profile(
                         - douban_id: 豆瓣人物 ID
                         - emby_person_id: Emby 人员 ID（用于 L0.5 拼接头像 URL）
                         - emby_image_tag: Emby 人员头像标签（PrimaryImageTag）
+        light_mode:    轻量模式（系列汉化专用）。True 时跳过整个 TMDB 上半场
+                       （每演员 0-2 次请求的大头），只走 L0/L0.5/L1，L2 仅提升
+                       已缓存头像；False 走完整漏斗。演员库刷新务必传 False。
 
     Returns:
         成功时返回 dict:
@@ -1170,7 +1174,7 @@ def resolve_actor_profile(
     has_overview = bool(profile_data["overview"])
     needs_tmdb_meta = not provider_tmdb_id or not has_overview
 
-    if force_refresh or needs_tmdb_meta:
+    if not light_mode and (force_refresh or needs_tmdb_meta):
         if provider_tmdb_id:
             logger.info(
                 "   🎯 [Profile] 上半场 TMDB 精准 ID 拦截: %s → tmdb=%s",
@@ -1335,6 +1339,15 @@ def resolve_actor_profile(
         source = "tmdb"
         logger.info(
             "   🥈 [Profile] L2 TMDB 头像兜底: %s → %s",
+            actor_name, download_url[:80],
+        )
+
+    # ---- 顺位 3.5: L2 轻量模式 — 仅提升已缓存头像（CDN 下载，非 Provider API 请求） ----
+    if light_mode and not download_url and existing and existing.image_url:
+        download_url = existing.image_url
+        source = existing.source or "tmdb"
+        logger.info(
+            "   🥈 [Profile] L2 轻量模式提升已缓存头像: %s → %s",
             actor_name, download_url[:80],
         )
 
