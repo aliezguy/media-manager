@@ -113,3 +113,81 @@ def test_light_mode_promotes_cached_image_url(monkeypatch):
     assert downloads, "light_mode=True 应触发头像下载（3.5 提升）"
     assert "http://cached.test/x.jpg" in downloads
     db.close()
+
+
+import services.douban_service as ds
+import services.db_crud as dbc
+
+
+def test_ensure_profiles_forwards_light_mode(monkeypatch):
+    Session = _make_db()
+    db = Session()
+    captured = {}
+
+    def fake_resolve(name, db, context_info=None, force_refresh=False, light_mode=False):
+        captured["light_mode"] = light_mode
+        return {"name": name, "local_image_path": "", "image_url": "",
+                "local_image_url": "", "source": "", "tmdb_id": "", "imdb_id": "",
+                "douban_celebrity_id": "", "birth_date": "", "birth_place": "", "overview": ""}
+    monkeypatch.setattr(aps, "resolve_actor_profile", fake_resolve)
+
+    aps.ensure_profiles_for_people(db, [{"Name": "A", "Type": "Actor"}], light_mode=True)
+    assert captured["light_mode"] is True
+    db.close()
+
+
+def test_ensure_profiles_default_full_mode(monkeypatch):
+    Session = _make_db()
+    db = Session()
+    captured = {}
+
+    def fake_resolve(name, db, context_info=None, force_refresh=False, light_mode=False):
+        captured["light_mode"] = light_mode
+        return {"name": name, "local_image_path": "", "image_url": "",
+                "local_image_url": "", "source": "", "tmdb_id": "", "imdb_id": "",
+                "douban_celebrity_id": "", "birth_date": "", "birth_place": "", "overview": ""}
+    monkeypatch.setattr(aps, "resolve_actor_profile", fake_resolve)
+
+    aps.ensure_profiles_for_people(db, [{"Name": "A", "Type": "Actor"}])  # 默认 False
+    assert captured["light_mode"] is False
+    db.close()
+
+
+def test_save_media_to_db_forwards_light_profiles(monkeypatch):
+    Session = _make_db()
+    db = Session()
+    captured = {}
+
+    def fake_ensure(db, people, light_mode=False):
+        captured["light_mode"] = light_mode
+    monkeypatch.setattr(dbc, "ensure_profiles_for_people", fake_ensure)
+
+    dbc.save_media_to_db(
+        db,
+        emby_item={"Id": "s1", "Name": "九门", "Type": "Series",
+                   "People": [{"Name": "A", "Type": "Actor"}]},
+        people=[{"Name": "A", "Type": "Actor"}],
+        light_profiles=True,
+    )
+    assert captured["light_mode"] is True
+    db.close()
+
+
+def test_save_media_to_db_default_full_mode(monkeypatch):
+    Session = _make_db()
+    db = Session()
+    captured = {}
+
+    def fake_ensure(db, people, light_mode=False):
+        captured["light_mode"] = light_mode
+    monkeypatch.setattr(dbc, "ensure_profiles_for_people", fake_ensure)
+
+    dbc.save_media_to_db(
+        db,
+        emby_item={"Id": "s2", "Name": "无", "Type": "Movie",
+                   "People": [{"Name": "B", "Type": "Actor"}]},
+        people=[{"Name": "B", "Type": "Actor"}],
+        # 不传 light_profiles → 默认完整漏斗
+    )
+    assert captured["light_mode"] is False
+    db.close()

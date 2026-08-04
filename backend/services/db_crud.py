@@ -100,6 +100,7 @@ def save_media_to_db(
     error_message: str = "",
     parent_id: str = None,
     skip_profiles: bool = False,
+    light_profiles: bool = False,   # 系列汉化专用：True 时 profile 解析走 light_mode
 ):
     """通用入库：将一条 Emby 媒体数据 UPSERT 到三张同步表中。
 
@@ -123,6 +124,8 @@ def save_media_to_db(
         error_message:  失败原因（status=failed 时使用）
         parent_id:    父级 Series ID（Episode 入库时传入）
         skip_profiles: True 时跳过 ensure_profiles_for_people（调用方已提前批量处理）
+        light_profiles: True 时 ensure_profiles_for_people 传 light_mode=True
+                       （系列汉化跳过 TMDB 上半场）；audit/task_queue 保持 False
     """
     if provider_ids is None:
         provider_ids = extract_provider_ids(emby_item)
@@ -195,7 +198,7 @@ def save_media_to_db(
                     len([p for p in people if p.get("Type") in ("Actor", "GuestStar")]),
                     title, item_id,
                 )
-                ensure_profiles_for_people(db, people)
+                ensure_profiles_for_people(db, people, light_mode=light_profiles)
 
             # 先删后插 actor_records，保证关联数据与当前一致
             db.query(ActorRecord).filter(

@@ -1473,6 +1473,7 @@ def resolve_actor_profile(
 def ensure_profiles_for_people(
     db,
     people: list,
+    light_mode: bool = False,
 ) -> dict:
     """为一组 People 字典批量确保 ActorProfile 存在。
 
@@ -1529,7 +1530,9 @@ def ensure_profiles_for_people(
                         p.get("ImageTags", {}).get("Primary") if isinstance(p.get("ImageTags"), dict) else None
                     ),
                 }
-                profile = resolve_actor_profile(name, db, context_info=ctx)
+                profile = resolve_actor_profile(
+                    name, db, context_info=ctx, light_mode=light_mode,
+                )
                 if profile:
                     result[name] = profile
                     success_count += 1
