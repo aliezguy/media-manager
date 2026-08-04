@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests as _requests
+from services.request_budget import acquire as budget_acquire
 from requests.exceptions import Timeout, ConnectionError
 from config.settings import load_config
 
@@ -289,6 +290,9 @@ def _tmdb_request(url: str, params: dict, timeout: int = 20, max_retries: int = 
     Returns:
         requests.Response 对象，彻底失败返回 None。
     """
+    if not budget_acquire("tmdb"):
+        logger.warning("   ⚠ [TMDB] 请求预算超限（排队超时），本次请求跳过: %s", url)
+        return None
     last_error = None
     for attempt in range(max_retries + 1):
         try:

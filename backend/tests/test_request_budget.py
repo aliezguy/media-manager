@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import services.request_budget as rb
+import services.actor_profile_service as aps
 from services.douban_api import DoubanApi
 
 
@@ -156,3 +157,33 @@ def test_douban_post_skips_when_budget_exhausted(monkeypatch):
     result = api._DoubanApi__post("/movie/1", name="x")
 
     assert result["error"] == "budget_exhausted"
+
+
+# ==================== 接入点 2：actor_profile_service._tmdb_request ====================
+
+def test_tmdb_request_acquires_budget_and_proceeds(monkeypatch):
+    calls = []
+    monkeypatch.setattr(aps, "budget_acquire", lambda provider, timeout=30.0: calls.append(provider) or True)
+    fake = _FakeSession({"page": 1})
+    monkeypatch.setattr(aps, "_requests", fake)
+
+    resp = aps._tmdb_request("http://tmdb.test/x", {"api_key": "k"})
+
+    assert calls == ["tmdb"]
+    assert fake.calls and fake.calls[0][0] == "get"
+
+
+def test_tmdb_request_skips_when_budget_exhausted(monkeypatch):
+    calls = []
+    monkeypatch.setattr(aps, "budget_acquire", lambda provider, timeout=30.0: calls.append(provider) or False)
+
+    class _NoGet:
+        def get(self, *a, **k):
+            raise AssertionError("预算超限不应发起网络请求")
+
+    monkeypatch.setattr(aps, "_requests", _NoGet())
+
+    resp = aps._tmdb_request("http://tmdb.test/x", {"api_key": "k"})
+
+    assert resp is None
+    assert calls == ["tmdb"]
