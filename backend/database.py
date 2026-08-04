@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker, declarative_base
 import os
@@ -49,105 +49,119 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-def _run_migrations():
-    """对现有表执行增量迁移。
+def _get_table_columns(eng, table_name: str) -> set[str]:
+    """方言无关列探测（替代 PRAGMA table_info）。表不存在返回空集。"""
+    try:
+        return {c["name"] for c in inspect(eng).get_columns(table_name)}
+    except Exception:
+        return set()
+
+
+def _add_column_type(dialect: str, col_name: str) -> str:
+    """方言敏感列类型。
+
+    - JSON 缓存列 douban_cast_cache：SQLite 落 TEXT / MySQL 原生 JSON
+    - translation_source / confidence_level：带默认值
+    - 其余 VARCHAR 列统一补长度 VARCHAR(255)（裸 VARCHAR 在 MySQL 必报 1064，
+      SQLite 忽略长度故双兼容）
+    """
+    if col_name == "douban_cast_cache":
+        return "JSON" if dialect == "mysql" else "TEXT"
+    if col_name == "translation_source":
+        return "VARCHAR(255) DEFAULT ''"
+    if col_name == "confidence_level":
+        return "INTEGER DEFAULT 0"
+    return "VARCHAR(255)"
+
+
+def _run_migrations(eng=None):
+    """对现有表执行增量迁移（方言无关）。
 
     SQLite 不支持 ALTER TABLE DROP COLUMN，因此移除字段的策略是：
-      1. 检查旧列是否存在于 PRAGMA table_info
+      1. 检查旧列是否存在于 inspect(eng).get_columns
       2. 如表无数据 → DROP TABLE + create_all 重建
       3. 如有数据 → 创建新表 → 复制数据 → 删旧表 → 重命名
     """
+    eng = eng or engine
+    dialect = eng.dialect.name
     try:
-        with engine.connect() as conn:
+        with eng.connect() as conn:
             # ---- media_sync_status: 补齐 tmdb_id / imdb_id / douban_id ----
-            existing = [
-                row[1] for row in
-                conn.execute(text("PRAGMA table_info(media_sync_status)")).fetchall()
-            ]
+            existing = _get_table_columns(eng, "media_sync_status")
             for col_name in ("tmdb_id", "imdb_id", "douban_id"):
                 if col_name not in existing:
                     conn.execute(text(
-                        f"ALTER TABLE media_sync_status ADD COLUMN {col_name} VARCHAR"
+                        f"ALTER TABLE media_sync_status ADD COLUMN {col_name} "
+                        f"{_add_column_type(dialect, col_name)}"
                     ))
                     logger.info("📦 [Migration] media_sync_status 添加字段: %s", col_name)
 
-            # ★ P3-3b: douban_cast_cache（JSON 缓存列，SQLite 落为 TEXT，与 create_all 一致）
+            # ★ P3-3b: douban_cast_cache（JSON 缓存列，方言分支：SQLite TEXT / MySQL JSON）
             if "douban_cast_cache" not in existing:
                 conn.execute(text(
-                    "ALTER TABLE media_sync_status ADD COLUMN douban_cast_cache TEXT"
+                    "ALTER TABLE media_sync_status ADD COLUMN douban_cast_cache "
+                    f"{_add_column_type(dialect, 'douban_cast_cache')}"
                 ))
                 logger.info("📦 [Migration] media_sync_status 添加字段: douban_cast_cache")
 
-            # ---- actor_records: 移除废弃的 image_url 列 ----
-            # SQLite 不支持 DROP COLUMN，采用 DROP + 重建策略
-            try:
-                ar_cols = [
-                    row[1] for row in
-                    conn.execute(text("PRAGMA table_info(actor_records)")).fetchall()
-                ]
-            except Exception:
-                ar_cols = []  # 表不存在 — create_all 会处理
+            # ---- actor_records: 移除废弃的 image_url 列（SQLite 专属 DROP+重建） ----
+            # SQLite 不支持 DROP COLUMN，采用 DROP + 重建策略；
+            # MySQL 上由 create_all 直建、无 legacy image_url 列，永不触发（含 AUTOINCREMENT 裸 DDL）。
+            if dialect == "sqlite":
+                ar_cols = _get_table_columns(eng, "actor_records")
+                if "image_url" in ar_cols:
+                    # 检查表是否为空（安全起见）
+                    row_count = conn.execute(
+                        text("SELECT COUNT(*) FROM actor_records")
+                    ).scalar() or 0
 
-            if "image_url" in ar_cols:
-                # 检查表是否为空（安全起见）
-                row_count = conn.execute(
-                    text("SELECT COUNT(*) FROM actor_records")
-                ).scalar() or 0
+                    conn.commit()  # 结束当前事务，DDL 需要独立执行
 
-                conn.commit()  # 结束当前事务，DDL 需要独立执行
-
-                if row_count == 0:
-                    # 无数据 — 直接 DROP + 重建
-                    with engine.connect() as ddl_conn:
-                        ddl_conn.execute(text("DROP TABLE IF EXISTS actor_records"))
-                        ddl_conn.commit()
-                    from models import ActorRecord
-                    ActorRecord.__table__.create(bind=engine, checkfirst=True)
-                    logger.info(
-                        "📦 [Migration] actor_records 已重建（移除废弃 image_url 列，0 行数据）"
-                    )
-                else:
-                    # 有数据 — 安全重建（创建新表 → 复制 → 删旧 → 重命名）
-                    logger.info(
-                        "📦 [Migration] actor_records 含 %d 行数据，执行安全重建...",
-                        row_count,
-                    )
-                    with engine.connect() as ddl_conn:
-                        ddl_conn.execute(text("""
-                            CREATE TABLE IF NOT EXISTS actor_records_new (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                emby_item_id VARCHAR NOT NULL,
-                                name VARCHAR NOT NULL,
-                                role VARCHAR,
-                                type VARCHAR NOT NULL DEFAULT 'Actor',
-                                sort_order INTEGER DEFAULT 0,
-                                update_time DATETIME
-                            )
-                        """))
-                        ddl_conn.execute(text("""
-                            INSERT INTO actor_records_new
-                                (id, emby_item_id, name, role, type, sort_order, update_time)
-                            SELECT id, emby_item_id, name, role, type, sort_order, update_time
-                            FROM actor_records
-                        """))
-                        ddl_conn.execute(text("DROP TABLE actor_records"))
-                        ddl_conn.execute(text(
-                            "ALTER TABLE actor_records_new RENAME TO actor_records"
-                        ))
-                        ddl_conn.commit()
-                    logger.info(
-                        "📦 [Migration] actor_records 已安全重建（移除废弃 image_url 列）"
-                    )
+                    if row_count == 0:
+                        # 无数据 — 直接 DROP + 重建
+                        with eng.connect() as ddl_conn:
+                            ddl_conn.execute(text("DROP TABLE IF EXISTS actor_records"))
+                            ddl_conn.commit()
+                        from models import ActorRecord
+                        ActorRecord.__table__.create(bind=eng, checkfirst=True)
+                        logger.info(
+                            "📦 [Migration] actor_records 已重建（移除废弃 image_url 列，0 行数据）"
+                        )
+                    else:
+                        # 有数据 — 安全重建（创建新表 → 复制 → 删旧 → 重命名）
+                        logger.info(
+                            "📦 [Migration] actor_records 含 %d 行数据，执行安全重建...",
+                            row_count,
+                        )
+                        with eng.connect() as ddl_conn:
+                            ddl_conn.execute(text("""
+                                CREATE TABLE IF NOT EXISTS actor_records_new (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    emby_item_id VARCHAR NOT NULL,
+                                    name VARCHAR NOT NULL,
+                                    role VARCHAR,
+                                    type VARCHAR NOT NULL DEFAULT 'Actor',
+                                    sort_order INTEGER DEFAULT 0,
+                                    update_time DATETIME
+                                )
+                            """))
+                            ddl_conn.execute(text("""
+                                INSERT INTO actor_records_new
+                                    (id, emby_item_id, name, role, type, sort_order, update_time)
+                                SELECT id, emby_item_id, name, role, type, sort_order, update_time
+                                FROM actor_records
+                            """))
+                            ddl_conn.execute(text("DROP TABLE actor_records"))
+                            ddl_conn.execute(text(
+                                "ALTER TABLE actor_records_new RENAME TO actor_records"
+                            ))
+                            ddl_conn.commit()
+                        logger.info(
+                            "📦 [Migration] actor_records 已安全重建（移除废弃 image_url 列）"
+                        )
 
             # ---- actor_profiles: douban_id → douban_celebrity_id ----
-            try:
-                ap_cols = [
-                    row[1] for row in
-                    conn.execute(text("PRAGMA table_info(actor_profiles)")).fetchall()
-                ]
-            except Exception:
-                ap_cols = []
-
+            ap_cols = _get_table_columns(eng, "actor_profiles")
             if "douban_id" in ap_cols and "douban_celebrity_id" not in ap_cols:
                 conn.execute(text(
                     "ALTER TABLE actor_profiles RENAME COLUMN douban_id TO douban_celebrity_id"
@@ -159,21 +173,12 @@ def _run_migrations():
 
             # ---- actor_profiles / actor_records: 新增置信度与译名来源列 ----
             for table_name in ("actor_profiles", "actor_records"):
-                try:
-                    cols = [
-                        row[1] for row in
-                        conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
-                    ]
-                except Exception:
-                    continue  # 表尚未创建 — create_all 会处理
-
-                for col_name, col_type in (
-                    ("confidence_level", "INTEGER DEFAULT 0"),
-                    ("translation_source", "VARCHAR DEFAULT ''"),
-                ):
+                cols = _get_table_columns(eng, table_name)
+                for col_name in ("confidence_level", "translation_source"):
                     if col_name not in cols:
                         conn.execute(text(
-                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} "
+                            f"{_add_column_type(dialect, col_name)}"
                         ))
                         logger.info("📦 [Migration] %s 添加字段: %s", table_name, col_name)
 
