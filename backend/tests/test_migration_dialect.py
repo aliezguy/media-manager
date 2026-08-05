@@ -25,6 +25,17 @@ def test_add_column_type_varchar_universal():
         assert _add_column_type(dialect, "translation_source") == "VARCHAR(255) DEFAULT ''"
 
 
+def test_add_column_type_overview_source_default():
+    # overview_source 审计字段：双方言均带 DEFAULT ''（MySQL 非空列必填默认值）
+    for dialect in ("sqlite", "mysql"):
+        assert _add_column_type(dialect, "overview_source") == "VARCHAR(255) DEFAULT ''"
+
+
+def test_add_column_type_overview_updated_at_datetime():
+    for dialect in ("sqlite", "mysql"):
+        assert _add_column_type(dialect, "overview_updated_at") == "DATETIME"
+
+
 # ---------- 迁移函数：SQLite 上可执行且 JSON 落 TEXT ----------
 
 def _sqlite_session():

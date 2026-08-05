@@ -17,6 +17,7 @@ from database import SessionLocal
 from models import MediaSyncStatus, MediaMetadata, ActorRecord
 from services.tmdb_service import get_tmdb_image_urls
 from services.actor_profile_service import ensure_profiles_for_people
+from services.translation_utils import apply_overview_with_guard
 
 logger = logging.getLogger("uvicorn")
 
@@ -179,7 +180,13 @@ def save_media_to_db(
         rec2.parent_id = parent_id
         rec2.media_type = media_type
         rec2.title = title or ""
-        rec2.overview = overview or ""
+        # ★ 防覆盖守卫：AI 已汉化的中文简介，禁止被 Emby 重新同步的非中文新值覆盖
+        #   （官方推来纯中文才允许覆盖并标记 official）
+        if not apply_overview_with_guard(rec2, overview):
+            logger.info(
+                "   🛡 [DBCrud] %s overview 为 AI 中文简介，拒绝被非中文覆盖: %r",
+                item_id, overview,
+            )
         rec2.index_number = index_number
         rec2.parent_index_number = parent_index_number
         rec2.recursive_item_count = recursive_item_count

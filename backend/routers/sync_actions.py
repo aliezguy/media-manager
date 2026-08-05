@@ -25,7 +25,7 @@ from services.db_crud import (
     extract_external_images,
 )
 from services.actor_profile_service import resolve_actor_profile, ensure_profiles_for_people
-from services.translation_utils import is_valid_chinese_translation
+from services.translation_utils import is_valid_chinese_translation, apply_overview_with_guard
 from utils.task_manager import task_manager
 
 router = APIRouter()
@@ -152,6 +152,7 @@ def _process_episodes(db, episodes: list, series_id: str, library_id: str,
                       apply_localization: bool = False,
                       douban_actor_map: dict = None,
                       series_name: str = "",
+                      year: str = "",
                       max_actors: int = 50) -> int:
     """处理 Series 下的所有分集，统一通过 save_media_to_db 入库。
 
@@ -159,6 +160,7 @@ def _process_episodes(db, episodes: list, series_id: str, library_id: str,
         apply_localization: 是否对分集演员应用中文化（来自豆瓣匹配结果）
         douban_actor_map: {emby_actor_name: {"name": 中文名, "role": 中文角色名}}
         series_name: 剧集名称，供 AI 翻译上下文使用
+        year:        剧集年份（ProductionYear），强化 AI 翻译作品消歧，可选
         max_actors:      最大入库演员数（用于截断）
     """
     processed = 0
@@ -173,7 +175,7 @@ def _process_episodes(db, episodes: list, series_id: str, library_id: str,
             # ★ 分集演员中文化：使用豆瓣匹配结果替换英文名/角色
             if apply_localization and douban_actor_map:
                 ep_people = _localize_episode_people(
-                    ep_people, douban_actor_map, series_name=series_name,
+                    ep_people, douban_actor_map, series_name=series_name, year=year,
                 )
 
             # ★ 分集截断
@@ -212,7 +214,7 @@ def _process_episodes(db, episodes: list, series_id: str, library_id: str,
 
 
 def _localize_episode_people(ep_people: list, douban_map: dict,
-                             series_name: str = "") -> list:
+                             series_name: str = "", year: str = "") -> list:
     """对分集的演员列表应用中文化替换（含 AI 兜底 + 动态缓存）。
 
     三级漏斗策略：
@@ -225,6 +227,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
         douban_map:  {emby_name_lower: {"name": "中文名", "role": "中文角色"}}
                      此字典会被原地修改（引用传递），用于跨分集缓存
         series_name: 剧集名称，作为 AI 翻译上下文
+        year:        剧集年份（ProductionYear），强化作品消歧，可选
 
     Returns:
         中文化后的 People 列表
@@ -286,7 +289,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
             if _pending_ai_names:
                 unique_names = list(set(_pending_ai_names.values()))
                 try:
-                    name_map = translator.translate_names(unique_names, context=series_name)
+                    name_map = translator.translate_names(unique_names, context=series_name, year=year)
                     # c. 动态缓存：将 AI 结果写入 douban_map
                     for lookup_key, original_name in _pending_ai_names.items():
                         translated = name_map.get(original_name, "")
@@ -308,7 +311,7 @@ def _localize_episode_people(ep_people: list, douban_map: dict,
                 ]
                 if unique_roles:
                     try:
-                        role_map = translator.translate_roles(unique_roles, context=series_name)
+                        role_map = translator.translate_roles(unique_roles, context=series_name, year=year)
                         # c. 动态缓存
                         for lookup_key, original_role in _pending_ai_roles.items():
                             translated = role_map.get(original_role, "")
@@ -542,6 +545,7 @@ def _audit_and_save_single_item(
                         apply_localization=bool(douban_map),
                         douban_actor_map=douban_map,
                         series_name=item_name,
+                        year=str(item.get("ProductionYear", "") or ""),
                         max_actors=max_actors,
                     )
                     logger.info(
@@ -574,6 +578,7 @@ def _audit_and_save_single_item(
                         apply_localization=False,
                         douban_actor_map=None,
                         series_name=item_name,
+                        year=str(item.get("ProductionYear", "") or ""),
                         max_actors=max_actors,
                     )
 
@@ -1334,8 +1339,8 @@ def _batch_enrich_episodes_task(
                 ).all()
 
                 for ep_rec in ep_records:
-                    if overview:
-                        ep_rec.overview = overview
+                    # ★ 防覆盖守卫：AI 已汉化简介禁止被 TMDB 非中文新值覆盖，仅真正写入才置 update_time
+                    if overview and apply_overview_with_guard(ep_rec, overview):
                         ep_rec.update_time = datetime.now()
 
                     # 写入客串演员到 actor_records（仅当该 Episode 尚无记录时）
@@ -2038,8 +2043,8 @@ def _batch_audit_task(
                         ).all()
 
                         for ep_rec in ep_recs:
-                            if overview:
-                                ep_rec.overview = overview
+                            # ★ 防覆盖守卫：AI 已汉化简介禁止被 TMDB 非中文新值覆盖，仅真正写入才置 update_time
+                            if overview and apply_overview_with_guard(ep_rec, overview):
                                 ep_rec.update_time = datetime.now()
 
                             # 写入客串演员关联（仅当尚无记录时）

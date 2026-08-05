@@ -1,6 +1,6 @@
-"""maintenance_jobs.py — 全量汉化 / 全量审计可配置定时任务。
+"""maintenance_jobs.py — 全量汉化 / 全量审计 / 全库简介汉化可配置定时任务。
 
-两个任务的配置持久化在 config.json（``localization_job`` / ``audit_job``），
+三个任务的配置持久化在 config.json（``localization_job`` / ``audit_job`` / ``overview_job``），
 由本模块负责：
 - 配置读写（含 last_run_at 持久化、next_run_at 动态计算）
 - APScheduler Cron 作业注册/移除（与 scheduler_service 共用全局 scheduler）
@@ -19,7 +19,7 @@ from croniter import croniter
 
 from config.settings import load_config, save_config
 
-JOB_KEYS = ("localization_job", "audit_job")
+JOB_KEYS = ("localization_job", "audit_job", "overview_job")
 logger = logging.getLogger(__name__)
 
 
@@ -198,6 +198,8 @@ def run_job(job_key: str) -> dict:
         try:
             if job_key == "localization_job":
                 summary = _run_full_localization(lib)
+            elif job_key == "overview_job":
+                summary = _run_overview_translation(lib)
             else:
                 summary = _run_full_audit(lib)
             summary = summary or {}
@@ -335,3 +337,19 @@ def _run_full_localization(library_id: str) -> dict:
         "[MaintenanceJob] 全量汉化: task=%s items=%d", task_id, len(pending_ids),
     )
     return {"task_id": task_id, "items": len(pending_ids)}
+
+
+def _run_overview_translation(library_id: str) -> dict:
+    """全库简介汉化：扫描选中媒体库内所有非中文 overview，本地 qwen 优先、云端兜底。
+
+    复用 overview_translator.scan_and_translate（单行 commit、防覆盖守卫已内建），
+    库过滤经 MediaSyncStatus.library_id 桥接。
+    """
+    from database import SessionLocal
+    from services.overview_translator import scan_and_translate
+
+    db = SessionLocal()
+    try:
+        return scan_and_translate(db, library_ids=[library_id])
+    finally:
+        db.close()
