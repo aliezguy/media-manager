@@ -526,7 +526,11 @@ def _ctx_bp_chat(system_prompt, user_prompt, temperature=0.1, max_tokens=1000, c
 
 
 def test_resolve_cache_hit_translates_birthplace(monkeypatch):
-    """L0 数据库极速命中（有本地头像）→ 仍汉化英文出生地，并落库翻译来源。"""
+    """L0 数据库极速命中（有本地头像）→ 演员库显式 skip_llm_enrich=False 时仍汉化英文出生地并落库来源。
+
+    默认 config（actor_bio_inline_enabled=False）下汉化/审计不再内联补简介（见 test_bio_skip.py）；
+    本测试显式走演员库路径（skip_llm_enrich=False），验证早返回路径的补全机制本身仍然工作。
+    """
     Session = _mem_db()
     db = Session()
     db.add(ActorProfile(
@@ -539,7 +543,9 @@ def test_resolve_cache_hit_translates_birthplace(monkeypatch):
     monkeypatch.setattr(aps, "_local_file_exists", lambda p: True)
     monkeypatch.setattr(apa, "_chat", _ctx_bp_chat)
 
-    prof = aps.resolve_actor_profile("Zhang Yi", db, context_info={}, light_mode=True)
+    prof = aps.resolve_actor_profile(
+        "Zhang Yi", db, context_info={}, light_mode=True, skip_llm_enrich=False,
+    )
     assert prof["birth_place"] == "中国黑龙江省哈尔滨市"
     row = db.query(ActorProfile).filter(ActorProfile.name == "Zhang Yi").first()
     assert row.llm_check_status == 1 and row.llm_last_checked is not None
@@ -552,7 +558,7 @@ def test_resolve_cache_hit_translates_birthplace(monkeypatch):
 
 
 def test_resolve_cooldown_translates_birthplace(monkeypatch):
-    """头像冷却期内（无本地文件，最近更新过）→ 仍汉化英文出生地。"""
+    """头像冷却期内（无本地文件，最近更新过）→ 演员库显式 skip_llm_enrich=False 时仍汉化英文出生地。"""
     Session = _mem_db()
     db = Session()
     db.add(ActorProfile(
@@ -564,7 +570,9 @@ def test_resolve_cooldown_translates_birthplace(monkeypatch):
     monkeypatch.setattr(aps, "_find_local_avatar", lambda name: None)
     monkeypatch.setattr(apa, "_chat", lambda *a, **k: "中国黑龙江省哈尔滨市")
 
-    prof = aps.resolve_actor_profile("Zhang Yi", db, context_info={}, light_mode=True)
+    prof = aps.resolve_actor_profile(
+        "Zhang Yi", db, context_info={}, light_mode=True, skip_llm_enrich=False,
+    )
     assert prof["birth_place"] == "中国黑龙江省哈尔滨市"
     db.close()
 

@@ -100,6 +100,12 @@ DEFAULT_CONFIG = {
     "actor_ai_enabled": True,     # 总开关：False 时跳过所有演员元数据 LLM 调用
     "actor_ai_local_first": True, # 本地大模型优先（ollama qwen2.5），翻译不到再走其他 Provider
     "llm_cooldown_days": 7,       # LLM「不知道」冷静期: -1 无限期(status=2 永不再查) / 0 无 / N 天内不重查
+
+    # ★ 汉化/审计是否内联补演员简介（D3 决策）
+    #   False（默认）= 汉化/审计只建身份+TMDB/豆瓣免费元数据，不逐演员触发 LLM 简介补全（快）
+    #   True = 切回旧行为，汉化/审计逐演员内联补简介
+    #   演员库刷新/修复路径显式 skip_llm_enrich=False，不受本开关影响
+    "actor_bio_inline_enabled": False,
 }
 
 def load_config():

@@ -107,7 +107,7 @@ def _ai_providers_available(cfg: dict) -> bool:
         return False
 
 
-def _llm_enrich_existing(actor_name: str, existing, db):
+def _llm_enrich_existing(actor_name: str, existing, db, skip_llm_enrich: bool = False):
     """对已有 ActorProfile 行做 LLM 出生地汉化/空值补全并落库（无网络请求）。
 
     【为什么需要】审计/汉化流程对「已存在且近期更新过」的演员会命中 L0 缓存或
@@ -118,9 +118,15 @@ def _llm_enrich_existing(actor_name: str, existing, db):
     - 受 actor_ai_enabled 开关 + llm_check_status/llm_last_checked 冷静期保护；
     - 只在本轮真正调用了 LLM 时 flush（status 非 None），否则原样返回。
 
+    Args:
+        skip_llm_enrich: True 时直接返回 None，不触发任何 LLM（汉化/审计默认路径，
+                         简介补全已解耦到演员库统一刷新）。
+
     Returns:
         补全后的字段容器 dict | None（无 LLM 调用 / 无工作时返回 None，调用方沿用 existing）
     """
+    if skip_llm_enrich:
+        return None
     cfg = load_config()
     if not cfg.get("actor_ai_enabled", True) or not _ai_providers_available(cfg):
         return None
@@ -920,6 +926,7 @@ def resolve_actor_profile(
     context_info: dict | None = None,
     force_refresh: bool = False,
     light_mode: bool = False,
+    skip_llm_enrich: bool | None = None,
 ) -> dict | None:
     """超级漏斗：L0 本地 → L0.5 Emby → L1 豆瓣 → L2 TMDB → UPSERT。
 
@@ -944,6 +951,13 @@ def resolve_actor_profile(
         light_mode:    轻量模式（系列汉化专用）。True 时跳过整个 TMDB 上半场
                        （每演员 0-2 次请求的大头），只走 L0/L0.5/L1，L2 仅提升
                        已缓存头像；False 走完整漏斗。演员库刷新务必传 False。
+        skip_llm_enrich: 三态控制是否跳过「演员简介 LLM 补全/汉化」:
+                       - None（默认）→ 跟随配置 actor_bio_inline_enabled
+                         （False=汉化/审计不内联补简介；True=切回旧行为内联补）
+                       - True  → 强制跳过（汉化/审计默认路径）
+                       - False → 强制不跳过（演员库刷新/修复路径，不受配置影响）
+                         跳过简介只影响 LLM 生成/翻译；TMDB/豆瓣 免费元数据照常入库，
+                         角色名翻译走独立链路，完全不受影响。
 
     Returns:
         成功时返回 dict:
@@ -964,6 +978,14 @@ def resolve_actor_profile(
         return None
 
     logger.info("🚀 [Profile] 开始解析演员: %s", actor_name)
+
+    # ★ 三态 skip_llm_enrich → 布尔 skip_llm（用 is None 判断，勿用 or，避免 None 被误判为 False）
+    cfg = load_config()
+    if skip_llm_enrich is None:
+        # 跟随配置：默认 False 表示汉化/审计不内联补简介（快），改 True 切回旧行为
+        skip_llm = not cfg.get("actor_bio_inline_enabled", False)
+    else:
+        skip_llm = bool(skip_llm_enrich)
 
     ctx = context_info or {}
     douban_avatar = (ctx.get("douban_avatar_url") or "").strip()
@@ -1008,7 +1030,8 @@ def resolve_actor_profile(
                 actor_name, existing.local_image_path,
             )
             # ★ 已有记录仍做 LLM 出生地汉化/空值补全（审计流程主路径，无网络请求）
-            _llm_enrich_existing(actor_name, existing, db)
+            if not skip_llm:
+                _llm_enrich_existing(actor_name, existing, db, skip_llm_enrich=skip_llm)
             return {
                 "name": existing.name,
                 "local_image_path": existing.local_image_path,
@@ -1058,7 +1081,8 @@ def resolve_actor_profile(
                     actor_name, local_avatar_path,
                 )
                 # ★ 已有记录仍做 LLM 出生地汉化/空值补全（无网络请求）
-                _llm_enrich_existing(actor_name, existing, db)
+                if not skip_llm:
+                    _llm_enrich_existing(actor_name, existing, db, skip_llm_enrich=skip_llm)
                 return {
                     "name": existing.name,
                     "local_image_path": existing.local_image_path,
@@ -1102,7 +1126,8 @@ def resolve_actor_profile(
                     existing.update_time.strftime("%Y-%m-%d"),
                 )
                 # ★ 冷却期内仍做 LLM 出生地汉化/空值补全（无网络请求，受 LLM 冷静期保护）
-                _llm_enrich_existing(actor_name, existing, db)
+                if not skip_llm:
+                    _llm_enrich_existing(actor_name, existing, db, skip_llm_enrich=skip_llm)
                 return {
                     "name": existing.name,
                     "local_image_path": "",
@@ -1146,8 +1171,6 @@ def resolve_actor_profile(
     source = ""
     local_path = ""
     tmdb_avatar_bak = ""  # ★ TMDB 头像备份，仅在上半场暂存，下半场才决定是否使用
-
-    cfg = load_config()
 
     # ★ 提取豆瓣 Cookie 用于 API 鉴权，避免 need_login 流控
     douban_cookie = (
@@ -1431,7 +1454,8 @@ def resolve_actor_profile(
     llm_last_checked = None
     llm_translation_source = ""
     llm_field_sources = {}
-    if cfg.get("actor_ai_enabled", True) and _ai_providers_available(cfg):
+    # ★ skip_llm=True 时整块跳过（汉化/审计默认路径不内联补简介；TMDB/豆瓣 免费元数据照常已入库）
+    if not skip_llm and cfg.get("actor_ai_enabled", True) and _ai_providers_available(cfg):
         try:
             from services.actor_profile_ai import enrich_actor_metadata
             (profile_data, llm_check_status, llm_last_checked,
