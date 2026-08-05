@@ -171,6 +171,8 @@ def refresh_actor(actor_name: str):
             actor_name, db,
             context_info=ctx,
             force_refresh=True,
+            # ★ 演员库路径：显式 False → LLM 简介补全始终开启，不受 actor_bio_inline_enabled 配置影响
+            skip_llm_enrich=False,
         )
 
         if result is None:
@@ -303,6 +305,8 @@ def _batch_repair_task(task_id: str):
                     actor_name, db,
                     context_info=ctx,
                     force_refresh=True,
+                    # ★ 演员库路径：显式 False → LLM 简介补全始终开启，不受 actor_bio_inline_enabled 配置影响
+                    skip_llm_enrich=False,
                 )
 
                 if result and (result.get("overview") or result.get("tmdb_id")):
@@ -585,6 +589,172 @@ def repair_birthplace(background_tasks: BackgroundTasks):
     return {
         "task_id": task_id,
         "message": f"出生地批量汉化已启动，共 {broken_count} 条",
+        "count": broken_count,
+    }
+
+
+# ================================================================
+# 演员简介一键补全（overview 为空/非中文）— 后台任务 + 触发接口
+# ================================================================
+
+def _repair_overview_task(task_id: str):
+    """后台任务：批量补全所有缺失或非中文的演员简介（overview）。
+
+    查询 overview 为空 或 非中文 的演员，逐个调 resolve_actor_profile
+    （显式 skip_llm_enrich=False → 强制 LLM 补全/汉化，不受 actor_bio_inline_enabled
+    配置影响）：L0 库命中 → _llm_enrich_existing 零网络补简介；无缓存才落网络路径。
+    llm_check_status=2 冷静期天然限流冷门演员。单条失败保留原值，绝不影响其他演员。
+    """
+    from services.actor_profile_service import resolve_actor_profile
+
+    db = SessionLocal()
+    _repair_success = False
+    _repair_final_msg = "❌ 简介批量补全失败，请查看服务端日志"
+    repaired = 0
+    failed = 0
+    skipped = 0
+
+    try:
+        rows = db.query(ActorProfile).all()
+        targets = [
+            r for r in rows
+            if not r.overview or not is_valid_chinese_translation(r.overview)
+        ]
+        total = len(targets)
+
+        task_manager.update_progress(
+            task_id,
+            total=total,
+            message=f"发现 {total} 位演员简介缺失/非中文，开始补全...",
+        )
+
+        if total == 0:
+            _repair_success = True
+            _repair_final_msg = "✅ 所有演员简介均已完整，无需修复"
+            return
+
+        logger.info(
+            "🔧 [RepairOverview] 开始补全 %d 位演员简介 (task=%s)",
+            total, task_id,
+        )
+
+        for idx, actor in enumerate(targets):
+            current = idx + 1
+            actor_name = actor.name
+
+            task_manager.update_progress(
+                task_id,
+                current=current - 1,
+                message=f"补全中 {current}/{total}: {actor_name}",
+            )
+
+            try:
+                # ★ 演员库路径：显式 skip_llm_enrich=False → 强制补简介，不受配置影响
+                result = resolve_actor_profile(
+                    actor_name, db,
+                    context_info={},
+                    skip_llm_enrich=False,
+                )
+                if result and (
+                    result.get("overview")
+                    and is_valid_chinese_translation(result["overview"])
+                ):
+                    db.commit()
+                    repaired += 1
+                    logger.info(
+                        "   ✅ [RepairOverview] %s 简介已补全 (%d chars)",
+                        actor_name, len(result["overview"]),
+                    )
+                else:
+                    db.rollback()
+                    skipped += 1
+                    logger.warning(
+                        "   ⏭ [RepairOverview] %s 简介仍未补全", actor_name,
+                    )
+            except Exception:
+                db.rollback()
+                failed += 1
+                logger.error(
+                    "   ❌ [RepairOverview] %s 异常:\n%s",
+                    actor_name, traceback.format_exc(),
+                )
+
+            task_manager.update_progress(
+                task_id,
+                current=current,
+                message=(
+                    f"已完成 {current}/{total} "
+                    f"（补全 {repaired} | 跳过 {skipped} | 失败 {failed}）"
+                ),
+            )
+
+            # 拟人化随机休眠，避免高频并发触发 LLM Provider 限流
+            time.sleep(random.uniform(0.5, 1.5))
+
+        _repair_success = True
+        _repair_final_msg = (
+            f"✅ 简介批量补全完成: {total} 位演员 | "
+            f"补全 {repaired} | 跳过 {skipped} | 失败 {failed}"
+        )
+
+    except Exception as e:
+        logger.error(
+            "❌ [RepairOverview] 任务崩溃 (task=%s):\n%s",
+            task_id, traceback.format_exc(),
+        )
+        _repair_final_msg = f"❌ 任务崩溃: {str(e)[:200]}"
+        try:
+            task_manager.update_progress(
+                task_id, status="error", message=_repair_final_msg,
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            task_manager.complete_task(
+                task_id, _repair_final_msg, success=_repair_success,
+            )
+        except Exception:
+            try:
+                task_manager.complete_task(
+                    task_id, "❌ 简介补全异常终止", success=False,
+                )
+            except Exception:
+                pass
+        db.close()
+
+
+@router.post("/actors/repair_overview")
+def repair_overview(background_tasks: BackgroundTasks):
+    """一键批量补全缺失/非中文演员简介（后台任务，前端经 GET /api/tasks/{task_id} 轮询）。"""
+    db = SessionLocal()
+    try:
+        rows = db.query(ActorProfile).all()
+        broken_count = sum(
+            1 for r in rows
+            if not r.overview or not is_valid_chinese_translation(r.overview)
+        )
+    finally:
+        db.close()
+
+    if broken_count == 0:
+        return {"task_id": "", "message": "所有演员简介均已完整，无需修复", "count": 0}
+
+    task_id = task_manager.create_task(
+        total=broken_count,
+        message=f"发现 {broken_count} 位演员简介缺失/非中文，准备补全...",
+        metadata={"type": "repair_overview", "count": broken_count},
+    )
+
+    background_tasks.add_task(_repair_overview_task, task_id=task_id)
+
+    logger.info(
+        "🔧 [RepairOverview] 触发批量补全: task=%s count=%d",
+        task_id, broken_count,
+    )
+    return {
+        "task_id": task_id,
+        "message": f"简介批量补全已启动，共 {broken_count} 位演员",
         "count": broken_count,
     }
 
