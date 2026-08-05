@@ -185,6 +185,9 @@ class MediaMetadata(Base):
     recursive_item_count = Column(Integer, nullable=True)   # 子项总数 (仅 Series: 含 Seasons + Episodes)
     poster_url = Column(Text)
     backdrop_url = Column(Text)
+    # ★ 简介汉化审计：overview 由谁写入 — local_llm / cloud_llm / official / ""
+    overview_source = Column(String(255), default="")
+    overview_updated_at = Column(DateTime, nullable=True)   # 最近一次简介翻译时间（审计/后续冷静期预留）
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
@@ -208,6 +211,15 @@ class ActorProfile(Base):
     overview = Column(Text)
     confidence_level = Column(Integer, default=0)     # 中文名译名置信度: 4官方 / 3AI / 5手动
     translation_source = Column(String(255), default="")   # "official" / "ai_llm" / "manual"
+    # ★ 大模型核查状态（出生地/简介/生日空值补全）:
+    #   0=未检查(默认, 可触发 LLM) / 1=检查并成功更新 / 2=已检查但模型不知道(触发冷静期)
+    llm_check_status = Column(Integer, default=0)
+    # 最后 LLM 检查时间戳（配合 llm_cooldown_days 冷静期，避免重复击穿）
+    llm_last_checked = Column(DateTime, nullable=True)
+    # ★ 大模型翻译来源：成功产出数据的大模型名，逗号分隔去重（如 "gemini-2.5-flash,qwen2.5"）
+    llm_translation_source = Column(String(255), default="")
+    # ★ 按字段的大模型来源映射（JSON）: {"birth_place": "qwen2.5", "overview": "gemini-2.5-flash"}
+    llm_field_sources = Column(JSON, nullable=True)
     update_time = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 

@@ -347,6 +347,11 @@ _TRANSLATION_TEMPLATES = {
         "rule_jp": (
             "2. 日文角色名尽量保留原汉字并转为简体；其余外语使用国内观众熟悉的通用译名。"
         ),
+        "rule_context": (
+            "【角色语境判断】必须依据上面的作品背景确定角色译名：同一角色名在不同作品中的"
+            "中文译法可能不同（如翻拍/译制版本差异），请以【这部特定作品】为准，选取官方或"
+            "国内最受认可的中文译名。"
+        ),
         "table_note": "角色表",
     },
 }
@@ -405,6 +410,7 @@ class AITranslator:
             "model_name": model_name,
             "timeout": cls._safe_positive_int(raw.get("timeout"), default_timeout, allow_zero=False),
             "max_retries": cls._safe_positive_int(raw.get("max_retries"), default_retries, allow_zero=True),
+            "is_local": bool(raw.get("is_local")),  # 显式本地大模型标记（actor 元数据本地优先用）
         }
 
     @classmethod
@@ -502,9 +508,10 @@ class AITranslator:
     # ------------------------------------------------------------------
 
     def _chat_once(self, client: OpenAI, provider: dict, messages: List[dict],
-                   temperature: float, max_tokens: int):
+                   temperature: float, max_tokens: int, require_json: bool = True):
         """
         单次 chat.completions.create。
+        require_json=True 时附带 response_format（JSON 强制）；False 时纯文本（单值任务用）。
         若当前 API 不支持 response_format（部分兼容端点返回 400），
         自动降级为无格式约束重试一次；其余异常原样上抛由重试/降级层处理。
         """
@@ -516,9 +523,11 @@ class AITranslator:
             timeout=provider.get("timeout", DEFAULT_TIMEOUT),
         )
         try:
-            return client.chat.completions.create(**kwargs, response_format={"type": "json_object"})
+            if require_json:
+                return client.chat.completions.create(**kwargs, response_format={"type": "json_object"})
+            return client.chat.completions.create(**kwargs)
         except Exception as exc:
-            if _is_response_format_unsupported(exc):
+            if require_json and _is_response_format_unsupported(exc):
                 logger.info(
                     "   ℹ️ [AI翻译] Provider[%s] 不支持 response_format，降级为无格式约束重试",
                     provider["name"],
@@ -527,7 +536,8 @@ class AITranslator:
             raise
 
     def _chat_with_address_fallback(self, *, provider: dict, messages: List[dict],
-                                    temperature: float, max_tokens: int):
+                                    temperature: float, max_tokens: int,
+                                    require_json: bool = True):
         """
         【地址级降级核心】同一 Provider 内，主地址 → 备选地址 逐个尝试。
 
@@ -559,7 +569,8 @@ class AITranslator:
 
             try:
                 resp = _retry_with_backoff(
-                    lambda: self._chat_once(client, provider, messages, temperature, max_tokens),
+                    lambda: self._chat_once(client, provider, messages, temperature, max_tokens,
+                                            require_json=require_json),
                     max_retries=provider["max_retries"],
                     base_delay=DEFAULT_BASE_DELAY,
                     max_delay=DEFAULT_MAX_BACKOFF_DELAY,
@@ -650,6 +661,135 @@ class AITranslator:
         return None
 
     # ------------------------------------------------------------------
+    # 本地优先 + NULL 感知降级（演员元数据补全专用）
+    # ------------------------------------------------------------------
+
+    _LOCAL_PROVIDER_MARKERS = ("ollama", "本地", "local", "qwen")
+    _LOCAL_HOST_MARKERS = ("11434", "127.0.0.1", "localhost", "host.docker.internal", "0.0.0.0")
+
+    @staticmethod
+    def _is_local_provider(provider: dict) -> bool:
+        """判断 Provider 是否为本地大模型（ollama / qwen / localhost 等）。
+
+        判据：显式 is_local 字段 → name/model/base_url/alt_base_url 命中本地标记。
+        """
+        if not isinstance(provider, dict):
+            return False
+        if provider.get("is_local"):
+            return True
+        haystack = " ".join([
+            str(provider.get("name") or "").lower(),
+            str(provider.get("model_name") or "").lower(),
+            str(provider.get("base_url") or "").lower(),
+            str(provider.get("alt_base_url") or "").lower(),
+        ])
+        return (
+            any(m in haystack for m in AITranslator._LOCAL_PROVIDER_MARKERS)
+            or any(h in haystack for h in AITranslator._LOCAL_HOST_MARKERS)
+        )
+
+    @classmethod
+    def _providers_local_first(cls, providers: List[dict]) -> List[dict]:
+        """稳定分区：本地 Provider 排前，其余保持原相对顺序（首选项语义不变）。"""
+        return (
+            [p for p in providers if cls._is_local_provider(p)]
+            + [p for p in providers if not cls._is_local_provider(p)]
+        )
+
+    def chat_null_aware(self, system_prompt: str, user_prompt: str,
+                        temperature: float = 0.1, max_tokens: int = 2000,
+                        local_first: bool = True,
+                        skip: Optional[set] = None,
+                        validator: Optional[Callable[[str], bool]] = None) -> tuple[Optional[str], Optional[str], set]:
+        """NULL 感知瀑布流：单个 Provider 返回空串或字面 "NULL" 视为「不知道」→ 降级下一个。
+
+        【核心语义】「翻译不到再使用其他的大模型」：
+        - local_first=True（默认）时本地大模型（ollama qwen2.5）最先尝试；
+        - 本地返回 NULL / 空 / 连接失败 → 无缝降级到云端 Provider；
+        - validator（可选）：对 Provider 返回的内容做领域有效性验收（如中文校验）。
+          未通过 validator 的内容与 NULL/空 同等对待 → 记入 null_models 并降级下一个
+          Provider。默认 None 保持原语义（首个非空即接受），向后兼容。
+        - 全部 Provider 均失败或返回 NULL → content=None（调用方 strict-NULL 兜底，绝不编造）。
+        - skip：按 model_name 集合跳过 Provider（同一演员同一轮已「不知道」的模型不重复试）。
+        - 纯文本输出（require_json=False），不强制 JSON 包裹，适配单值任务。
+
+        Returns:
+            (content, success_model, null_models)
+            - content:        首次成功 Provider 返回的非空、非 "NULL"、且通过 validator 的内容；
+                              全失败 → None
+            - success_model:  产出内容的大模型名（provider.model_name）；无 → None
+            - null_models:    本轮尝试且返回 NULL/空/连接失败/未过 validator 的 model_name 集合
+                             （调用方可作为下一轮的 skip，避免重复试探「不认识」的模型）
+        """
+        providers = self._resolve_providers(log_invalid=True)
+        if not providers:
+            logger.info("   ℹ️ [AI翻译] 未配置任何可用的 AI Provider，跳过 null-aware 调用")
+            return None, None, set()
+        if local_first:
+            providers = self._providers_local_first(providers)
+        if skip:
+            providers = [p for p in providers if p["model_name"] not in skip]
+        if not providers:
+            logger.info("   ℹ️ [AI翻译] null-aware 全部 Provider 已被 skip 跳过")
+            return None, None, set()
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        null_models: set = set()
+        last_exc: Optional[Exception] = None
+        for idx, provider in enumerate(providers):
+            pname = provider["name"]
+            mname = provider["model_name"]
+            logger.info(
+                "   🚀 [AI翻译] null-aware 尝试 Provider[%s] (model=%s) …",
+                pname, mname,
+            )
+            try:
+                resp = self._chat_with_address_fallback(
+                    provider=provider,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    require_json=False,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+            except Exception as exc:
+                last_exc = exc
+                null_models.add(mname)
+                logger.warning(
+                    "   ⚠️ [AI翻译] Provider[%s] 失败，降级下一个 Provider: %s",
+                    pname, exc,
+                )
+                continue
+            if not content:
+                last_exc = RuntimeError(f"Provider[{pname}] 返回空内容")
+                null_models.add(mname)
+                logger.warning("   ⚠️ [AI翻译] Provider[%s] 返回空内容，降级下一个 Provider", pname)
+                continue
+            if content.strip().upper() == "NULL":
+                last_exc = RuntimeError(f"Provider[{pname}] 返回 NULL（模型不知道）")
+                null_models.add(mname)
+                logger.info("   ⚠️ [AI翻译] Provider[%s] 返回 NULL（模型不知道），降级下一个 Provider", pname)
+                continue
+            if validator is not None and not validator(content):
+                last_exc = RuntimeError(f"Provider[{pname}] 内容未通过 validator 验收")
+                null_models.add(mname)
+                logger.warning(
+                    "   ⚠️ [AI翻译] Provider[%s] 内容未通过 validator 验收（仍为外语/乱码/幻觉），降级下一个 Provider",
+                    pname,
+                )
+                continue
+            return content, mname, null_models
+
+        logger.error(
+            "   ❌ [AI翻译] null-aware 全部 %d 个 Provider 均失败/返回 NULL/未过 validator，最后异常: %s",
+            len(providers), last_exc,
+        )
+        return None, None, null_models
+
+    # ------------------------------------------------------------------
     # 对外 API（与既有调用方完全兼容）
     # ------------------------------------------------------------------
 
@@ -657,21 +797,35 @@ class AITranslator:
         """是否存在至少一个有效 Provider（不构建客户端、不刷无效配置告警）。"""
         return bool(self._resolve_providers(log_invalid=False))
 
-    def translate_names(self, names: List[str], context: str = "") -> Dict[str, str]:
-        """批量翻译演员人名。返回 {原文: 译文}；失败或未配置时返回原文映射（不抛异常）。"""
+    def translate_names(self, names: List[str], context: str = "", year: str = "") -> Dict[str, str]:
+        """批量翻译演员人名。返回 {原文: 译文}；失败或未配置时返回原文映射（不抛异常）。
+
+        Args:
+            names:   待翻译的人名列表
+            context: 作品名（消歧上下文，可选）
+            year:    作品年份（如 "2006"，强化作品消歧，可选）
+        """
         return self._translate_batch(
             items=names,
             kind="names",
             context=context,
+            year=year,
             temperature=0.1,
         )
 
-    def translate_roles(self, roles: List[str], context: str = "") -> Dict[str, str]:
-        """批量翻译角色名。返回 {原文: 译文}；失败或未配置时返回原文映射（不抛异常）。"""
+    def translate_roles(self, roles: List[str], context: str = "", year: str = "") -> Dict[str, str]:
+        """批量翻译角色名。返回 {原文: 译文}；失败或未配置时返回原文映射（不抛异常）。
+
+        Args:
+            roles:   待翻译的角色名列表
+            context: 作品名（消歧上下文，可选）
+            year:    作品年份（如 "2006"，强化作品消歧，可选）
+        """
         return self._translate_batch(
             items=roles,
             kind="roles",
             context=context,
+            year=year,
             temperature=0.1,
         )
 
@@ -680,7 +834,7 @@ class AITranslator:
     # ------------------------------------------------------------------
 
     def _translate_batch(self, items: List[str], kind: str, context: str,
-                         temperature: float) -> Dict[str, str]:
+                         temperature: float, year: str = "") -> Dict[str, str]:
         """分块批量翻译：块间限速 + 每块走瀑布流 + 最终原文兜底。"""
         if not items:
             return {}
@@ -704,7 +858,7 @@ class AITranslator:
         request_interval = self._safe_positive_float(cfg.get("ai_request_interval"), DEFAULT_REQUEST_INTERVAL)
         max_tokens = self._safe_positive_int(cfg.get("ai_max_tokens"), DEFAULT_MAX_TOKENS, allow_zero=False)
 
-        system_prompt = self._build_prompt(kind, context)
+        system_prompt = self._build_prompt(kind, context, year)
         chunks = [unique_items[i:i + chunk_size] for i in range(0, len(unique_items), chunk_size)]
         total_chunks = len(chunks)
 
@@ -766,8 +920,14 @@ class AITranslator:
         return key
 
     @staticmethod
-    def _build_prompt(kind: str, context: str) -> str:
-        """根据翻译类型组装严格的 System Prompt。"""
+    def _build_prompt(kind: str, context: str, year: str = "") -> str:
+        """根据翻译类型组装严格的 System Prompt。
+
+        Args:
+            kind:    "names"（演员人名）或 "roles"（角色名）
+            context: 作品名（消歧上下文，可选）
+            year:    作品年份（如 "2006"）；提供时并入背景作《名（年）》，强化作品消歧
+        """
         tpl = _TRANSLATION_TEMPLATES.get(kind, _TRANSLATION_TEMPLATES["names"])
         system_prompt = (
             f"你是一位专业的影视翻译助理，负责把{tpl['subject']}翻译成简体中文。\n\n"
@@ -775,7 +935,11 @@ class AITranslator:
             "1. 已经是简体中文的名字，原样保留，禁止修改。\n"
             f"{tpl['rule_jp']}\n"
             "3. 优先使用国内观众熟悉、豆瓣等影视平台通行的中文译名，拒绝生硬直译。\n"
-            "4. 每个名字只输出一个译名，禁止列出多个候选。\n\n"
+            "4. 每个名字只输出一个译名，禁止列出多个候选。\n"
+            "5. 拼音条目（如 \"Zhang San\"）应译为汉字（\"张三\"）；不完整的名字或仅含首字母的"
+            "名字（如 \"Peter J.\"）按可识别部分给出最可能的标准中文音译。\n"
+            "6. 无论原始名字是什么语言（英/日/韩/拉丁等），最终输出必须是简体中文；"
+            "即使作品本身是外文，也不得把名字转写成该作品的原语言。\n\n"
             "【严格输出格式】\n"
             "- 只输出一个 JSON 对象，键为「原始名字」，值为「中文译名」。\n"
             '- 示例：{"Zhao Wenlong": "赵文龙", "新垣結衣": "新垣结衣"}\n'
@@ -783,7 +947,10 @@ class AITranslator:
             "- 禁止输出 Markdown 代码块标记（```、```json）、注释、解释或任何多余字符。"
         )
         if context:
-            system_prompt += f"\n\n【背景】这是影视作品《{context}》的{tpl['table_note']}。"
+            display_ctx = f"{context}（{year}）" if year else context
+            system_prompt += f"\n\n【背景】这是影视作品《{display_ctx}》的{tpl['table_note']}。"
+            if tpl.get("rule_context"):
+                system_prompt += f"\n\n{tpl['rule_context']}"
         return system_prompt
 
 

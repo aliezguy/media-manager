@@ -71,6 +71,18 @@ def _add_column_type(dialect: str, col_name: str) -> str:
         return "VARCHAR(255) DEFAULT ''"
     if col_name == "confidence_level":
         return "INTEGER DEFAULT 0"
+    if col_name == "llm_check_status":
+        return "INTEGER DEFAULT 0"
+    if col_name == "llm_last_checked":
+        return "DATETIME"
+    if col_name == "llm_translation_source":
+        return "VARCHAR(255) DEFAULT ''"
+    if col_name == "llm_field_sources":
+        return "JSON" if dialect == "mysql" else "TEXT"
+    if col_name == "overview_source":
+        return "VARCHAR(255) DEFAULT ''"
+    if col_name == "overview_updated_at":
+        return "DATETIME"
     return "VARCHAR(255)"
 
 
@@ -181,6 +193,27 @@ def _run_migrations(eng=None):
                             f"{_add_column_type(dialect, col_name)}"
                         ))
                         logger.info("📦 [Migration] %s 添加字段: %s", table_name, col_name)
+
+            # ---- actor_profiles: 新增 LLM 核查状态列（空值补全/出生地汉化） ----
+            ap2_cols = _get_table_columns(eng, "actor_profiles")
+            for col_name in ("llm_check_status", "llm_last_checked", "llm_translation_source",
+                             "llm_field_sources"):
+                if col_name not in ap2_cols:
+                    conn.execute(text(
+                        f"ALTER TABLE actor_profiles ADD COLUMN {col_name} "
+                        f"{_add_column_type(dialect, col_name)}"
+                    ))
+                    logger.info("📦 [Migration] actor_profiles 添加字段: %s", col_name)
+
+            # ---- media_metadata: 新增简介汉化审计列（overview_source / overview_updated_at） ----
+            mm_cols = _get_table_columns(eng, "media_metadata")
+            for col_name in ("overview_source", "overview_updated_at"):
+                if col_name not in mm_cols:
+                    conn.execute(text(
+                        f"ALTER TABLE media_metadata ADD COLUMN {col_name} "
+                        f"{_add_column_type(dialect, col_name)}"
+                    ))
+                    logger.info("📦 [Migration] media_metadata 添加字段: %s", col_name)
 
             conn.commit()
     except Exception as e:

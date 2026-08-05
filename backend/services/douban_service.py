@@ -265,7 +265,10 @@ class DoubanSinizer:
                         f" (ai_fallback={_fb} / ai_direct={_dd})..."
                     )
                     try:
-                        name_map = translator.translate_names(list(ai_names.keys()), context=item_name)
+                        name_map = translator.translate_names(
+                            list(ai_names.keys()), context=item_name,
+                            year=str(item_data.get("ProductionYear", "") or ""),
+                        )
                         for a in updated_actors:
                             old_name = a.get("Name", "")
                             if old_name in name_map:
@@ -288,7 +291,10 @@ class DoubanSinizer:
                 if ai_roles:
                     logger.info(f"   🤖 [AI翻译] 翻译 {len(ai_roles)} 个角色名...")
                     try:
-                        role_map = translator.translate_roles(list(ai_roles.keys()), context=item_name)
+                        role_map = translator.translate_roles(
+                            list(ai_roles.keys()), context=item_name,
+                            year=str(item_data.get("ProductionYear", "") or ""),
+                        )
                         # 常见英文名名单，翻译后如果变成了音译中文（如 Jason→杰森），回退为原名
                         common_english_names = {
                             "jason", "linda", "michael", "david", "tom", "jack",
@@ -552,6 +558,7 @@ class DoubanSinizer:
                             localized_people = self._localize_episode_people(
                                 ep_people, douban_match_map, series_name=item_name,
                                 db=ep_db, emby_item_id=ep_id, parent_id=item_id,
+                                year=str(item_data.get("ProductionYear", "") or ""),
                             )
 
                             # ★ 分集也应用截断
@@ -759,6 +766,7 @@ class DoubanSinizer:
                 ep_people, douban_match_map,
                 series_name=ep_item.get("SeriesName", ""),
                 db=db, emby_item_id=ep_item_id, parent_id=series_id,
+                year=str(ep_item.get("ProductionYear", "") or ""),
             )
             localized = _truncate_actors(localized, self.max_actors_per_media)
 
@@ -1824,6 +1832,7 @@ class DoubanSinizer:
         self, ep_people: list, douban_match_map: dict,
         series_name: str = "",
         db=None, emby_item_id: str = "", parent_id: str = "",
+        year: str = "",
     ) -> list:
         """对分集演员列表中文化替换（含缓存拦截 + AI 兜底 + 动态缓存）。
 
@@ -1844,6 +1853,7 @@ class DoubanSinizer:
             db:               可选 SQLAlchemy Session，用于纯净缓存拦截
             emby_item_id:     当前分集 ID（角色缓存局部查询）
             parent_id:        所属 Series ID（角色缓存向上追溯）
+            year:             剧集年份（ProductionYear），强化 AI 翻译作品消歧，可选
 
         Returns:
             中文化后的 People 列表
@@ -1994,7 +2004,7 @@ class DoubanSinizer:
                 if ai_name_items:
                     unique_names = list(ai_name_items.keys())
                     try:
-                        name_map = translator.translate_names(unique_names, context=series_name)
+                        name_map = translator.translate_names(unique_names, context=series_name, year=year)
                         for original_name, src in ai_name_items.items():
                             translated = (name_map.get(original_name) or "").strip()
                             if translated and is_valid_chinese_translation(translated):
@@ -2020,7 +2030,7 @@ class DoubanSinizer:
                     ]
                     if unique_roles:
                         try:
-                            role_map = translator.translate_roles(unique_roles, context=series_name)
+                            role_map = translator.translate_roles(unique_roles, context=series_name, year=year)
                             for original_role, src in ai_role_items.items():
                                 if original_role.lower() in ("actor", "actress", "guest", "guest star", "unknown"):
                                     continue

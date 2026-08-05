@@ -81,6 +81,25 @@ DEFAULT_CONFIG = {
         "is_active": False,
         "last_run_at": None,
     },
+    "overview_job": {
+        "library_ids": [],
+        "cron_expression": "0 5 * * *",
+        "is_active": False,
+        "last_run_at": None,
+    },
+
+    # ★ 全库简介（Overview）汉化 — 本地 qwen 优先，云端兜底
+    #   overview_job 定时触发 scan_and_translate；overview_* 为翻译链路调参
+    "overview_translation_enabled": True,  # 总开关：False 时全库汉化不执行
+    "overview_local_first": True,          # 本地 qwen 优先，超时/失败/NULL/未过中文校验 → 云端兜底
+    "overview_chinese_ratio": 0.5,         # 「已中文」判定阈值（is_already_chinese）
+    "overview_max_tokens": 1500,           # 翻译输出上限
+
+    # ★ 演员元数据 AI 补全/汉化（出生地汉化 + 空值补全，严格防伪 NULL）
+    #   流程顺序: 先 TMDB/豆瓣 → 为空才请求本地大模型(qwen2.5) → 仍无再请求其他 Provider
+    "actor_ai_enabled": True,     # 总开关：False 时跳过所有演员元数据 LLM 调用
+    "actor_ai_local_first": True, # 本地大模型优先（ollama qwen2.5），翻译不到再走其他 Provider
+    "llm_cooldown_days": 7,       # LLM「不知道」冷静期: -1 无限期(status=2 永不再查) / 0 无 / N 天内不重查
 }
 
 def load_config():

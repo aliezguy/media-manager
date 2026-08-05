@@ -27,6 +27,7 @@ UPSERT actor_profiles (name 主键)，包含:
 
 import os
 import logging
+import random
 import time as _time
 import traceback
 from datetime import datetime, timedelta
@@ -92,6 +93,156 @@ def _safe_get_str(d: dict, key: str, default: str = "") -> str:
     if val is None:
         return default
     return str(val).strip()
+
+
+def _ai_providers_available(cfg: dict) -> bool:
+    """是否存在至少一个有效 AI Provider（懒导入 ai_translator，避免循环依赖）。
+
+    演员元数据 LLM 补全的前置门槛：无 AI 配置时整体跳过（如最小测试 config）。
+    """
+    try:
+        from services.ai_translator import get_primary_provider
+        return get_primary_provider(cfg) is not None
+    except Exception:
+        return False
+
+
+def _llm_enrich_existing(actor_name: str, existing, db):
+    """对已有 ActorProfile 行做 LLM 出生地汉化/空值补全并落库（无网络请求）。
+
+    【为什么需要】审计/汉化流程对「已存在且近期更新过」的演员会命中 L0 缓存或
+    头像冷却期而提前返回，根本走不到网络路径的补全块。若不在此步汉化，
+    存量英文出生地永远不会在审计时被转换为中文。
+
+    - 仅基于 existing 已有数据 + LLM，不触发 TMDB/豆瓣/下载；
+    - 受 actor_ai_enabled 开关 + llm_check_status/llm_last_checked 冷静期保护；
+    - 只在本轮真正调用了 LLM 时 flush（status 非 None），否则原样返回。
+
+    Returns:
+        补全后的字段容器 dict | None（无 LLM 调用 / 无工作时返回 None，调用方沿用 existing）
+    """
+    cfg = load_config()
+    if not cfg.get("actor_ai_enabled", True) or not _ai_providers_available(cfg):
+        return None
+    profile_data = {
+        "birth_date": existing.birth_date or "",
+        "birth_place": existing.birth_place or "",
+        "overview": existing.overview or "",
+    }
+    try:
+        from services.actor_profile_ai import enrich_actor_metadata, merge_sources, merge_field_sources
+        enriched, status, last, llm_source, field_sources = enrich_actor_metadata(
+            actor_name, profile_data, existing, cfg,
+        )
+        if status is not None:
+            existing.llm_check_status = status
+            existing.llm_last_checked = last
+            existing.birth_date = enriched["birth_date"] or existing.birth_date or ""
+            existing.birth_place = enriched["birth_place"] or existing.birth_place or ""
+            existing.overview = enriched["overview"] or existing.overview or ""
+            existing.llm_translation_source = merge_sources(
+                existing.llm_translation_source or "", llm_source,
+            )
+            existing.llm_field_sources = merge_field_sources(
+                existing.llm_field_sources, field_sources,
+            )
+            db.flush()
+            return enriched
+    except Exception:
+        logger.error(
+            "   ❌ [Profile] LLM 元数据补全异常（不阻断主流程）: %s\n%s",
+            actor_name, traceback.format_exc(),
+        )
+    return None
+
+
+# L1 豆瓣详情可重试错误码；永久性失败（need_login / 404 / 参数无效）不重试
+_DOUBAN_RETRYABLE_ERRORS = {
+    "rate_limit",          # 豆瓣 1080 限流 → 退避后恢复
+    "http_error",          # 4xx/5xx 瞬时错误
+    "request_exception",   # 网络层异常（超时/断连）
+    "json_decode_error",   # 响应解析失败（反爬 HTML 页等）
+    "budget_exhausted",    # 请求预算排队超时 → 稍后窗口滑动可恢复
+}
+
+
+def _douban_celebrity_details_with_retry(
+    actor_name: str,
+    douban_id: str,
+    douban_cookie: str,
+    max_retries: int = 2,
+) -> dict | None:
+    """带指数退避重试的豆瓣影人详情获取（L1 启用后的限流安全网）。
+
+    限流已由 DoubanApi 内建双层兜底：
+      - _apply_cooldown(): 类级 1.5s 冷却，任意两次豆瓣请求之间强制间隔；
+      - budget_acquire("douban"): request_budget 滑动窗口（默认 30 次/600s），
+        超限排队等待 30s，仍超限返回 budget_exhausted（本函数视作可重试）。
+
+    本层只负责对【可重试错误】（限流/网络抖动/HTTP/预算排队超时）做指数退避重试：
+      delay = 1.5 * 2^(attempt) + jitter，最多 max_retries 次；
+    need_login（Cookie 失效）与 404/参数无效 等永久失败直接放弃，不浪费请求。
+
+    Returns:
+        成功详情 dict（无 error 字段）；彻底失败返回 None。
+    """
+    from services.douban_api import DoubanApi
+    douban_api = DoubanApi(user_cookie=douban_cookie)
+
+    for attempt in range(max_retries + 1):
+        try:
+            details = douban_api.celebrity_details(douban_id)
+        except Exception as e:
+            logger.warning(
+                "   ⚠ [Profile] 豆瓣详情请求异常 (%s, 第 %d 次): %s - %s",
+                type(e).__name__, attempt + 1, actor_name, e,
+            )
+            if attempt < max_retries:
+                _time.sleep(1.5 * (2 ** attempt) + random.uniform(0, 0.5))
+                continue
+            return None
+
+        if details and not details.get("error"):
+            return details
+
+        err_code = (details or {}).get("error") or "unknown"
+        err_msg = (details or {}).get("message") or ""
+        logger.warning(
+            "   ⚠ [Profile] 豆瓣详情返回 %s (第 %d 次): %s - %s",
+            err_code, attempt + 1, actor_name, err_msg,
+        )
+
+        # 永久性失败 → 直接放弃（重试无意义）
+        if err_code in ("need_login", "movie_not_found", "invalid_param"):
+            if err_code == "need_login":
+                logger.error(
+                    "   ⛔ [Profile] 豆瓣需要登录 (Cookie 失效)，放弃重试: %s。请检查 douban_cookie 配置",
+                    actor_name,
+                )
+            else:
+                logger.warning(
+                    "   ⏭ [Profile] 豆瓣影人不存在/参数无效(%s)，放弃重试: %s",
+                    err_code, actor_name,
+                )
+            return None
+
+        # 可重试错误 → 指数退避后重试
+        if err_code in _DOUBAN_RETRYABLE_ERRORS and attempt < max_retries:
+            delay = 1.5 * (2 ** attempt) + random.uniform(0, 0.5)
+            logger.info(
+                "   🔄 [Profile] 豆瓣详情 %s，%.1fs 后重试 %d/%d: %s",
+                err_code, delay, attempt + 1, max_retries, actor_name,
+            )
+            _time.sleep(delay)
+            continue
+
+        logger.error(
+            "   ❌ [Profile] 豆瓣详情重试耗尽(%s): %s - %s",
+            err_code, actor_name, err_msg,
+        )
+        return None
+
+    return None
 
 
 # ==========================================
@@ -856,6 +1007,8 @@ def resolve_actor_profile(
                 "   🏠 [Profile] L0 数据库极速命中: %s → %s",
                 actor_name, existing.local_image_path,
             )
+            # ★ 已有记录仍做 LLM 出生地汉化/空值补全（审计流程主路径，无网络请求）
+            _llm_enrich_existing(actor_name, existing, db)
             return {
                 "name": existing.name,
                 "local_image_path": existing.local_image_path,
@@ -904,6 +1057,8 @@ def resolve_actor_profile(
                     "   🏠 [Profile] L0 物理硬盘嗅探命中: %s → %s",
                     actor_name, local_avatar_path,
                 )
+                # ★ 已有记录仍做 LLM 出生地汉化/空值补全（无网络请求）
+                _llm_enrich_existing(actor_name, existing, db)
                 return {
                     "name": existing.name,
                     "local_image_path": existing.local_image_path,
@@ -946,6 +1101,8 @@ def resolve_actor_profile(
                     actor_name,
                     existing.update_time.strftime("%Y-%m-%d"),
                 )
+                # ★ 冷却期内仍做 LLM 出生地汉化/空值补全（无网络请求，受 LLM 冷静期保护）
+                _llm_enrich_existing(actor_name, existing, db)
                 return {
                     "name": existing.name,
                     "local_image_path": "",
@@ -1024,151 +1181,10 @@ def resolve_actor_profile(
         profile_data["birth_date"] = existing.birth_date or ""
         profile_data["birth_place"] = existing.birth_place or ""
 
-    # ---- Step 2: 前置豆瓣影人盲搜与作品溯源（仅获取 ID，不调详情/不下载图片） ----
-    if douban_enabled and not douban_id and False:
-        try:
-            from services.douban_api import DoubanApi
-            douban_api = DoubanApi(user_cookie=douban_cookie)
-            logger.info(
-                "   🔍 [Profile] 上半场 豆瓣影人名字盲搜 (仅取ID): %s",
-                actor_name,
-            )
-            search_res = douban_api.search(actor_name, count=20)
-
-            if not search_res:
-                logger.debug("   ⚠ [Profile] 盲搜无任何返回 (None)")
-            elif search_res.get("error"):
-                logger.debug("   ⚠ [Profile] 盲搜返回错误: %s", search_res)
-            else:
-                items = search_res.get("items", [])
-                logger.debug(
-                    "   🐛 [Debug] 盲搜获取到 %d 个 items (keyword=%s)",
-                    len(items), actor_name,
-                )
-
-                # 阶段 1：直接寻找影人卡片
-                for idx, item_obj in enumerate(items):
-                    target = item_obj.get("target", {})
-                    target_type = item_obj.get("target_type")
-                    title = target.get("title") or target.get("name") or ""
-                    item_id = target.get("id")
-
-                    if idx < 10:
-                        logger.debug(
-                            "      ➜ [%d] type=%s title=%s id=%s",
-                            idx, target_type, title, item_id,
-                        )
-
-                    if (
-                        target_type in ("celebrity", "person")
-                        and title.strip() == actor_name
-                    ):
-                        douban_id = str(item_id).strip()
-                        logger.info(
-                            "   🎯 [Profile] 上半场 豆瓣影人直搜命中: %s → douban_id=%s",
-                            actor_name, douban_id,
-                        )
-                        break
-
-                # 阶段 2：曲线救国 — 作品溯源反查
-                if not douban_id:
-                    logger.info(
-                        "   🔄 [Profile] 直搜未命中影人卡片，启动作品溯源反查: %s",
-                        actor_name,
-                    )
-                    media_items = [
-                        i for i in items
-                        if i.get("target_type") in ("movie", "tv")
-                    ][:3]
-
-                    for m_item in media_items:
-                        m_target = m_item.get("target", {})
-                        m_type = m_item.get("target_type")
-                        m_id = m_target.get("id")
-                        m_title = m_target.get("title") or m_target.get("name") or "?"
-
-                        if not m_id:
-                            continue
-
-                        logger.debug(
-                            "      🔗 尝试从作品《%s》(%s/%s) 反查演员表...",
-                            m_title, m_type, m_id,
-                        )
-
-                        try:
-                            if m_type == "tv":
-                                cast_data = douban_api.tv_celebrities(m_id)
-                            else:
-                                cast_data = douban_api.movie_celebrities(m_id)
-
-                            if cast_data and not cast_data.get("error"):
-                                persons = (
-                                    cast_data.get("celebrities")
-                                    or cast_data.get("actors")
-                                    or []
-                                )
-                                directors = cast_data.get("directors") or []
-                                candidates = []
-
-                                for p in (persons + directors):
-                                    p_name = str(p.get("name") or "").lower().strip()
-                                    p_latin = str(p.get("latin_name") or "").lower().strip()
-                                    p_en = str(p.get("name_en") or "").lower().strip()
-                                    found_id = str(p.get("id", "")).strip()
-                                    target_name = actor_name.lower().strip()
-
-                                    logger.debug(
-                                        "         👉 [Debug-溯源] id=%s | name=%s | latin=%s | en=%s",
-                                        found_id, p_name, p_latin, p_en,
-                                    )
-
-                                    if (
-                                        target_name in p_name
-                                        or target_name in p_latin
-                                        or target_name in p_en
-                                    ):
-                                        if found_id and found_id.isdigit() and int(found_id) > 0:
-                                            candidates.append(int(found_id))
-                                            logger.debug(
-                                                "         📌 [Debug-溯源] 候选命中: id=%s (name=%s)",
-                                                found_id, p.get("name"),
-                                            )
-
-                                if candidates:
-                                    douban_id = str(max(candidates))
-                                    logger.info(
-                                        "   🎯 [Profile] 作品溯源成功！"
-                                        " 在《%s》中抓到演员: %s → douban_id=%s"
-                                        " (候选 %d 个: %s)",
-                                        m_title, actor_name, douban_id,
-                                        len(candidates), sorted(candidates),
-                                    )
-                        except Exception as e:
-                            logger.debug(
-                                "      ⚠ 溯源作品 %s 失败: %s",
-                                m_title, e,
-                            )
-
-                        if douban_id:
-                            break
-
-                if not douban_id:
-                    logger.info(
-                        "   ❌ [Profile] 盲搜及溯源均未找到影人: %s (共 %d 条)",
-                        actor_name, len(items),
-                    )
-
-        except Exception as e:
-            error_msg = str(e).lower()
-            logger.warning(
-                "   ⚠ [Profile] 上半场 豆瓣影人盲搜异常: %s - %s",
-                actor_name, e,
-            )
-            if "need_login" in error_msg or "403" in error_msg or "too many requests" in error_msg:
-                logger.error(
-                    "   ⛔ [Profile] 触发豆瓣严重流控！强制退避休眠 5 秒保护 IP..."
-                )
-                _time.sleep(5)
+    # ---- Step 2: 豆瓣影人 ID —— 不做盲搜 ----
+    # 决策（2026-08-05）：不使用「名字搜索/作品溯源」盲找 douban_id（避免打爆豆瓣反爬）。
+    # douban_id 仅当请求电视剧/电影时演员信息自带（ProviderIds.DoubanCelebrityId /
+    # 上下文 douban_id）时使用；无 id 则跳过豆瓣详情，交由 TMDB / LLM 兜底。
 
     # ---- Step 3: 前置 TMDB 元数据查询（仅取元数据，头像暂存备份绝不截留） ----
     has_overview = bool(profile_data["overview"])
@@ -1274,17 +1290,21 @@ def resolve_actor_profile(
                 actor_name, download_url[:80],
             )
 
-    if douban_enabled and douban_id and (not download_url or force_refresh) and False:
+    if douban_enabled and douban_id and (not download_url or force_refresh):
+        # ★ 已启动（此前被 `and False` 禁用）：调 Frodo API 提取中文元数据。
+        #   豆瓣 born_place/info/birthday 为原生中文，优先级高于 TMDB 英文 → LLM 汉化兜底。
+        #   重试与限流：_douban_celebrity_details_with_retry（指数退避 + need_login 熔断），
+        #   底层 DoubanApi 内建 1.5s 冷却 + request_budget 滑动窗口限流。
         logger.info(
             "   🌐 [Profile] L1 豆瓣 (调 Frodo API 提取详情): %s (douban_id=%s)",
             actor_name, douban_id,
         )
         try:
-            from services.douban_api import DoubanApi
-            douban_api = DoubanApi(user_cookie=douban_cookie)
-            douban_details = douban_api.celebrity_details(douban_id)
+            douban_details = _douban_celebrity_details_with_retry(
+                actor_name, douban_id, douban_cookie,
+            )
 
-            if douban_details and not douban_details.get("error"):
+            if douban_details:
                 # ★ 元数据总是提取（不受头像状态影响）
                 profile_data["overview"] = (
                     (douban_details.get("info") or "").strip()
@@ -1322,16 +1342,10 @@ def resolve_actor_profile(
                         actor_name,
                     )
         except Exception as e:
-            error_msg = str(e).lower()
             logger.warning(
                 "   ⚠ [Profile] L1 豆瓣 API 详情请求失败: %s - %s",
                 actor_name, e,
             )
-            if "need_login" in error_msg or "403" in error_msg or "too many requests" in error_msg:
-                logger.error(
-                    "   ⛔ [Profile] 触发豆瓣严重流控！强制退避休眠 5 秒保护 IP..."
-                )
-                _time.sleep(5)
 
     # ---- 顺位 3: L2 TMDB 头像最终兜底 ----
     if not download_url and tmdb_avatar_bak:
@@ -1407,6 +1421,29 @@ def resolve_actor_profile(
                 actor_name,
             )
 
+    # ================================================================
+    # ★ 演员元数据 LLM 补全/汉化（出生地汉化 + 空值补全）
+    #    流程顺序: 先 TMDB/豆瓣(上半场) → 仍为空/非中文 → 本地 qwen 优先 → 其他 Provider
+    #    严格防伪: LLM 返回 NULL/空/无效 → 保留原值或留空，绝不无中生有
+    #    写回状态: llm_check_status (0未查/1成功/2不知道) + llm_last_checked + 冷静期
+    # ================================================================
+    llm_check_status = None
+    llm_last_checked = None
+    llm_translation_source = ""
+    llm_field_sources = {}
+    if cfg.get("actor_ai_enabled", True) and _ai_providers_available(cfg):
+        try:
+            from services.actor_profile_ai import enrich_actor_metadata
+            (profile_data, llm_check_status, llm_last_checked,
+             llm_translation_source, llm_field_sources) = enrich_actor_metadata(
+                actor_name, profile_data, existing, cfg,
+            )
+        except Exception:
+            logger.error(
+                "   ❌ [Profile] LLM 元数据补全异常（不阻断主流程）: %s\n%s",
+                actor_name, traceback.format_exc(),
+            )
+
     # 如果既没有本地文件也没有外部链接，检查是否有元数据需要保存
     has_meta = any([
         profile_data["tmdb_id"], profile_data["imdb_id"],
@@ -1434,6 +1471,18 @@ def resolve_actor_profile(
         existing.birth_date = profile_data["birth_date"] or (existing.birth_date or "")
         existing.birth_place = profile_data["birth_place"] or (existing.birth_place or "")
         existing.overview = profile_data["overview"] or (existing.overview or "")
+        # ★ LLM 核查状态落库（仅本轮真正调用了 LLM 时写入，避免误判 status=2）
+        if llm_check_status is not None:
+            existing.llm_check_status = llm_check_status
+            existing.llm_last_checked = llm_last_checked
+            if llm_translation_source or llm_field_sources:
+                from services.actor_profile_ai import merge_sources, merge_field_sources
+                existing.llm_translation_source = merge_sources(
+                    existing.llm_translation_source or "", llm_translation_source,
+                )
+                existing.llm_field_sources = merge_field_sources(
+                    existing.llm_field_sources, llm_field_sources,
+                )
         existing.update_time = datetime.now()
 
         db.flush()

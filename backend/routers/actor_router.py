@@ -11,6 +11,7 @@ import shutil
 import threading
 import time
 import traceback
+from datetime import datetime
 
 import requests
 from fastapi import APIRouter, Query, HTTPException, BackgroundTasks
@@ -19,6 +20,7 @@ from config.settings import load_config
 from database import SessionLocal
 from models import ActorProfile
 from services.actor_profile_service import _download_image, is_image_content
+from services.translation_utils import is_valid_chinese_translation
 from utils.task_manager import task_manager
 
 logger = logging.getLogger("uvicorn")
@@ -415,6 +417,175 @@ def repair_missing_actors(background_tasks: BackgroundTasks):
     return {
         "task_id": task_id,
         "message": f"批量修复已启动，共 {broken_count} 位演员",
+    }
+
+
+# ================================================================
+# 存量英文出生地批量汉化 — 后台任务 + 触发接口
+# ================================================================
+
+def _repair_birthplace_task(task_id: str):
+    """后台任务：批量汉化所有非空非中文的出生地。
+
+    查询 birth_place 非空的行，Python 侧过滤出非中文出生地，
+    逐个调 translate_birth_place（本地 qwen 优先 + strict-NULL），成功且含中文 → 写回。
+    单条失败保留原值，绝不影响其他演员。
+    """
+    from services.actor_profile_ai import translate_birth_place, merge_sources, merge_field_sources
+
+    db = SessionLocal()
+    _repair_success = False
+    _repair_final_msg = "❌ 出生地批量汉化失败，请查看服务端日志"
+    repaired = 0
+    failed = 0
+    skipped = 0
+
+    try:
+        rows = (
+            db.query(ActorProfile)
+            .filter(ActorProfile.birth_place.isnot(None), ActorProfile.birth_place != "")
+            .all()
+        )
+        targets = [r for r in rows if not is_valid_chinese_translation(r.birth_place)]
+        total = len(targets)
+
+        task_manager.update_progress(
+            task_id,
+            total=total,
+            message=f"发现 {total} 条非中文出生地，开始汉化...",
+        )
+
+        if total == 0:
+            _repair_success = True
+            _repair_final_msg = "✅ 所有出生地均已汉化，无需修复"
+            return
+
+        logger.info(
+            "🔧 [RepairBirthplace] 开始汉化 %d 条英文出生地 (task=%s)",
+            total, task_id,
+        )
+
+        for idx, actor in enumerate(targets):
+            current = idx + 1
+            original = actor.birth_place or ""
+            task_manager.update_progress(
+                task_id,
+                current=current - 1,
+                message=f"汉化中 {current}/{total}: {actor.name}",
+            )
+
+            try:
+                ctx = {}
+                translated = translate_birth_place(original, actor.name, ctx=ctx)
+                if is_valid_chinese_translation(translated) and translated != original:
+                    actor.birth_place = translated
+                    actor.llm_translation_source = merge_sources(
+                        actor.llm_translation_source or "",
+                        ",".join(sorted(ctx.get("_sources") or ())),
+                    )
+                    actor.llm_field_sources = merge_field_sources(
+                        actor.llm_field_sources, ctx.get("_field_sources") or {},
+                    )
+                    actor.update_time = datetime.now()
+                    db.commit()
+                    repaired += 1
+                    logger.info(
+                        "   ✅ [RepairBirthplace] %s: %r → %r",
+                        actor.name, original, translated,
+                    )
+                else:
+                    db.rollback()
+                    skipped += 1
+                    logger.warning(
+                        "   ⏭ [RepairBirthplace] %s: LLM 返回 NULL/无效，保留原值 %r",
+                        actor.name, original,
+                    )
+            except Exception:
+                db.rollback()
+                failed += 1
+                logger.error(
+                    "   ❌ [RepairBirthplace] %s 异常:\n%s",
+                    actor.name, traceback.format_exc(),
+                )
+
+            task_manager.update_progress(
+                task_id,
+                current=current,
+                message=(
+                    f"已完成 {current}/{total} "
+                    f"（汉化 {repaired} | 跳过 {skipped} | 失败 {failed}）"
+                ),
+            )
+
+            # 拟人化随机休眠，避免高频并发触发 LLM Provider 限流
+            time.sleep(random.uniform(0.5, 1.5))
+
+        _repair_success = True
+        _repair_final_msg = (
+            f"✅ 出生地批量汉化完成: {total} 条 | "
+            f"汉化 {repaired} | 跳过 {skipped} | 失败 {failed}"
+        )
+
+    except Exception as e:
+        logger.error(
+            "❌ [RepairBirthplace] 任务崩溃 (task=%s):\n%s",
+            task_id, traceback.format_exc(),
+        )
+        _repair_final_msg = f"❌ 任务崩溃: {str(e)[:200]}"
+        try:
+            task_manager.update_progress(
+                task_id, status="error", message=_repair_final_msg,
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            task_manager.complete_task(
+                task_id, _repair_final_msg, success=_repair_success,
+            )
+        except Exception:
+            try:
+                task_manager.complete_task(
+                    task_id, "❌ 出生地汉化异常终止", success=False,
+                )
+            except Exception:
+                pass
+        db.close()
+
+
+@router.post("/actors/repair_birthplace")
+def repair_birthplace(background_tasks: BackgroundTasks):
+    """一键批量汉化存量英文出生地（后台任务，前端经 GET /api/tasks/{task_id} 轮询）。"""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(ActorProfile)
+            .filter(ActorProfile.birth_place.isnot(None), ActorProfile.birth_place != "")
+            .all()
+        )
+        broken_count = sum(1 for r in rows if not is_valid_chinese_translation(r.birth_place))
+    finally:
+        db.close()
+
+    if broken_count == 0:
+        return {"task_id": "", "message": "所有出生地均已汉化，无需修复", "count": 0}
+
+    task_id = task_manager.create_task(
+        total=broken_count,
+        message=f"发现 {broken_count} 条非中文出生地，准备汉化...",
+        metadata={"type": "repair_birthplace", "count": broken_count},
+    )
+
+    background_tasks.add_task(_repair_birthplace_task, task_id=task_id)
+
+    logger.info(
+        "🔧 [RepairBirthplace] 触发批量汉化: task=%s count=%d",
+        task_id, broken_count,
+    )
+    return {
+        "task_id": task_id,
+        "message": f"出生地批量汉化已启动，共 {broken_count} 条",
+        "count": broken_count,
     }
 
 
