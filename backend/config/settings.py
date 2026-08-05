@@ -106,6 +106,11 @@ DEFAULT_CONFIG = {
     #   True = 切回旧行为，汉化/审计逐演员内联补简介
     #   演员库刷新/修复路径显式 skip_llm_enrich=False，不受本开关影响
     "actor_bio_inline_enabled": False,
+
+    # ★ 汉化 Series 时是否顺带翻译分集简介（写回 Emby + 落库）
+    #   True（默认）= 分集循环里对非中文简介调 LLM 翻译（overview 双重引擎），整部剧全中文
+    #   False = 保持旧行为，只汉化演员/角色，分集简介交全库 overview 汉化任务处理
+    "sinicize_translate_episode_overviews": True,
 }
 
 def load_config():

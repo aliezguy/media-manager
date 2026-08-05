@@ -37,6 +37,9 @@ from services.translation_utils import (
 from services.translation_cache import (
     lookup_actor_name, lookup_role_name, upsert_actor_translation,
 )
+from services.overview_translator import (
+    needs_overview_translation, translate_overview,
+)
 
 logger = logging.getLogger("uvicorn")
 
@@ -121,6 +124,12 @@ class DoubanSinizer:
         self.emby_api_key = cfg.get("emby_api_key", "")
         self.emby_user_id = cfg.get("emby_user_id", "")
         self.max_actors_per_media = cfg.get("max_actors_per_media", 50)
+        # ★ 分集简介汉化开关：汉化 Series 时顺带 LLM 翻译非中文分集简介并写回 Emby/落库。
+        #   同时受 overview_translation_enabled 总开关约束（全库简介汉化禁用时一并关闭）。
+        self.translate_episode_overviews = (
+            bool(cfg.get("sinicize_translate_episode_overviews", True))
+            and bool(cfg.get("overview_translation_enabled", True))
+        )
         self.session = requests.Session()
         # 复用系统代理设置（与 requests.get() 行为一致）
         proxy_url = cfg.get("http_proxy") or cfg.get("proxy_url") or ""
@@ -566,8 +575,12 @@ class DoubanSinizer:
                                 localized_people, self.max_actors_per_media,
                             )
 
+                            # 7c-2. 分集简介汉化（默认开启）：非中文简介 → LLM 翻译 →
+                            # 就地写入 ep['Overview']，随下方 Emby 写回 + 落库共用
+                            ep_overview_source = self._translate_episode_overview(ep)
+
                             # 只写回有变更的分集（节省 API 调用）
-                            if localized_people != ep_people:
+                            if localized_people != ep_people or ep_overview_source:
                                 write_ep_ok = self._write_back_episode(
                                     ep_id, ep, localized_people,
                                 )
@@ -598,6 +611,11 @@ class DoubanSinizer:
                                 total_actors=total_ep,
                                 parent_id=item_id,
                                 skip_profiles=True,  # ★ 已在循环外前置批处理，分集静音写入
+                            )
+                            # ★ 简介来源审计：LLM 翻译产物标记 local_llm/cloud_llm
+                            #   （防覆盖守卫据此保护 AI 中文，避免被后续非中文官方值覆盖）
+                            self._patch_episode_overview_audit(
+                                ep_db, ep_id, ep_overview_source,
                             )
                             ep_db.flush()
                             # ★ 逐集提交：单集失败不影响已成功的其他分集
@@ -770,8 +788,11 @@ class DoubanSinizer:
             )
             localized = _truncate_actors(localized, self.max_actors_per_media)
 
+            # ★ 分集简介汉化（默认开启）：翻译结果就地写入 ep_item['Overview']
+            ep_overview_source = self._translate_episode_overview(ep_item)
+
             # 4. 回写 Emby（仅当有变更）
-            if localized != ep_people:
+            if localized != ep_people or ep_overview_source:
                 if not self._write_back_episode(ep_item_id, ep_item, localized):
                     logger.warning("⚠ [Douban/Ep] %s 回写 Emby 失败", ep_item_id)
                     return result
@@ -793,6 +814,8 @@ class DoubanSinizer:
                 parent_id=series_id,
                 skip_profiles=True,
             )
+            # ★ 简介来源审计：LLM 翻译产物标记真实来源（防覆盖守卫据此保护）
+            self._patch_episode_overview_audit(db, ep_item_id, ep_overview_source)
             db.commit()
 
             result["success"] = True
@@ -2165,6 +2188,50 @@ class DoubanSinizer:
                 }
 
         return actor_map
+
+    def _translate_episode_overview(self, ep: dict) -> str:
+        """分集简介汉化：非中文简介 → LLM 翻译（本地 qwen→云端兜底）→ 就地写回 ep['Overview']。
+
+        与全库 overview 汉化共用 translate_overview（含中文有效性验收，伪中文绝不落库）。
+        翻译成功后同步更新 ep['Overview']，使后续 Emby 写回（_write_back_episode 以
+        dict(ep) 为 update_data）与 save_media_to_db 落库共用同一份中文简介。
+
+        Returns:
+            翻译来源标记（local_llm / cloud_llm）；未翻译 / 失败 / 开关关闭 → ""
+        """
+        if not self.translate_episode_overviews:
+            return ""
+        try:
+            overview = (ep.get("Overview") or "").strip()
+            if not needs_overview_translation(overview):
+                return ""
+            translated, source, _nulls = translate_overview(overview)
+            if translated:
+                ep["Overview"] = translated
+                logger.info(
+                    "   🌐 [Episode] S%02dE%02d '%s' 简介已汉化 (source=%s)",
+                    ep.get("ParentIndexNumber") or 0, ep.get("IndexNumber") or 0,
+                    ep.get("Name") or "", source,
+                )
+                return source
+        except Exception:
+            # 简介翻译失败绝不影响演员汉化主流程（逐集 try/except 已隔离）
+            logger.warning(
+                "   ⚠ [Episode] 简介翻译异常，跳过（演员照常处理）: %s",
+                traceback.format_exc(),
+            )
+        return ""
+
+    def _patch_episode_overview_audit(self, db, ep_id: str, source: str) -> None:
+        """回填分集 overview 审计列：LLM 翻译产物标记真实来源（防覆盖守卫据此保护）。"""
+        if not source:
+            return
+        rec2 = db.query(MediaMetadata).filter(
+            MediaMetadata.emby_item_id == ep_id
+        ).first()
+        if rec2:
+            rec2.overview_source = source
+            rec2.overview_updated_at = datetime.now()
 
     def _write_back_episode(
         self, episode_id: str, episode_data: dict, people: list
