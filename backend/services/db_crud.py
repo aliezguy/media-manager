@@ -102,6 +102,7 @@ def save_media_to_db(
     parent_id: str = None,
     skip_profiles: bool = False,
     light_profiles: bool = False,   # 系列汉化专用：True 时 profile 解析走 light_mode
+    skip_llm_enrich: bool | None = None,  # 三态控制是否跳过演员简介 LLM 补全，透传 ensure_profiles_for_people
 ):
     """通用入库：将一条 Emby 媒体数据 UPSERT 到三张同步表中。
 
@@ -127,6 +128,11 @@ def save_media_to_db(
         skip_profiles: True 时跳过 ensure_profiles_for_people（调用方已提前批量处理）
         light_profiles: True 时 ensure_profiles_for_people 传 light_mode=True
                        （系列汉化跳过 TMDB 上半场）；audit/task_queue 保持 False
+        skip_llm_enrich: 三态控制是否跳过「演员简介 LLM 补全/汉化」，原样透传给
+                       ensure_profiles_for_people：
+                       - None（默认）→ 跟随配置 actor_bio_inline_enabled
+                       - True  → 强制跳过（汉化/审计默认路径）
+                       - False → 强制补全（演员库刷新/修复路径，不受配置影响）
     """
     if provider_ids is None:
         provider_ids = extract_provider_ids(emby_item)
@@ -205,7 +211,10 @@ def save_media_to_db(
                     len([p for p in people if p.get("Type") in ("Actor", "GuestStar")]),
                     title, item_id,
                 )
-                ensure_profiles_for_people(db, people, light_mode=light_profiles)
+                ensure_profiles_for_people(
+                    db, people, light_mode=light_profiles,
+                    skip_llm_enrich=skip_llm_enrich,
+                )
 
             # 先删后插 actor_records，保证关联数据与当前一致
             db.query(ActorRecord).filter(

@@ -20,6 +20,7 @@ from database import Base
 from models import ActorProfile
 import services.actor_profile_ai as apa
 import services.actor_profile_service as aps
+import services.db_crud as dbc
 
 
 def _mem_db():
@@ -158,3 +159,155 @@ def test_config_default_inline_enabled_false():
     """新配置项 actor_bio_inline_enabled 默认 False（汉化/审计默认不内联补简介）。"""
     from config.settings import DEFAULT_CONFIG
     assert DEFAULT_CONFIG.get("actor_bio_inline_enabled") is False
+
+
+# ================================================================
+# Task 2: 透传 ensure_profiles_for_people / save_media_to_db
+#   探针断言 skip_llm_enrich 入参 X 原样穿透，绝不丢失、绝不改写。
+# ================================================================
+
+_MISSING = "MISSING"
+
+
+def _probe_resolve(captured):
+    """ensure_profiles_for_people 的下游探针：捕获传给 resolve_actor_profile 的关键参数。"""
+    def _fake_resolve(name, db, context_info=None, force_refresh=False,
+                      light_mode=False, skip_llm_enrich=_MISSING):
+        captured["light_mode"] = light_mode
+        captured["skip_llm_enrich"] = skip_llm_enrich
+        return {"name": name, "local_image_path": "", "image_url": "",
+                "local_image_url": "", "source": "", "tmdb_id": "", "imdb_id": "",
+                "douban_celebrity_id": "", "birth_date": "", "birth_place": "", "overview": ""}
+    return _fake_resolve
+
+
+def _probe_ensure(captured):
+    """save_media_to_db 的下游探针：捕获传给 ensure_profiles_for_people 的关键参数。"""
+    def _fake_ensure(db, people, light_mode=False, skip_llm_enrich=_MISSING):
+        captured["light_mode"] = light_mode
+        captured["skip_llm_enrich"] = skip_llm_enrich
+    return _fake_ensure
+
+
+def test_ensure_forwards_skip_true(monkeypatch):
+    """ensure_profiles_for_people(skip_llm_enrich=True) → resolve_actor_profile 原样收到 True。"""
+    db = _mem_db()()
+    captured = {}
+    monkeypatch.setattr(aps, "resolve_actor_profile", _probe_resolve(captured))
+
+    aps.ensure_profiles_for_people(
+        db, [{"Name": "A", "Type": "Actor"}], skip_llm_enrich=True,
+    )
+    assert captured["skip_llm_enrich"] is True, "显式 True 必须原样透传"
+    db.close()
+
+
+def test_ensure_forwards_skip_false(monkeypatch):
+    """ensure_profiles_for_people(skip_llm_enrich=False) → resolve_actor_profile 原样收到 False。"""
+    db = _mem_db()()
+    captured = {}
+    monkeypatch.setattr(aps, "resolve_actor_profile", _probe_resolve(captured))
+
+    aps.ensure_profiles_for_people(
+        db, [{"Name": "A", "Type": "Actor"}], skip_llm_enrich=False,
+    )
+    assert captured["skip_llm_enrich"] is False, "显式 False（演员库路径）必须原样透传"
+    db.close()
+
+
+def test_ensure_forwards_skip_none_default(monkeypatch):
+    """ensure_profiles_for_people() 不传 → resolve_actor_profile 收到 None（跟随配置，非 MISSING）。"""
+    db = _mem_db()()
+    captured = {}
+    monkeypatch.setattr(aps, "resolve_actor_profile", _probe_resolve(captured))
+
+    aps.ensure_profiles_for_people(db, [{"Name": "A", "Type": "Actor"}])
+    assert captured["skip_llm_enrich"] is None, "默认 None（跟随配置）必须原样透传"
+    db.close()
+
+
+def test_ensure_forwards_light_and_skip_combined(monkeypatch):
+    """ensure_profiles_for_people(light_mode=True, skip_llm_enrich=True) → 两参数同时透传。"""
+    db = _mem_db()()
+    captured = {}
+    monkeypatch.setattr(aps, "resolve_actor_profile", _probe_resolve(captured))
+
+    aps.ensure_profiles_for_people(
+        db, [{"Name": "A", "Type": "Actor"}], light_mode=True, skip_llm_enrich=True,
+    )
+    assert captured["light_mode"] is True, "light_mode 必须照常透传"
+    assert captured["skip_llm_enrich"] is True, "skip_llm_enrich 必须与 light_mode 同时透传"
+    db.close()
+
+
+def test_save_forwards_skip_true(monkeypatch):
+    """save_media_to_db(skip_llm_enrich=True) → ensure_profiles_for_people 原样收到 True。"""
+    Session = _mem_db()
+    db = Session()
+    captured = {}
+    monkeypatch.setattr(dbc, "ensure_profiles_for_people", _probe_ensure(captured))
+
+    dbc.save_media_to_db(
+        db,
+        emby_item={"Id": "s1", "Name": "九门", "Type": "Series",
+                   "People": [{"Name": "A", "Type": "Actor"}]},
+        people=[{"Name": "A", "Type": "Actor"}],
+        skip_llm_enrich=True,
+    )
+    assert captured["skip_llm_enrich"] is True, "显式 True 必须原样透传"
+    db.close()
+
+
+def test_save_forwards_skip_false(monkeypatch):
+    """save_media_to_db(skip_llm_enrich=False) → ensure_profiles_for_people 原样收到 False。"""
+    Session = _mem_db()
+    db = Session()
+    captured = {}
+    monkeypatch.setattr(dbc, "ensure_profiles_for_people", _probe_ensure(captured))
+
+    dbc.save_media_to_db(
+        db,
+        emby_item={"Id": "s2", "Name": "无", "Type": "Movie",
+                   "People": [{"Name": "B", "Type": "Actor"}]},
+        people=[{"Name": "B", "Type": "Actor"}],
+        skip_llm_enrich=False,
+    )
+    assert captured["skip_llm_enrich"] is False, "显式 False 必须原样透传"
+    db.close()
+
+
+def test_save_forwards_skip_none_default(monkeypatch):
+    """save_media_to_db() 不传 → ensure_profiles_for_people 收到 None（跟随配置，非 MISSING）。"""
+    Session = _mem_db()
+    db = Session()
+    captured = {}
+    monkeypatch.setattr(dbc, "ensure_profiles_for_people", _probe_ensure(captured))
+
+    dbc.save_media_to_db(
+        db,
+        emby_item={"Id": "s3", "Name": "无", "Type": "Movie",
+                   "People": [{"Name": "C", "Type": "Actor"}]},
+        people=[{"Name": "C", "Type": "Actor"}],
+    )
+    assert captured["skip_llm_enrich"] is None, "默认 None（跟随配置）必须原样透传"
+    db.close()
+
+
+def test_save_forwards_light_and_skip_combined(monkeypatch):
+    """save_media_to_db(light_profiles=True, skip_llm_enrich=True) → 两参数同时透传。"""
+    Session = _mem_db()
+    db = Session()
+    captured = {}
+    monkeypatch.setattr(dbc, "ensure_profiles_for_people", _probe_ensure(captured))
+
+    dbc.save_media_to_db(
+        db,
+        emby_item={"Id": "s4", "Name": "九门", "Type": "Series",
+                   "People": [{"Name": "A", "Type": "Actor"}]},
+        people=[{"Name": "A", "Type": "Actor"}],
+        light_profiles=True,
+        skip_llm_enrich=True,
+    )
+    assert captured["light_mode"] is True, "light_profiles 必须照常透传"
+    assert captured["skip_llm_enrich"] is True, "skip_llm_enrich 必须与 light_profiles 同时透传"
+    db.close()

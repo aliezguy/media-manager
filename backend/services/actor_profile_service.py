@@ -1547,6 +1547,7 @@ def ensure_profiles_for_people(
     db,
     people: list,
     light_mode: bool = False,
+    skip_llm_enrich: bool | None = None,
 ) -> dict:
     """为一组 People 字典批量确保 ActorProfile 存在。
 
@@ -1560,8 +1561,13 @@ def ensure_profiles_for_people(
     - 记录总体统计信息
 
     Args:
-        db:      SQLAlchemy Session
-        people:  Emby People 格式的字典列表
+        db:              SQLAlchemy Session
+        people:          Emby People 格式的字典列表
+        skip_llm_enrich: 三态控制是否跳过「演员简介 LLM 补全/汉化」，原样透传给
+                         resolve_actor_profile:
+                         - None（默认）→ 跟随配置 actor_bio_inline_enabled
+                         - True  → 强制跳过（汉化/审计默认路径）
+                         - False → 强制补全（演员库刷新/修复路径，不受配置影响）
 
     Returns:
         {actor_name: profile_dict}  映射，profile_dict 同 resolve_actor_profile 返回值。
@@ -1605,6 +1611,7 @@ def ensure_profiles_for_people(
                 }
                 profile = resolve_actor_profile(
                     name, db, context_info=ctx, light_mode=light_mode,
+                    skip_llm_enrich=skip_llm_enrich,
                 )
                 if profile:
                     result[name] = profile

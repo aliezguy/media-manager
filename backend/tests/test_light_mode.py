@@ -124,7 +124,8 @@ def test_ensure_profiles_forwards_light_mode(monkeypatch):
     db = Session()
     captured = {}
 
-    def fake_resolve(name, db, context_info=None, force_refresh=False, light_mode=False):
+    def fake_resolve(name, db, context_info=None, force_refresh=False, light_mode=False,
+                     skip_llm_enrich=None):
         captured["light_mode"] = light_mode
         return {"name": name, "local_image_path": "", "image_url": "",
                 "local_image_url": "", "source": "", "tmdb_id": "", "imdb_id": "",
@@ -141,7 +142,8 @@ def test_ensure_profiles_default_full_mode(monkeypatch):
     db = Session()
     captured = {}
 
-    def fake_resolve(name, db, context_info=None, force_refresh=False, light_mode=False):
+    def fake_resolve(name, db, context_info=None, force_refresh=False, light_mode=False,
+                     skip_llm_enrich=None):
         captured["light_mode"] = light_mode
         return {"name": name, "local_image_path": "", "image_url": "",
                 "local_image_url": "", "source": "", "tmdb_id": "", "imdb_id": "",
@@ -158,7 +160,7 @@ def test_save_media_to_db_forwards_light_profiles(monkeypatch):
     db = Session()
     captured = {}
 
-    def fake_ensure(db, people, light_mode=False):
+    def fake_ensure(db, people, light_mode=False, skip_llm_enrich=None):
         captured["light_mode"] = light_mode
     monkeypatch.setattr(dbc, "ensure_profiles_for_people", fake_ensure)
 
@@ -178,7 +180,7 @@ def test_save_media_to_db_default_full_mode(monkeypatch):
     db = Session()
     captured = {}
 
-    def fake_ensure(db, people, light_mode=False):
+    def fake_ensure(db, people, light_mode=False, skip_llm_enrich=None):
         captured["light_mode"] = light_mode
     monkeypatch.setattr(dbc, "ensure_profiles_for_people", fake_ensure)
 
