@@ -44,3 +44,7 @@ backend/logs
 SESSION_HANDOFF copy.md
 SESSION_HANDOFF.md
 SESSION_HANDOFF.md
+
+# === 参考与导出（不入库） ===
+_references/
+export_blueprints/
