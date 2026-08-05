@@ -114,7 +114,7 @@ save_media_to_db(db, ..., skip_profiles, light_profiles, skip_llm_enrich=None) �
 
 ## 任务分解（严格 TDD，每 Task 独立 commit + 用户 Review）
 
-### Task 1: `skip_llm_enrich` 三态参数进入 `_llm_enrich_existing` 与 `resolve_actor_profile`
+### Task 1: `skip_llm_enrich` 三态参数进入 `_llm_enrich_existing` 与 `resolve_actor_profile` ✅（`f8a823a` docs + `e2f1d14` feat）
 - 文件：`actor_profile_service.py`
 - 测试：`tests/test_actor_profile_ai.py` 新增（或新 `tests/test_bio_skip.py`）
   - RED: `resolve_actor_profile(skip_llm_enrich=True)` L0 缓存命中时 **0 次** `_llm_enrich_existing`/`enrich_actor_metadata`（Boom 探针）
@@ -124,36 +124,37 @@ save_media_to_db(db, ..., skip_profiles, light_profiles, skip_llm_enrich=None) �
   - RED: `resolve_actor_profile(skip_llm_enrich=False)`（演员库路径）→ 始终补全
 - GREEN: 加三态参数 + 3 处 guard + 末尾 guard；默认 None 跟随配置，配置默认 False；全量回归不红
 
-### Task 2: `skip_llm_enrich` 透传 `ensure_profiles_for_people` 与 `save_media_to_db`
+### Task 2: `skip_llm_enrich` 透传 `ensure_profiles_for_people` 与 `save_media_to_db` ✅（`343aa6d` feat）
 - 文件：`actor_profile_service.py`、`db_crud.py`
 - 测试：
   - RED: `ensure_profiles_for_people(skip_llm_enrich=X)` 透传给 resolve（monkeypatch `resolve_actor_profile` 探针断言入参 X 原样）
   - RED: `save_media_to_db(skip_llm_enrich=X)` 透传给 ensure_profiles_for_people（同探针）
 - GREEN: 加参数 + 透传（含 `light_mode` 组合）
 
-### Task 3: sinicize 两个调用点改为跟随配置（不显式传参）
+### Task 3: sinicize 两个调用点改为跟随配置（不显式传参）✅（`775c62c` test）
 - 文件：`douban_service.py:393`、`:509`
 - 测试：`tests/test_light_mode.py` 或新 `tests/test_sinicize_bio_skip.py`
   - RED: 汉化一个 Series（模拟）后，新增演员的 `overview` 为空/仅 TMDB 免费值，且 `enrich_actor_metadata` 0 次被调用；同时 `actor_profiles` 中记录 **已新增**（默认 config 下即跳过）
   - RED: 断言角色名翻译仍触发（`translate_roles`/`_infer_missing_roles_via_ai` 的调用计数 > 0 或结果回填）——证明 Requirement 2 保留
 - GREEN: 确认调用点默认不传参即生效（若调用点显式传值需移除，确保跟随配置）
 
-### Task 4: 审计/审批流程调用点改为跟随配置
+### Task 4: 审计/审批流程调用点改为跟随配置 ✅（`0526c26` test）
 - 文件：`sync_actions.py:512`、`:559`、`:1318`、`:2019`
 - 测试：`tests/test_audit_series_count.py` 或新测试
   - RED: `_audit_and_save_single_item` 已汉化分支 → `save_media_to_db` 不显式传 skip（探针断言传 None/未传）且 config 默认 False 时 LLM 0 次
   - RED: batch-enrich / batch_audit guest stars 同样探针
 - GREEN: 确认四处调用点默认不传参即生效
 
-### Task 5: 新增 `/actors/repair_overview` 端点 + `_repair_overview_task`
+### Task 5: 新增 `/actors/repair_overview` 端点 + `_repair_overview_task` ✅（`5c289d9` feat，含 refresh/repair_missing 回归修复）
 - 文件：`actor_router.py`（+ `models.py` 无改动；`actor_profile_service` 已具备能力）
 - 测试：
   - RED: 构造 3 位演员（缺 overview / 非中文 overview / 完整中文）→ 前两位进入修复列表，完整者跳过
   - RED: `_repair_overview_task` 对缺简介演员调用 `resolve_actor_profile(skip_llm_enrich=False)`（探针断言显式 False，即使 config=True 也强制补全）
   - RED: 单演员异常不炸整体（try/except 隔离）
 - GREEN: 端点 + 后台任务实现，模式对齐 `_repair_birthplace_task`
+- ⚠ 扩展：用户确认将 refresh(:170)/repair_missing(:302) 漏传 `skip_llm_enrich=False` 的静默回归并入本 Task 修复
 
-### Task 6: 全量回归 + 文档 + 记忆 + commit
+### Task 6: 全量回归 + 文档 + 记忆 + commit ✅（本轮完成）
 - 全量 pytest，确认 0 失败
 - 更新记忆文件（演员简介解耦 + config 开关 + repair_overview 入口）
 - 提交
@@ -173,7 +174,9 @@ save_media_to_db(db, ..., skip_profiles, light_profiles, skip_llm_enrich=None) �
 
 ## 交付物清单
 - 6 个 Task 的代码改动 + 对应测试文件
-- 新增配置项 `actor_bio_inline_enabled`（默认 False）+ 前端配置展示（如有配置页面联动）
+- 新增配置项 `actor_bio_inline_enabled`（默认 False）+ 前端配置展示（如有配置页面联动）—— ⚠ 前端无配置页联动，跳过
 - 新增端点 `/actors/repair_overview`
-- 全量回归通过记录（含 commit hash）
+- 全量回归通过记录：**250 passed / 4 skipped**（基线 243 + Task4/5 新增 12）
 - 记忆文件更新（actors 简介解耦决策 + config 开关 + repair_overview 入口）
+
+**Commit 记录**：`f8a823a`(docs) → `e2f1d14`(T1) → `343aa6d`(T2) → `775c62c`(T3) → `0526c26`(T4) → `5c289d9`(T5) → Task 6 文档收尾
