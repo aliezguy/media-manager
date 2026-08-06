@@ -1,27 +1,9 @@
 <template>
   <div class="qb-manager">
-    <!-- ==================== Custom Tab Bar (胶囊滑动) ==================== -->
-    <div class="tab-bar">
-      <button
-        :class="['tab-btn', { active: activeTab === 'torrents' }]"
-        @click="activeTab = 'torrents'"
-      >
-        <el-icon :size="16"><VideoPlay /></el-icon>
-        <span>种子管理</span>
-      </button>
-      <button
-        :class="['tab-btn', { active: activeTab === 'configs' }]"
-        @click="activeTab = 'configs'"
-      >
-        <el-icon :size="16"><Setting /></el-icon>
-        <span>实例配置</span>
-      </button>
-    </div>
-
     <!-- ================================================================== -->
-    <!--                         种子管理 Tab                                -->
+    <!--                         种子管理                                    -->
     <!-- ================================================================== -->
-    <div v-show="activeTab === 'torrents'" class="torrent-tab">
+    <div class="torrent-tab">
       <!-- Filter Bar — 胶囊形过滤器 -->
       <div class="filter-bar">
         <el-select
@@ -216,64 +198,6 @@
     </div>
 
     <!-- ================================================================== -->
-    <!--                         实例配置 Tab                                -->
-    <!-- ================================================================== -->
-    <div v-show="activeTab === 'configs'" class="configs-tab">
-      <div class="configs-header">
-        <h3 class="configs-title">qBittorrent 实例列表</h3>
-        <button class="btn-pill btn-pill-primary" @click="showAddDialog">
-          <el-icon :size="16"><Plus /></el-icon>
-          新增实例
-        </button>
-      </div>
-
-      <div class="config-cards">
-        <div v-for="cfg in qbConfigs" :key="cfg.id" class="config-card">
-          <div class="cfg-left">
-            <div class="cfg-icon-circle bg-emerald-500/10 text-emerald-400" :class="{ active: cfg.active }">
-              <el-icon :size="20"><Monitor /></el-icon>
-            </div>
-          </div>
-          <div class="cfg-body">
-            <div class="cfg-name">{{ cfg.name }}</div>
-            <div class="cfg-url">{{ cfg.host }}</div>
-            <div class="cfg-user">{{ cfg.username || '未设置用户名' }}</div>
-          </div>
-          <div class="cfg-right">
-            <el-switch
-              v-model="cfg.active"
-              class="cfg-switch"
-              @change="updateConfig(cfg)"
-            />
-            <div class="cfg-actions">
-              <button class="ac-btn" @click.stop="editConfig(cfg)" title="编辑">
-                <el-icon :size="16"><Edit /></el-icon>
-              </button>
-              <el-popconfirm
-                title="确定删除该配置吗？"
-                @confirm="deleteConfig(cfg.id)"
-              >
-                <template #reference>
-                  <button class="ac-btn ac-btn-warn" title="删除">
-                    <el-icon :size="16"><Delete /></el-icon>
-                  </button>
-                </template>
-              </el-popconfirm>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="!qbConfigs.length" class="empty-state">
-          <div class="empty-icon-circle">
-            <el-icon :size="36"><Setting /></el-icon>
-          </div>
-          <p class="empty-title">暂无实例</p>
-          <p class="empty-desc">点击上方按钮新增 qBittorrent 实例配置</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- ================================================================== -->
     <!--                         文件列表弹窗                                -->
     <!-- ================================================================== -->
     <el-dialog v-model="fileDialogVisible" title="文件列表" width="800px" class="file-dialog">
@@ -319,36 +243,6 @@
       </template>
     </el-dialog>
 
-    <!-- ================================================================== -->
-    <!--                         配置弹窗                                    -->
-    <!-- ================================================================== -->
-    <el-dialog
-      v-model="dialogVisible"
-      :title="isEdit ? '编辑实例' : '新增实例'"
-      width="500px"
-    >
-      <el-form :model="currentConfig" label-width="100px">
-        <el-form-item label="名称" required>
-          <el-input v-model="currentConfig.name" placeholder="例如: 家中主下载机" />
-        </el-form-item>
-        <el-form-item label="地址" required>
-          <el-input v-model="currentConfig.host" placeholder="http://192.168.1.10:8080" />
-        </el-form-item>
-        <el-form-item label="用户名">
-          <el-input v-model="currentConfig.username" />
-        </el-form-item>
-        <el-form-item label="密码">
-          <el-input v-model="currentConfig.password" type="password" show-password />
-        </el-form-item>
-        <el-form-item label="激活">
-          <el-switch v-model="currentConfig.active" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="saveQbConfig">确定</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
@@ -356,9 +250,9 @@
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  VideoPlay, Setting, Search, Close, Refresh, Check,
+  Search, Close, Refresh, Check,
   Folder, View, Delete, DeleteFilled, Monitor,
-  FolderOpened, Plus, Edit, Upload, Download, VideoPause,
+  FolderOpened, Upload, Download, VideoPause,
   Clock, WarningFilled, Loading, QuestionFilled,
   Remove
 } from '@element-plus/icons-vue'
@@ -410,11 +304,7 @@ interface TorrentFile {
   is_seed: boolean
 }
 
-/** 实例配置编辑表单（id 在编辑时才有） */
-type ConfigForm = Omit<QbConfig, 'id'> & { id?: string }
-
 // ==================== Reactive State ====================
-const activeTab = ref('torrents')
 const qbConfigs = ref<QbConfig[]>([])
 const loading = ref(false)
 const selectedQb = ref('')
@@ -428,16 +318,6 @@ const currentCategories = ref<string[]>([])
 const filterTag = ref('')
 const filterCategory = ref('')
 const filterName = ref('')
-
-const dialogVisible = ref(false)
-const isEdit = ref(false)
-const currentConfig = ref<ConfigForm>({
-  name: '',
-  host: '',
-  username: 'admin',
-  password: '',
-  active: true
-})
 
 const fileDialogVisible = ref(false)
 const fileList = ref<TorrentFile[]>([])
@@ -640,54 +520,6 @@ const deleteOne = (row: Torrent, deleteFiles: boolean) => {
   })
 }
 
-// ==================== Config CRUD ====================
-const showAddDialog = () => {
-  isEdit.value = false
-  currentConfig.value = { name: '', host: '', username: 'admin', password: '', active: true }
-  dialogVisible.value = true
-}
-
-const editConfig = (row: QbConfig) => {
-  isEdit.value = true
-  currentConfig.value = { ...row }
-  dialogVisible.value = true
-}
-
-const saveQbConfig = async () => {
-  try {
-    if (isEdit.value) {
-      await axios.put(`/api/qb/configs/${currentConfig.value.id}`, currentConfig.value)
-    } else {
-      await axios.post('/api/qb/configs', currentConfig.value)
-    }
-    ElMessage.success('保存成功')
-    dialogVisible.value = false
-    fetchConfigs()
-  } catch (err) {
-    ElMessage.error('保存失败')
-  }
-}
-
-const updateConfig = async (row: QbConfig) => {
-  try {
-    await axios.put(`/api/qb/configs/${row.id}`, row)
-    ElMessage.success('更新成功')
-  } catch (err) {
-    ElMessage.error('更新失败')
-    fetchConfigs()
-  }
-}
-
-const deleteConfig = async (id: string) => {
-  try {
-    await axios.delete(`/api/qb/configs/${id}`)
-    ElMessage.success('删除成功')
-    fetchConfigs()
-  } catch (err) {
-    ElMessage.error('删除失败')
-  }
-}
-
 const formatBytes = (bytes: number, decimals = 2) => {
   if (!+bytes) return '0 Bytes'
   const k = 1024
@@ -715,41 +547,7 @@ onMounted(() => {
               var(--bg-primary);
 }
 
-/* ==================== 胶囊 Tab 栏 ==================== */
-.tab-bar {
-  display: inline-flex;
-  gap: 4px;
-  padding: 4px;
-  width: fit-content;
-  background: rgba(2, 6, 23, 0.5);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.35);
-}
-
-.tab-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 9px 22px;
-  border-radius: 999px;
-  border: none;
-  background: transparent;
-  font-family: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  color: #64748b;
-  cursor: pointer;
-  transition: all 0.22s ease;
-}
-.tab-btn:hover { color: #cbd5e1; }
-.tab-btn.active {
-  color: #93c5fd;
-  background: rgba(59, 130, 246, 0.18);
-  box-shadow: 0 0 14px rgba(59, 130, 246, 0.3), inset 0 0 8px rgba(59, 130, 246, 0.06);
-}
-
-/* ==================== 种子管理 Tab ==================== */
+/* ==================== 种子管理 ==================== */
 .torrent-tab {
   flex: 1;
   min-height: 0;
@@ -1115,116 +913,6 @@ onMounted(() => {
   box-shadow: 0 0 12px rgba(59, 130, 246, 0.5);
 }
 
-/* ==================== 实例配置 Tab ==================== */
-.configs-tab {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.configs-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-.configs-title {
-  font-size: 16px;
-  font-weight: 700;
-  color: #f1f5f9;
-  margin: 0;
-  letter-spacing: 0.3px;
-}
-
-.config-cards {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  overflow-y: auto;
-  min-height: 0;
-  padding: 4px 2px;
-}
-
-/* 实例卡片 — 横向毛玻璃卡片 */
-.config-card {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 14px 18px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 16px;
-  backdrop-filter: blur(14px) saturate(140%);
-  -webkit-backdrop-filter: blur(14px) saturate(140%);
-  transition: border-color 0.22s ease, box-shadow 0.22s ease;
-}
-.config-card:hover {
-  border-color: rgba(16, 185, 129, 0.3);
-  box-shadow: 0 8px 26px -14px rgba(16, 185, 129, 0.25);
-}
-
-.cfg-left { flex-shrink: 0; }
-
-/* 服务器图标 — 发光绿 */
-.cfg-icon-circle {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 46px;
-  height: 46px;
-  border-radius: 14px;
-  box-shadow: 0 0 14px rgba(52, 211, 153, 0.25), inset 0 0 8px rgba(52, 211, 153, 0.08);
-}
-.cfg-icon-circle.active {
-  color: #34d399;
-  box-shadow: 0 0 18px rgba(52, 211, 153, 0.5), inset 0 0 10px rgba(52, 211, 153, 0.12);
-}
-
-.cfg-body {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.cfg-name {
-  font-size: 14.5px;
-  font-weight: 700;
-  color: #ffffff;
-}
-.cfg-url {
-  font-size: 12.5px;
-  color: #94a3b8;
-  font-family: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.cfg-user {
-  font-size: 12px;
-  color: #64748b;
-}
-
-.cfg-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-shrink: 0;
-}
-
-/* Toggle 开关 — 激活霓虹绿光晕 */
-.cfg-switch :deep(.el-switch__core) {
-  width: 44px;
-}
-.cfg-switch :deep(.el-switch.is-checked .el-switch__core) {
-  background: #10b981;
-  box-shadow: 0 0 14px rgba(16, 185, 129, 0.6);
-  border-color: transparent;
-}
-
 /* ==================== Element Plus overrides ==================== */
 :deep(.el-switch) {
   --el-switch-on-color: #3b82f6;
@@ -1390,8 +1078,6 @@ onMounted(() => {
   .qb-manager {
     padding: 10px 12px 32px;
   }
-  .tab-bar { width: 100%; }
-  .tab-btn { flex: 1; justify-content: center; }
   .filter-bar { gap: 8px; }
   .filter-select { width: 100%; }
   .filter-select-sm { width: calc(50% - 4px); }

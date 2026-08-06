@@ -4,10 +4,9 @@ import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import { Settings2, Save } from 'lucide-vue-next'
 
-// 修正了之前的 # 注释错误
 const API_URL = import.meta.env.VITE_API_URL || ''
 
-// 默认选中 'category_yaml'
+// 分类策略 YAML 文件
 const activeTab = ref('category_yaml')
 const fileContent = ref('')
 const loading = ref(false)
@@ -39,46 +38,54 @@ onMounted(loadFile)
 </script>
 
 <template>
-  <div class="console" v-loading="loading">
-    <!-- ========== 科技感头部导航 ========== -->
-    <div class="console-header">
-      <div class="header-left">
-        <span class="header-title">
-          <Settings2 class="title-icon" />
-          策略配置编辑器
-        </span>
-        <span class="header-file">category.yaml</span>
+  <div class="category-root">
+    <div class="console" v-loading="loading">
+      <!-- ========== 科技感头部导航 ========== -->
+      <div class="console-header">
+        <div class="header-left">
+          <span class="header-title">
+            <Settings2 class="title-icon" />
+            策略配置编辑器
+          </span>
+          <span class="header-file">category.yaml</span>
+        </div>
+
+        <button class="save-btn" :disabled="loading" @click="saveFile">
+          <Save class="save-icon" />
+          保存配置
+        </button>
       </div>
 
-      <button class="save-btn" :disabled="loading" @click="saveFile">
-        <Save class="save-icon" />
-        保存配置
-      </button>
-    </div>
+      <!-- ========== 骇客终端编辑器 ========== -->
+      <div class="editor-area">
+        <el-input
+          v-model="fileContent"
+          type="textarea"
+          :rows="25"
+          placeholder="// 策略配置 · 加载中..."
+          class="editor-input"
+        />
+      </div>
 
-    <!-- ========== 骇客终端编辑器 ========== -->
-    <div class="editor-area">
-      <el-input
-        v-model="fileContent"
-        type="textarea"
-        :rows="25"
-        placeholder="// 策略配置 · 加载中..."
-        class="editor-input"
-      />
-    </div>
-
-    <!-- ========== 底部状态栏 ========== -->
-    <div class="status-bar">
-      <div class="status-labels">
-        <span>YAML</span>
-        <span>UTF-8</span>
-        <span>System Ready</span>
+      <!-- ========== 底部状态栏 ========== -->
+      <div class="status-bar">
+        <div class="status-labels">
+          <span>YAML</span>
+          <span>UTF-8</span>
+          <span>System Ready</span>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped lang="postcss">
+/* ==================== 标签页容器 ==================== */
+.category-root {
+  height: 100%;
+  padding: 16px 24px;
+}
+
 /* ==================== 全息策略控制台容器 ==================== */
 .console {
   @apply flex flex-col w-full h-full bg-[#0B1120]/80 backdrop-blur-2xl
@@ -183,5 +190,11 @@ onMounted(loadFile)
 }
 .status-labels {
   @apply flex items-center gap-4 text-slate-500 text-[10px] font-mono uppercase tracking-widest;
+}
+
+@media (max-width: 768px) {
+  .category-root {
+    padding: 10px 12px;
+  }
 }
 </style>

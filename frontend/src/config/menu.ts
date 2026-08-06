@@ -7,16 +7,14 @@
 import type { Component } from 'vue'
 import {
   LayoutDashboard, CalendarClock, Download, Brush, Tags, Users,
-  Library, FolderTree, Server, Settings, History,
+  Library, Settings, History,
 } from 'lucide-vue-next'
 
 // 页面组件
 import TagManager from '../components/TagManager.vue'
-import EmbySettings from '../components/EmbySettings.vue'
-import MpConfig from '../components/MpConfig.vue'
+import BasicConfig from '../components/BasicConfig.vue'
 import WashHistory from '../components/WashHistory.vue'
 import QbManager from '../components/QbManager.vue'
-import FileEditor from '../components/FileEditor.vue'
 import TorrentCleanup from '../components/TorrentCleanup.vue'
 import TaskDashboard from '../components/TaskDashboard.vue'
 import ScheduledTasks from '../components/ScheduledTasks.vue'
@@ -59,14 +57,12 @@ export const menuGroups: MenuGroup[] = [
       { index: 'manager', label: '标签管理', icon: Tags, component: TagManager },
       { index: 'actor', label: '演员中文化', icon: Users, component: ActorLocalizationStudio },
       { index: 'actorLib', label: '演员库', icon: Library, component: ActorLibrary },
-      { index: 'editor', label: '分类', icon: FolderTree, component: FileEditor },
     ],
   },
   {
     title: '系统设置',
     items: [
-      { index: 'emby', label: 'Emby', icon: Server, component: EmbySettings },
-      { index: 'mp', label: '配置', icon: Settings, component: MpConfig },
+      { index: 'config', label: '基础配置', icon: Settings, component: BasicConfig },
       { index: 'history', label: '记录', icon: History, component: WashHistory },
     ],
   },

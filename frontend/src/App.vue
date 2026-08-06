@@ -6,7 +6,7 @@ import Sidebar from './components/Sidebar.vue'
 import { menuGroups } from './config/menu'
 
 const isCollapse = ref(false)
-const activeMenu = ref('emby')
+const activeMenu = ref('dashboard')
 const windowWidth = ref(window.innerWidth)
 
 const isMobile = computed(() => windowWidth.value < 768)
