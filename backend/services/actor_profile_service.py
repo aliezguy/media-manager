@@ -37,6 +37,7 @@ import requests as _requests
 from services.request_budget import acquire as budget_acquire
 from requests.exceptions import Timeout, ConnectionError
 from config.settings import load_config
+from services.webdav_push import push_actor_avatar_to_webdav
 
 logger = logging.getLogger("uvicorn")
 
@@ -1477,6 +1478,11 @@ def resolve_actor_profile(
     if not local_path and not download_url and not has_meta and not existing:
         logger.info("   ❌ [Profile] 无任何可用数据: %s", actor_name)
         return None
+
+    # ★ WebDAV 头像即时回推：本轮真下载了新头像才推（L0 本地命中早已 return，
+    #   不会误推旧图），让代理 cache-first 读到最新头像；WebDAV 未配置时静默跳过。
+    if local_path:
+        push_actor_avatar_to_webdav(local_path)
 
     # ================================================================
     # UPSERT actor_profiles（路径已 100% 规范化，无需 shutil.move 兜底）

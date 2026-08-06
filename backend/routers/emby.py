@@ -564,6 +564,7 @@ def process_actor_items(items):
     for item in items:
         people = item.get('People', []) or []
         actors = [p for p in people if p.get('Type') == 'Actor']
+        pids = item.get('ProviderIds', {}) or {}
         result.append({
             "id": item.get('Id'),
             "name": item.get('Name', ''),
@@ -571,7 +572,8 @@ def process_actor_items(items):
             "type": item.get('Type', ''),
             "library": item.get('CollectionType', ''),
             "actors": actors,
-            "provider_ids": item.get('ProviderIds', {}) or {}
+            "provider_ids": pids,
+            "tmdb_id": str(pids.get("Tmdb") or pids.get("tmdb") or pids.get("TMDb") or ""),
         })
     return result
 
@@ -639,6 +641,7 @@ def get_actor_items(req: ActorItemsRequest):
                 it["sync_status"] = rec.get("status") or "pending"
                 it["sync_matched"] = rec.get("matched_actors", 0)
                 it["sync_total"] = rec.get("total_actors", 0)
+                it["tmdb_id"] = rec.get("tmdb_id") or it.get("tmdb_id", "")
 
             return {"items": items, "total": total}
         finally:
@@ -684,6 +687,7 @@ def get_actor_items(req: ActorItemsRequest):
                     it["sync_status"] = rec.get("status") or "pending"
                     it["sync_matched"] = rec.get("matched_actors", 0)
                     it["sync_total"] = rec.get("total_actors", 0)
+                    it["tmdb_id"] = rec.get("tmdb_id") or it.get("tmdb_id", "")
                 else:
                     it["sync_status"] = "pending"
                     it["sync_matched"] = 0
