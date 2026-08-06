@@ -193,3 +193,52 @@ def test_unconfigured_returns_503(monkeypatch):
             await wis.serve_media_image("movie", 1, "X", 2023, "poster")
         assert ei.value.status_code == 503
     asyncio.run(main())
+
+
+# ==================== Task 4: Router（ASGITransport 隔离，不拉 database） ====================
+import routers.webdav_image as wr
+from fastapi import FastAPI
+_test_app = FastAPI()
+_test_app.include_router(wr.router, prefix="/api")   # 镜像 main.py 注册方式
+
+
+def test_router_invalid_image_type_422():
+    async def main():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_test_app),
+                                     base_url="http://t") as client:
+            r = await client.get("/api/webdav-image/media",
+                                 params={"media_type": "movie", "tmdb_id": 1, "name": "X",
+                                         "year": 2023, "image_type": "banana"})
+            assert r.status_code == 422
+    asyncio.run(main())
+
+
+def test_router_season_poster_without_season_400():
+    async def main():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_test_app),
+                                     base_url="http://t") as client:
+            r = await client.get("/api/webdav-image/media",
+                                 params={"media_type": "tv", "tmdb_id": 1, "name": "X",
+                                         "year": 2023, "image_type": "season-poster"})
+            assert r.status_code == 400
+    asyncio.run(main())
+
+
+def test_router_returns_image_with_headers(monkeypatch):
+    jpeg = b"\xff\xd8\xff\xe0" + b"B" * 1000
+    def handler(req):
+        return httpx.Response(200, content=jpeg, headers={"content-type": "image/jpeg"})
+    monkeypatch.setattr(wis, "get_webdav_client",
+                        lambda: WebDAVClient(base_url="http://dav", username="u", password="p",
+                                             transport=httpx.MockTransport(handler)))
+
+    async def main():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_test_app),
+                                     base_url="http://t") as client:
+            r = await client.get("/api/webdav-image/people",
+                                 params={"path": "张/张译-tmdb-12345/folder.png"})
+            assert r.status_code == 200
+            assert r.content == jpeg
+            assert r.headers["cache-control"] == "public, max-age=31536000, immutable"
+            assert r.headers["content-type"].startswith("image/")
+    asyncio.run(main())

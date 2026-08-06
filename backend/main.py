@@ -48,7 +48,7 @@ logging.getLogger("main").info("Emby AI Manager 启动 — 日志文件: %s", LO
 logging.getLogger("main").info("=" * 60)
 
 # 导入路由
-from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router, douban, sync_status, sync_actions, actor_router, job_config_router, overview_router
+from routers import moviepilot, system, emby, history, qb, file_editor, cd2_router, organize_router, task_flow_router, task_dashboard_router, scheduler_router, douban, sync_status, sync_actions, actor_router, job_config_router, overview_router, webdav_image
 
 # 初始化数据库表
 from database import _run_migrations
@@ -111,6 +111,7 @@ app.include_router(sync_actions.router, prefix="/api", tags=["SyncActions"])
 app.include_router(actor_router.router, prefix="/api", tags=["ActorLibrary"])
 app.include_router(job_config_router.router, prefix="/api", tags=["Jobs"])
 app.include_router(overview_router.router, prefix="/api", tags=["Overview"])
+app.include_router(webdav_image.router, prefix="/api", tags=["WebDAVImage"])
 
 # ★ 演员本地头像静态资源 — Kodi/Emby 标准 people/ 目录
 #    使用项目根目录绝对路径，避免工作目录变化导致的 404
