@@ -1,11 +1,12 @@
 import json
 import os
 
-import jstyleson   # 保留注释的 JSON 解析（config.json 支持 // 与 /* */ 注释）
+import yaml   # 配置文件 YAML 格式（原生支持 # 注释）
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # 定位到 backend 目录
 DATA_DIR = os.path.join(BASE_DIR, 'data') # backend/data
-CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.yaml')       # 主配置（YAML，支持注释）
+CONFIG_FILE_JSON = os.path.join(DATA_DIR, 'config.json')  # 旧版 JSON 兼容（存在则读，保存后迁移）
 # 确保 data 目录存在
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
@@ -114,7 +115,7 @@ DEFAULT_CONFIG = {
     #   False = 保持旧行为，只汉化演员/角色，分集简介交全库 overview 汉化任务处理
     "sinicize_translate_episode_overviews": True,
 
-    # ★ WebDAV 图片缓存（统一媒体资源存储）— 环境变量优先，config.json 兜底
+    # ★ WebDAV 图片缓存（统一媒体资源存储）— 环境变量优先，config.yaml 兜底
     "webdav_base_url": "",     # 如 http://192.168.31.135:5005
     "webdav_username": "",
     "webdav_password": "",
@@ -125,24 +126,30 @@ DEFAULT_CONFIG = {
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
+        # YAML 主格式：原生支持 # 注释
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            data = jstyleson.load(f)   # 支持 config.json 里的 // 与 /* */ 注释
-            # 只做简单的字段合并，不再做数据格式转换
-            for key, value in DEFAULT_CONFIG.items():
-                if key not in data:
-                    data[key] = value
-            return data
-    return DEFAULT_CONFIG
+            data = yaml.safe_load(f) or {}
+    elif os.path.exists(CONFIG_FILE_JSON):
+        # 旧版 config.json 兼容：存在则读取，一旦保存即迁移为 YAML
+        with open(CONFIG_FILE_JSON, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    else:
+        return DEFAULT_CONFIG
+    # 只做简单的字段合并，不再做数据格式转换
+    for key, value in DEFAULT_CONFIG.items():
+        if key not in data:
+            data[key] = value
+    return data
 
 def save_config(new_config: dict):
     current = load_config()
     current.update(new_config)
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(current, f, indent=4, ensure_ascii=False)
+        yaml.safe_dump(current, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
     return current
 
 def get_webdav_config() -> dict:
-    """WebDAV 连接 + 布局配置，环境变量优先，config.json 兜底。
+    """WebDAV 连接 + 布局配置，环境变量优先，config.yaml 兜底。
 
     media_root / people_root 分别是 tv|movie 与 people 的上级目录（相对路径）。
     """
