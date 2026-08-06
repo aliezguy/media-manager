@@ -84,6 +84,8 @@ def test_aput_streams_body_and_sets_content_type():
         received["method"] = req.method
         received["body"] = await req.aread()
         received["ctype"] = req.headers.get("content-type")
+        received["clen"] = req.headers.get("content-length")
+        received["has_te"] = "transfer-encoding" in req.headers
         return httpx.Response(201)
     import io
     spool = io.BytesIO(b"\xff\xd8\xff\xe0" + b"X" * 5000)   # 模拟 spool
@@ -97,3 +99,6 @@ def test_aput_streams_body_and_sets_content_type():
     assert received["body"].startswith(b"\xff\xd8\xff\xe0")
     assert len(received["body"]) == 5004
     assert received["ctype"] == "image/jpeg"
+    # Apache mod_dav 不吃 chunked PUT（存 0 字节），必须带显式 Content-Length
+    assert received["clen"] == "5004"
+    assert not received["has_te"]

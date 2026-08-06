@@ -94,6 +94,7 @@ interface ActorDetail {
   type?: string
   image_url?: string
   local_image_url?: string
+  local_image_path?: string
   birth_date?: string
   birth_place?: string
   overview?: string
@@ -617,11 +618,19 @@ const getPosterUrl = (item: MediaItem) => {
   return config.emby_host + '/emby/Items/' + item.id + '/Images/Primary?api_key=' + config.emby_api_key
 }
 
-// ★ 头像 URL 归一化 — 修复局域网访问裂图：
-// 后端经 Vite 代理(changeOrigin)拼出的 local_image_url 是 http://127.0.0.1:8000/static_actors/...，
-// 手机等局域网设备访问该地址会指向设备自身 → 失败。改写为同源相对路径 /static_actors/...，
-// 由 Vite 代理 / 后端静态挂载转发，localhost 与局域网 IP 访问均正常。
-const resolveActorAvatar = (act: { local_image_url?: string; image_url?: string }) => {
+// ★ 头像 URL 归一化 — WebDAV 代理优先（缓存优先 + TMDB 兜底），静态挂载兜底：
+// 1. local_image_path 为 DB 相对地址（如 "张/张译-tmdb-12345/folder.png"），
+//    转成 /api/webdav-image/people?path=... 代理 URL（同源，局域网/本机均可达）。
+//    仅当路径是 tmdb 三段式才走代理（旧格式代理不认，回退静态挂载）。
+// 2. 静态挂载 /static_actors/...（同源相对路径，由 Vite 代理 / 后端静态挂载转发）。
+//    后端经 Vite 代理(changeOrigin)拼出的 local_image_url 可能是 http://127.0.0.1:8000/static_actors/...，
+//    手机等局域网设备访问会指向设备自身 → 失败，故剥离协议+主机保留路径。
+// 3. 最后兜底外部直链 image_url。
+const WEBDAV_TMDB_RE = /^[^/]+\/[^/]+-tmdb-\d+\/[^/]+$/
+const resolveActorAvatar = (act: { local_image_path?: string; local_image_url?: string; image_url?: string }) => {
+  if (act.local_image_path && WEBDAV_TMDB_RE.test(act.local_image_path)) {
+    return '/api/webdav-image/people?path=' + encodeURIComponent(act.local_image_path)
+  }
   const url = act.local_image_url || act.image_url
   if (!url) return ''
   // 指向本机回环地址的绝对 URL → 剥离协议+主机，保留路径交给同源代理

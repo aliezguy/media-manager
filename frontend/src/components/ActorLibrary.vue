@@ -232,9 +232,15 @@ const handleCleanupImages = async () => {
 }
 
 // ==================== 图片 URL 拼接 + 高科技缺省图 ====================
+// ★ WebDAV 代理仅认 tmdb 三段式地址（首字/名-tmdb-id/folder.*），旧格式回退静态挂载
+const WEBDAV_TMDB_RE = /^[^/]+\/[^/]+-tmdb-\d+\/[^/]+$/
 const getAvatarUrl = (actor: Actor) => {
-  // L1: 本地图片 — 代理转发到 FastAPI /people 静态目录
+  // L1: 本地图片 — WebDAV 代理优先（缓存优先 + TMDB 兜底），仅 tmdb 三段式路径走代理
   if (actor.local_image_path) {
+    if (WEBDAV_TMDB_RE.test(actor.local_image_path)) {
+      return '/api/webdav-image/people?path=' + encodeURIComponent(actor.local_image_path)
+    }
+    // 旧格式路径代理不认 → 回退静态挂载 /people/...
     return `/people/${actor.local_image_path}`
   }
   // L2: 外部直链 (豆瓣/TMDB/Emby)

@@ -68,12 +68,17 @@ class WebDAVClient:
             raise WebDAVError(f"MKCOL {acc} 失败: HTTP {resp.status_code}")
         return True
 
-    # ---- PUT：async 生成器分块上传（Transfer-Encoding: chunked），不整图进内存 ----
+    # ---- PUT：async 生成器分块上传，但带显式 Content-Length ----
+    # Apache mod_dav 对 Transfer-Encoding: chunked 的 PUT 支持不完整（返回 201 却存 0 字节），
+    # 必须预先算出 spool 大小、以 Content-Length 方式上传（httpx 见 async gen 默认走 chunked）。
     async def aput(self, rel: str, spool, mime: str) -> bool:
         url = self.build_url(rel)
+        spool.seek(0, 2)
+        size = spool.tell()
         spool.seek(0)
         resp = await self._client.put(
-            url, content=_spool_chunks(spool), headers={"Content-Type": mime})
+            url, content=_spool_chunks(spool),
+            headers={"Content-Type": mime, "Content-Length": str(size)})
         if resp.status_code in (200, 201, 204):
             return True
         logger.warning("   ⚠ [WebDAV] PUT %s 失败 HTTP %d", url, resp.status_code)
