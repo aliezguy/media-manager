@@ -41,8 +41,7 @@ _MAGIC_MIME = (
     (b"GIF8", "image/gif"),
 )
 
-# WebDAV 根下的媒体资料库命名空间：library/tv、library/movie、library/people
-_LIBRARY_ROOT = "library"
+# WebDAV 布局：tv|movie 与 people 的上级目录均可配置（config: webdav_media_root / webdav_people_root）
 
 # image_type → (TMDB 接口模板, 响应字段, 图片尺寸)
 # 尺寸对齐既有约定: poster/season w500 (tmdb_service), backdrop w1280, profile w185 (actor_image_service)
@@ -57,6 +56,16 @@ _TMDB_SPEC = {
 
 
 # ---------- 路径构造 ----------
+def _media_root() -> str:
+    """tv/movie 的上级目录（config: webdav_media_root，默认 library）。"""
+    return (get_webdav_config().get("media_root") or "library").strip("/") or "library"
+
+
+def _people_root() -> str:
+    """people 的上级目录（config: webdav_people_root，默认 library）。"""
+    return (get_webdav_config().get("people_root") or "library").strip("/") or "library"
+
+
 def _sanitize_name(name: str) -> str:
     name = "".join(ch for ch in (name or "").strip() if ch not in "/\\")
     return name or "unnamed"
@@ -70,7 +79,7 @@ def build_media_webdav_rel(media_type: str, year, name: str, tmdb_id,
         filename = f"season{int(season):02d}-poster.jpg"
     else:
         filename = f"{image_type}.jpg"
-    return f"{_LIBRARY_ROOT}/{media_type}/{year}/{dirname}/{filename}"
+    return f"{_media_root()}/{media_type}/{year}/{dirname}/{filename}"
 
 
 # ---------- 客户端单例（配置签名变化时重建，测试可 monkeypatch 注入） ----------
@@ -96,7 +105,9 @@ def get_webdav_client() -> WebDAVClient | None:
         if not cfg["base_url"]:
             _webdav_client = None
             return None
-        _webdav_client = WebDAVClient(**cfg)
+        _webdav_client = WebDAVClient(
+            base_url=cfg["base_url"], username=cfg["username"],
+            password=cfg["password"], root_path=cfg["root_path"])
     return _webdav_client
 
 
@@ -302,7 +313,7 @@ async def serve_people_image(local_image_path: str) -> StreamingResponse:
     webdav = get_webdav_client()
     if webdav is None:
         raise HTTPException(status_code=503, detail="WebDAV 未配置")
-    rel = f"{_LIBRARY_ROOT}/people/{_sanitize_dav_rel(local_image_path)}"
+    rel = f"{_people_root()}/people/{_sanitize_dav_rel(local_image_path)}"
     resp = await webdav.aget(rel)
     if resp is not None:
         return _webdav_hit_stream(resp)
@@ -341,7 +352,7 @@ async def migrate_local_people_to_webdav() -> dict:
         for fname in files:
             if not fname.lower().startswith("folder"):
                 continue
-            dav_rel = f"{_LIBRARY_ROOT}/people/{rel}/{fname}"   # ★ 保留原名/格式：folder.png 仍是 folder.png
+            dav_rel = f"{_people_root()}/people/{rel}/{fname}"   # ★ 保留原名/格式：folder.png 仍是 folder.png
             mime = _EXT_MIME.get(os.path.splitext(fname)[1].lower(), "image/jpeg")
             try:
                 with open(os.path.join(root, fname), "rb") as f:

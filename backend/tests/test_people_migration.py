@@ -74,6 +74,25 @@ def test_serve_people_by_db_path(monkeypatch):
     assert calls == ["/library/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
 
 
+def test_serve_people_respects_configured_people_root(monkeypatch):
+    calls = []
+    def handler(req):
+        calls.append(req.url.raw_path.decode())
+        return httpx.Response(200, content=JPEG, headers={"content-type": "image/jpeg"})
+    monkeypatch.setattr(wis, "get_webdav_client",
+                        lambda: WebDAVClient(base_url="http://dav", username="u", password="p",
+                                             transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(wis, "get_webdav_config",
+                        lambda: {"base_url": "", "username": "", "password": "", "root_path": "",
+                                 "media_root": "library", "people_root": "actors"})
+
+    async def main():
+        resp = await wis.serve_people_image("张/张译-tmdb-12345/folder.png")
+        b"".join([ch async for ch in resp.body_iterator])
+    asyncio.run(main())
+    assert calls == ["/actors/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
+
+
 def test_people_miss_writes_back_to_same_path(monkeypatch):
     # DB 地址在 WebDAV 未命中 → TMDB 兜底 → 回写同一地址 folder.png（地址=唯一真相）
     PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 300

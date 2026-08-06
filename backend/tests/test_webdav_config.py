@@ -33,4 +33,19 @@ def test_config_fallback_when_no_env(monkeypatch):
 
 def test_empty_when_unconfigured():
     cfg = settings.get_webdav_config()
-    assert cfg == {"base_url": "", "username": "", "password": "", "root_path": ""}
+    assert cfg == {"base_url": "", "username": "", "password": "", "root_path": "",
+                   "media_root": "library", "people_root": "library"}
+
+
+def test_roots_configurable_via_config_file(monkeypatch):
+    monkeypatch.setattr(settings, "load_config",
+                        lambda: {"webdav_media_root": "movies", "webdav_people_root": "actors"})
+    cfg = settings.get_webdav_config()
+    assert cfg["media_root"] == "movies"
+    assert cfg["people_root"] == "actors"
+
+
+def test_roots_env_overrides_config(monkeypatch):
+    monkeypatch.setenv("WEBDAV_MEDIA_ROOT", "/media")
+    monkeypatch.setattr(settings, "load_config", lambda: {"webdav_media_root": "movies"})
+    assert settings.get_webdav_config()["media_root"] == "/media"   # env 原样，strip 在拼接层

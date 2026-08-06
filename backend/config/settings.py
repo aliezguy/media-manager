@@ -117,6 +117,8 @@ DEFAULT_CONFIG = {
     "webdav_username": "",
     "webdav_password": "",
     "webdav_root_path": "",    # WebDAV 服务内的根目录，如 /dav（可空）
+    "webdav_media_root": "library",     # tv/movie 的上级目录（WebDAV 内相对路径，可自定义）
+    "webdav_people_root": "library",    # people 的上级目录（WebDAV 内相对路径，可自定义）
 }
 
 def load_config():
@@ -138,11 +140,16 @@ def save_config(new_config: dict):
     return current
 
 def get_webdav_config() -> dict:
-    """WebDAV 连接配置，环境变量优先，config.json 兜底。"""
+    """WebDAV 连接 + 布局配置，环境变量优先，config.json 兜底。
+
+    media_root / people_root 分别是 tv|movie 与 people 的上级目录（相对路径）。
+    """
     cfg = load_config()
     return {
-        "base_url":  os.environ.get("WEBDAV_BASE_URL")  or cfg.get("webdav_base_url", ""),
-        "username":  os.environ.get("WEBDAV_USERNAME")  or cfg.get("webdav_username", ""),
-        "password":  os.environ.get("WEBDAV_PASSWORD")  or cfg.get("webdav_password", ""),
-        "root_path": os.environ.get("WEBDAV_ROOT_PATH") or cfg.get("webdav_root_path", ""),
+        "base_url":    os.environ.get("WEBDAV_BASE_URL")    or cfg.get("webdav_base_url", ""),
+        "username":    os.environ.get("WEBDAV_USERNAME")    or cfg.get("webdav_username", ""),
+        "password":    os.environ.get("WEBDAV_PASSWORD")    or cfg.get("webdav_password", ""),
+        "root_path":   os.environ.get("WEBDAV_ROOT_PATH")   or cfg.get("webdav_root_path", ""),
+        "media_root":  os.environ.get("WEBDAV_MEDIA_ROOT")  or cfg.get("webdav_media_root", "library"),
+        "people_root": os.environ.get("WEBDAV_PEOPLE_ROOT") or cfg.get("webdav_people_root", "library"),
     }

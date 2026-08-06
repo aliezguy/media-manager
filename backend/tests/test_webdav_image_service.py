@@ -47,6 +47,14 @@ def test_build_rel_sanitizes_name():
     assert wis.build_media_webdav_rel("movie", 2023, "", 1, "poster") == "library/movie/2023/unnamed-tmdb-1/poster.jpg"
 
 
+def test_media_rel_respects_configured_media_root(monkeypatch):
+    monkeypatch.setattr(wis, "get_webdav_config",
+                        lambda: {"base_url": "", "username": "", "password": "", "root_path": "",
+                                 "media_root": "movies", "people_root": "library"})
+    assert wis.build_media_webdav_rel("movie", 2023, "Oppenheimer", 123456, "poster") == \
+        "movies/movie/2023/Oppenheimer-tmdb-123456/poster.jpg"
+
+
 # ---------- 缓存命中：WebDAV 200 → 透传，不碰 TMDB ----------
 def _install_webdav(calls):
     def handler(req):
