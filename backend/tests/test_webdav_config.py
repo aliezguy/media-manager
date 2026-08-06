@@ -1,4 +1,4 @@
-"""WebDAV 图片缓存配置解析测试 — env 优先、config.json 兜底、未配置判空。"""
+"""WebDAV 图片缓存配置解析测试 — env 优先、config.yaml 兜底、未配置判空。"""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

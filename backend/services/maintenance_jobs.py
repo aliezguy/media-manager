@@ -1,6 +1,6 @@
 """maintenance_jobs.py — 全量汉化 / 全量审计 / 全库简介汉化可配置定时任务。
 
-三个任务的配置持久化在 config.json（``localization_job`` / ``audit_job`` / ``overview_job``），
+三个任务的配置持久化在 config.yaml（``localization_job`` / ``audit_job`` / ``overview_job``），
 由本模块负责：
 - 配置读写（含 last_run_at 持久化、next_run_at 动态计算）
 - APScheduler Cron 作业注册/移除（与 scheduler_service 共用全局 scheduler）

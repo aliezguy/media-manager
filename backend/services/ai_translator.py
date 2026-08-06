@@ -11,7 +11,7 @@ AI 翻译服务 — 通用 LLM 翻译，兼容任意 OpenAI SDK 接口的大模�
   按顺序逐级尝试：当前 Provider 内「地址级降级 → 指数退避重试」全部耗尽后，自动无缝降级到下一个 API。
 - 空值防御：某个优先级的配置为空、或缺失 api_key / model_name 等核心字段时，优雅跳过，直接尝试下一个。
 
-【配置 Schema（config.json）】
+【配置 Schema（config.yaml）】
     "ai_providers": [                       # 有序列表 或 保序字典，优先级 = 顺序（index 0 / 首个键 为首选）
         {
             "name": "硅基流动",              # 可选，仅用于日志标识

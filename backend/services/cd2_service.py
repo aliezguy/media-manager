@@ -24,11 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Configuration resolver — config.json first, then env vars (env wins)
+# Configuration resolver — config.yaml first, then env vars (env wins)
 # ---------------------------------------------------------------------------
 @lru_cache()
 def _cd2_config() -> dict:
-    """Load CD2 config from config.json, falling back to env vars."""
+    """Load CD2 config from config.yaml, falling back to env vars."""
     try:
         from config.settings import load_config
         cfg = load_config()
@@ -36,7 +36,7 @@ def _cd2_config() -> dict:
         cfg = {}
 
     def _val(key: str, env_key: str, default: str = "") -> str:
-        # env var takes highest priority, then config.json, then default
+        # env var takes highest priority, then config.yaml, then default
         env_val = os.getenv(env_key)
         if env_val is not None and env_val != "":
             return env_val

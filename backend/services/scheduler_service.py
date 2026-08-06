@@ -458,7 +458,7 @@ def load_all_tasks() -> None:
     except Exception as e:
         logger.error("[Scheduler] 注册超时检查任务失败: %s", e)
 
-    # ---- 注册可配置的汉化/审计定时任务（config.json 中 localization_job/audit_job）----
+    # ---- 注册可配置的汉化/审计定时任务（config.yaml 中 localization_job/audit_job）----
     try:
         from services.maintenance_jobs import load_maintenance_jobs
         load_maintenance_jobs()

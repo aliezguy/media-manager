@@ -5,7 +5,7 @@ P3 豆瓣请求治理的底层基建：在既有冷却之上加一道强制上�
 acquire() —— 超限时排队等待（默认 30s 超时），仍超限则返回 False，调用方跳过并记日志，
 避免一次 webhook 触发的系列汉化打爆某个 Provider。
 
-配置节（config.json → DEFAULT_CONFIG.request_budget）：
+配置节（config.yaml → DEFAULT_CONFIG.request_budget）：
     douban_per_series:          30   一次系列汉化突发窗口(600s)内豆瓣请求上限
     tmdb_per_min:               60   TMDB 滚动窗口(60s)内上限
     emby_writeback_per_series:  50   一次系列汉化突发窗口(600s)内 Emby 回写上限
@@ -29,7 +29,7 @@ _WINDOW_SECONDS = {
     "emby_writeback": 600.0,
 }
 
-# provider → config.json request_budget 节内的键名
+# provider → config.yaml request_budget 节内的键名
 _CONFIG_KEYS = {
     "douban": "douban_per_series",
     "tmdb": "tmdb_per_min",

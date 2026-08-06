@@ -6,7 +6,7 @@
 - save_job_config("overview_job", ...) 校验 / 持久化 / 同步调度器
 - run_job("overview_job") → _run_overview_translation → scan_and_translate(library_ids)
 
-全程 mock 配置读写与扫描层，绝不读写磁盘 config.json，不触网。
+全程 mock 配置读写与扫描层，绝不读写磁盘 config.yaml，不触网。
 """
 import sys
 import os
