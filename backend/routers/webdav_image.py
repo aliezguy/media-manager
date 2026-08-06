@@ -16,10 +16,11 @@ async def get_media_image(
     year: int,
     image_type: Literal["poster", "backdrop", "season-poster"],
     season: int | None = None,
+    emby_item_id: str = "",   # ★ Emby 兜底：TMDB 无对应图时用 Emby 原图海报回写
 ):
     if image_type == "season-poster" and season is None:
         raise HTTPException(status_code=400, detail="season 参数必填（season-poster）")
-    return await serve_media_image(media_type, tmdb_id, name, year, image_type, season)
+    return await serve_media_image(media_type, tmdb_id, name, year, image_type, season, emby_item_id)
 
 
 @router.get("/webdav-image/people")

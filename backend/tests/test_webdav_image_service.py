@@ -156,6 +156,45 @@ def test_tmdb_missing_poster_returns_404(monkeypatch):
     asyncio.run(main())
 
 
+def test_tmdb_missing_poster_falls_back_to_emby(monkeypatch):
+    """TMDB 无图（tmdb_id 失效）→ Emby 原图兜底下载 → 回写同一 WebDAV 地址。"""
+    dav_calls = []
+    img_calls = []
+
+    def dav_handler(req):
+        dav_calls.append((req.method, req.url.path))
+        return httpx.Response(404) if req.method == "GET" else httpx.Response(201)
+
+    monkeypatch.setattr(wis, "get_webdav_client",
+                        lambda: WebDAVClient(base_url="http://dav", username="u", password="p",
+                                             transport=httpx.MockTransport(dav_handler)))
+    monkeypatch.setattr(wis, "_tmdb_credentials", lambda: ("fakekey", "https://api.tmdb.org/3"))
+    monkeypatch.setattr(wis, "budget_acquire", lambda *a, **k: True)
+    monkeypatch.setattr(wis, "_tmdb_meta_client",
+                        httpx.AsyncClient(transport=httpx.MockTransport(
+                            lambda req: httpx.Response(200, json={"poster_path": None}))))
+    monkeypatch.setattr(wis, "_tmdb_image_client",
+                        httpx.AsyncClient(transport=httpx.MockTransport(
+                            lambda req: (img_calls.append(str(req.url)),
+                                         httpx.Response(200, content=JPEG))[1])))
+    monkeypatch.setattr(wis, "load_config",
+                        lambda: {"emby_host": "http://emby", "emby_api_key": "k"})
+
+    async def main():
+        resp = await wis.serve_media_image(
+            "tv", 287013, "仙剑奇侠传", 2005, "poster", emby_item_id="1888386")
+        body = await _collect(resp)
+        assert body == JPEG
+        await wis.wait_pending_writebacks()      # 等后台回写落地
+    asyncio.run(main())
+
+    # TMDB 无 poster → Emby 原图兜底下载
+    assert any("emby/Items/1888386/Images/Primary" in u for u in img_calls)
+    # 回写同一 tmdb 地址（缓存键不变，二次加载直接命中 WebDAV）
+    puts = [p for m, p in dav_calls if m == "PUT"]
+    assert len(puts) == 1 and puts[0].endswith("poster.jpg")
+
+
 def test_tmdb_html_image_returns_404_no_put(monkeypatch):
     dav_calls = []
     def dav_handler(req):

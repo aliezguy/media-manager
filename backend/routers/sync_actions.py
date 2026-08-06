@@ -1007,7 +1007,7 @@ def get_media_details(item_id: str):
                 "type": a.type,
                 "image_url": image_url,                   # 外部直链兜底
                 "local_image_url": local_image_url,       # 本地静态 URL（/static_actors/...）
-                "local_image_path": prof.local_image_path or "",   # ★ DB 相对地址 → 前端走 WebDAV 代理
+                "local_image_path": prof.local_image_path if prof else "",   # ★ DB 相对地址 → 前端走 WebDAV 代理
                 "birth_date": prof.birth_date if prof else "",
                 "birth_place": prof.birth_place if prof else "",
                 "overview": prof.overview if prof else "",

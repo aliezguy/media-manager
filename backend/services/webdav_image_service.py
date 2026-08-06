@@ -159,8 +159,8 @@ async def _fetch_tmdb_image_url(media_key: str, tmdb_id, image_type: str, season
     return f"https://image.tmdb.org/t/p/{size}{path}"
 
 
-async def _download_tmdb_to_spool(spool, image_url: str) -> bytes | None:
-    """分块流式下载 TMDB 图片到 spool，魔数校验；返回魔数（前 12 字节）或 None。"""
+async def _download_image_to_spool(spool, image_url: str) -> bytes | None:
+    """分块流式下载图片（TMDB / Emby 兜底）到 spool，魔数校验；返回魔数（前 12 字节）或 None。"""
     client = _get_tmdb_image_client()
     req = client.build_request("GET", image_url)
     resp = await client.send(req, stream=True)
@@ -189,6 +189,16 @@ def _magic_to_mime(magic: bytes) -> str:
         if magic.startswith(sig):
             return mime
     return "image/jpeg"
+
+
+def _build_emby_image_url(emby_item_id: str) -> str:
+    """Emby 兜底 URL：用 Emby 原始海报（Item 直连）。tmdb_id 失效/错配时仍可缓存封面。"""
+    cfg = load_config()
+    host = cfg.get("emby_host", "") or os.environ.get("EMBY_HOST", "")
+    key = cfg.get("emby_api_key", "") or os.environ.get("EMBY_API_KEY", "")
+    if not (host and key and emby_item_id):
+        return ""
+    return f"{host.rstrip('/')}/emby/Items/{emby_item_id}/Images/Primary?api_key={key}"
 
 
 # ---- people 按 DB 地址驱动 ----
@@ -231,17 +241,31 @@ def _webdav_hit_stream(resp) -> StreamingResponse:
 
 
 async def _tmdb_miss_stream(webdav, dav_rel: str, media_key: str, tmdb_id,
-                            image_type: str, season=None) -> StreamingResponse:
-    """TMDB 兜底：下载→校验→spool 分块给前端→回写调度在 finally。"""
-    image_url = await _fetch_tmdb_image_url(media_key, tmdb_id, image_type, season)
-    if not image_url:
-        raise HTTPException(status_code=404, detail="TMDB 无对应图片")
+                            image_type: str, season=None, emby_item_id="") -> StreamingResponse:
+    """TMDB 兜底（失败退 Emby 原图）：下载→校验→spool 分块给前端→回写调度在 finally。
 
-    spool = tempfile.SpooledTemporaryFile(max_size=1 * 1024 * 1024)
-    magic = await _download_tmdb_to_spool(spool, image_url)
-    if magic is None:
-        spool.close()
-        raise HTTPException(status_code=404, detail="TMDB 图片下载失败/非图片内容")
+    Emby 兜底动机：Emby 元数据里 tmdb_id 可能失效/错配（TMDB 无该资源，如
+    仙剑奇侠传 tmdb=287013），此时从 Emby 拉原始海报回写同一 WebDAV 地址，
+    保证封面照样进缓存；Emby 兜底不耗 TMDB 请求预算。
+    """
+    spool = None
+    image_url = await _fetch_tmdb_image_url(media_key, tmdb_id, image_type, season)
+    if image_url:
+        spool = tempfile.SpooledTemporaryFile(max_size=1 * 1024 * 1024)
+        magic = await _download_image_to_spool(spool, image_url)
+        if magic is None:
+            spool.close()
+            spool = None
+    if spool is None and emby_item_id:
+        emby_url = _build_emby_image_url(emby_item_id)
+        if emby_url:
+            spool = tempfile.SpooledTemporaryFile(max_size=1 * 1024 * 1024)
+            magic = await _download_image_to_spool(spool, emby_url)
+            if magic is None:
+                spool.close()
+                spool = None
+    if spool is None:
+        raise HTTPException(status_code=404, detail="TMDB/Emby 均无对应图片")
     mime = _magic_to_mime(magic)
     spool.seek(0)
 
@@ -293,7 +317,7 @@ async def wait_pending_writebacks() -> None:
 
 # ---------- 对外编排入口 ----------
 async def serve_media_image(media_type: str, tmdb_id, name: str, year,
-                            image_type: str, season=None) -> StreamingResponse:
+                            image_type: str, season=None, emby_item_id="") -> StreamingResponse:
     webdav = get_webdav_client()
     if webdav is None:
         raise HTTPException(status_code=503, detail="WebDAV 未配置")
@@ -301,7 +325,7 @@ async def serve_media_image(media_type: str, tmdb_id, name: str, year,
     resp = await webdav.aget(rel)
     if resp is not None:
         return _webdav_hit_stream(resp)
-    return await _tmdb_miss_stream(webdav, rel, media_type, tmdb_id, image_type, season)
+    return await _tmdb_miss_stream(webdav, rel, media_type, tmdb_id, image_type, season, emby_item_id)
 
 
 async def serve_people_image(local_image_path: str) -> StreamingResponse:

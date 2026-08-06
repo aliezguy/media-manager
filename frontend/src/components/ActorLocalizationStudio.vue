@@ -613,7 +613,22 @@ const getPosterGradient = (name: string) => {
   return g[Math.abs(h) % g.length]
 }
 
+// ★ 封面 URL 归一化 — WebDAV 代理优先（缓存优先 + TMDB 兜底并回写，二次加载命中 WebDAV）：
+// 需 tmdb_id + year 才能拼代理地址；缺失时回退 Emby 原始海报。
 const getPosterUrl = (item: MediaItem) => {
+  const tmdbId = item.provider_ids?.Tmdb || item.provider_ids?.tmdb || item.provider_ids?.TMDb || ''
+  if (item.id && tmdbId && item.year) {
+    const mediaType = item.type === 'Movie' ? 'movie' : 'tv'
+    const qs = new URLSearchParams({
+      media_type: mediaType,
+      tmdb_id: String(tmdbId),
+      name: item.name,
+      year: String(item.year),
+      image_type: 'poster',
+      emby_item_id: item.id,   // ★ Emby 兜底：tmdb_id 失效/错配时用 Emby 原图海报回写
+    })
+    return '/api/webdav-image/media?' + qs.toString()
+  }
   if (!config.emby_host || !config.emby_api_key || !item.id) return null
   return config.emby_host + '/emby/Items/' + item.id + '/Images/Primary?api_key=' + config.emby_api_key
 }
