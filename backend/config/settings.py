@@ -111,6 +111,12 @@ DEFAULT_CONFIG = {
     #   True（默认）= 分集循环里对非中文简介调 LLM 翻译（overview 双重引擎），整部剧全中文
     #   False = 保持旧行为，只汉化演员/角色，分集简介交全库 overview 汉化任务处理
     "sinicize_translate_episode_overviews": True,
+
+    # ★ WebDAV 图片缓存（统一媒体资源存储）— 环境变量优先，config.json 兜底
+    "webdav_base_url": "",     # 如 http://192.168.31.135:5005
+    "webdav_username": "",
+    "webdav_password": "",
+    "webdav_root_path": "",    # WebDAV 服务内的根目录，如 /dav（可空）
 }
 
 def load_config():
@@ -130,3 +136,13 @@ def save_config(new_config: dict):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(current, f, indent=4, ensure_ascii=False)
     return current
+
+def get_webdav_config() -> dict:
+    """WebDAV 连接配置，环境变量优先，config.json 兜底。"""
+    cfg = load_config()
+    return {
+        "base_url":  os.environ.get("WEBDAV_BASE_URL")  or cfg.get("webdav_base_url", ""),
+        "username":  os.environ.get("WEBDAV_USERNAME")  or cfg.get("webdav_username", ""),
+        "password":  os.environ.get("WEBDAV_PASSWORD")  or cfg.get("webdav_password", ""),
+        "root_path": os.environ.get("WEBDAV_ROOT_PATH") or cfg.get("webdav_root_path", ""),
+    }
