@@ -31,9 +31,10 @@ def test_migrate_uploads_and_creates_dirs(monkeypatch, tmp_path):
     asyncio.run(main())
 
     mkcols = [p for m, p in calls if m == "MKCOL"]
-    assert mkcols == ["/people/", "/people/%E5%BC%A0/", "/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/"]
+    assert mkcols == ["/library/", "/library/people/", "/library/people/%E5%BC%A0/",
+                      "/library/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/"]
     puts = [p for m, p in calls if m == "PUT"]
-    assert puts == ["/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]  # 保留原名/格式
+    assert puts == ["/library/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]  # 保留原名/格式
 
 
 def test_migrate_no_people_dir(monkeypatch):
@@ -70,7 +71,7 @@ def test_serve_people_by_db_path(monkeypatch):
         body = b"".join([ch async for ch in resp.body_iterator])
         assert body == JPEG
     asyncio.run(main())
-    assert calls == ["/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
+    assert calls == ["/library/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
 
 
 def test_people_miss_writes_back_to_same_path(monkeypatch):
@@ -99,6 +100,6 @@ def test_people_miss_writes_back_to_same_path(monkeypatch):
         await wis.wait_pending_writebacks()
     asyncio.run(main())
     gets = [p for m, p in dav_calls if m == "GET"]
-    assert gets == ["/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
+    assert gets == ["/library/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
     puts = [p for m, p in dav_calls if m == "PUT"]
-    assert puts == ["/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]
+    assert puts == ["/library/people/%E5%BC%A0/%E5%BC%A0%E8%AF%91-tmdb-12345/folder.png"]

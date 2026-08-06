@@ -14,12 +14,12 @@ HTML = b"<html>anti-bot</html>"
 # ---------- 路径构造 ----------
 def test_build_media_webdav_rel_poster():
     rel = wis.build_media_webdav_rel("movie", 2023, "Oppenheimer", 123456, "poster")
-    assert rel == "movie/2023/Oppenheimer-tmdb-123456/poster.jpg"
+    assert rel == "library/movie/2023/Oppenheimer-tmdb-123456/poster.jpg"
 
 
 def test_build_media_webdav_rel_season_zero_pad():
     rel = wis.build_media_webdav_rel("tv", 2024, "Shogun", 98765, "season-poster", season=1)
-    assert rel == "tv/2024/Shogun-tmdb-98765/season01-poster.jpg"
+    assert rel == "library/tv/2024/Shogun-tmdb-98765/season01-poster.jpg"
 
 
 def test_parse_people_path():
@@ -43,8 +43,8 @@ def test_build_actor_avatar_proxy_url():
 
 
 def test_build_rel_sanitizes_name():
-    assert wis.build_media_webdav_rel("movie", 2023, "a/b", 1, "poster") == "movie/2023/ab-tmdb-1/poster.jpg"
-    assert wis.build_media_webdav_rel("movie", 2023, "", 1, "poster") == "movie/2023/unnamed-tmdb-1/poster.jpg"
+    assert wis.build_media_webdav_rel("movie", 2023, "a/b", 1, "poster") == "library/movie/2023/ab-tmdb-1/poster.jpg"
+    assert wis.build_media_webdav_rel("movie", 2023, "", 1, "poster") == "library/movie/2023/unnamed-tmdb-1/poster.jpg"
 
 
 # ---------- 缓存命中：WebDAV 200 → 透传，不碰 TMDB ----------
@@ -79,7 +79,7 @@ def test_cache_hit_serves_without_tmdb(monkeypatch):
         assert resp.headers["content-type"] == "image/jpeg"
         assert resp.headers["cache-control"] == "public, max-age=31536000, immutable"
     asyncio.run(main())
-    assert calls[0] == ("GET", "/movie/2023/Oppenheimer-tmdb-123456/poster.jpg")
+    assert calls[0] == ("GET", "/library/movie/2023/Oppenheimer-tmdb-123456/poster.jpg")
 
 
 # ---------- 缓存未命中：TMDB 兜底下载 → 前端 + 后台回写 ----------
@@ -124,9 +124,10 @@ def test_cache_miss_fetches_tmdb_and_writes_back(monkeypatch):
     assert tmdb_calls == ["/3/movie/123456"]   # base_url 含 /3，endpoint 直接拼接
     assert any(str(u).endswith("w500/abc.jpg") for u in img_calls)
     mkcols = [p for m, p in dav_calls if m == "MKCOL"]
-    assert mkcols == ["/movie/", "/movie/2023/", "/movie/2023/Oppenheimer-tmdb-123456/"]
+    assert mkcols == ["/library/", "/library/movie/", "/library/movie/2023/",
+                      "/library/movie/2023/Oppenheimer-tmdb-123456/"]
     puts = [p for m, p in dav_calls if m == "PUT"]
-    assert puts == ["/movie/2023/Oppenheimer-tmdb-123456/poster.jpg"]
+    assert puts == ["/library/movie/2023/Oppenheimer-tmdb-123456/poster.jpg"]
 
 
 # ---------- 兜底失败场景 ----------
