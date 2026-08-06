@@ -1,6 +1,8 @@
 import json
 import os
 
+import jstyleson   # 保留注释的 JSON 解析（config.json 支持 // 与 /* */ 注释）
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # 定位到 backend 目录
 DATA_DIR = os.path.join(BASE_DIR, 'data') # backend/data
 CONFIG_FILE = os.path.join(DATA_DIR, 'config.json')
@@ -124,7 +126,7 @@ DEFAULT_CONFIG = {
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+            data = jstyleson.load(f)   # 支持 config.json 里的 // 与 /* */ 注释
             # 只做简单的字段合并，不再做数据格式转换
             for key, value in DEFAULT_CONFIG.items():
                 if key not in data:
