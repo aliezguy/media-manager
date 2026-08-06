@@ -765,7 +765,7 @@ onUnmounted(() => {
       <!-- 第一行：标题 + 筛选 -->
       <div class="flex flex-wrap items-center gap-3 px-5 py-3">
         <div class="flex items-center gap-3">
-          <h1 class="whitespace-nowrap text-[17px] font-bold tracking-wide text-white">演职员中文化治理</h1>
+          <h1 class="whitespace-nowrap text-[17px] font-bold tracking-wide text-white">媒体信息中文化</h1>
           <div class="stats-pill">
             <span class="stats-dot" />
             <span>已汉化 <strong>{{ stats.synced }}</strong> / {{ stats.total }}</span>
