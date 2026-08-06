@@ -25,6 +25,7 @@ typing_extensions==4.15.0
 urllib3==2.6.2
 uvicorn==0.38.0
 PyYAML
+ruamel.yaml>=0.18.0
 qbittorrent-api
 grpcio>=1.60.0
 grpcio-tools>=1.60.0

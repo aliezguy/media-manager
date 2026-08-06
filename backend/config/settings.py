@@ -1,6 +1,19 @@
+import logging
 import os
 
-import yaml   # 配置文件 YAML 格式（原生支持 # 注释）
+import yaml   # 运行期读取 YAML（原生支持 # 注释）
+
+logger = logging.getLogger("uvicorn")
+
+# ruamel.yaml round-trip：写入时保留手写注释（仅用于保存路径）。
+# 采用惰性导入——缺失时降级为 PyYAML safe_dump（不保留注释并告警），
+# 避免服务器因缺该依赖在启动/热重载时整进程崩溃。
+try:
+    from ruamel.yaml import YAML
+    _HAS_RUAMEL = True
+except ImportError:
+    YAML = None
+    _HAS_RUAMEL = False
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # 定位到 backend 目录
 DATA_DIR = os.path.join(BASE_DIR, 'data') # backend/data
@@ -13,11 +26,6 @@ DEFAULT_CONFIG = {
     "emby_host": "",
     "emby_api_key": "",
     "emby_user_id": "",
-    "sf_api_key": "",
-
-    # ★ LLM 通用配置（兼容 OpenAI SDK 接口的任意大模型）
-    "llm_base_url": "https://api.siliconflow.cn/v1",
-    "llm_model_name": "deepseek-ai/DeepSeek-V3",
 
     # MP 基础配置
     "mp_host": "http://127.0.0.1:3000",
@@ -135,12 +143,48 @@ def load_config():
             data[key] = value
     return data
 
+# ruamel.yaml round-trip：写入时保留手写注释与原有格式（仅用于保存路径）
+if _HAS_RUAMEL:
+    _rt_yaml = YAML()
+    _rt_yaml.preserve_quotes = True   # 保留引号风格（如 '2026-08-06T03:00:07'）
+    _rt_yaml.width = 4096             # 新写入的长字符串不折行（douban_cookie 等）
+    _rt_yaml.default_flow_style = False  # 新写入的嵌套块用 block 风格（旧内容原样保留）
+
 def save_config(new_config: dict):
-    current = load_config()
-    current.update(new_config)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        yaml.safe_dump(current, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
-    return current
+    """浅合并写入 config.yaml，返回合并默认值后的完整配置。
+
+    只落盘「磁盘已有键 ∪ 本次更新的键」——不会把 DEFAULT_CONFIG 的兜底字段
+    重新塞回文件（遗留字段 sf_api_key/llm_base_url/llm_model_name 已移出默认值）。
+
+    ruamel.yaml 可用时 round-trip 写入（保留手写注释）；缺失时降级为
+    PyYAML safe_dump 并告警（不保留注释，但保证服务器不会起不来）。
+    """
+    if _HAS_RUAMEL:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                current = _rt_yaml.load(f) or {}
+        else:
+            current = {}
+        current.update(new_config)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            _rt_yaml.dump(current, f)
+    else:
+        if not getattr(save_config, "_warned_no_ruamel", False):
+            logger.warning(
+                "[Config] ruamel.yaml 未安装，保存 config.yaml 时无法保留手写注释。"
+                "执行 pip install ruamel.yaml 后重启可启用。"
+            )
+            save_config._warned_no_ruamel = True
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                current = yaml.safe_load(f) or {}
+        else:
+            current = {}
+        current.update(new_config)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(current, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    # 响应/调用方沿用旧契约：返回含默认值的完整配置
+    return load_config()
 
 def get_webdav_config() -> dict:
     """WebDAV 连接 + 布局配置，环境变量优先，config.yaml 兜底。
