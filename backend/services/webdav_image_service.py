@@ -308,3 +308,45 @@ async def serve_people_image(local_image_path: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="头像地址格式无效")
     _dirname, _fname, tmdb_id = parsed
     return await _tmdb_miss_stream(webdav, rel, "people", tmdb_id, "folder")
+
+
+# ---------- 本地 people 迁移到 WebDAV（一次性预填充 / 增量同步，幂等） ----------
+# 定位项目根/people（与 main.py 的 PEOPLE_DIR 一致）
+_PEOPLE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "people")
+
+_EXT_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".webp": "image/webp", ".gif": "image/gif"}
+
+
+async def migrate_local_people_to_webdav() -> dict:
+    """把本地 people/ 增量同步到 WebDAV（幂等，PUT 覆盖）。
+
+    遍历 people/{首字}/{name}-tmdb-{id}/folder.*，写到 WebDAV 同相对路径
+    （保留原文件名与格式）。返回 {"uploaded", "failed"}。
+    """
+    webdav = get_webdav_client()
+    if webdav is None:
+        raise HTTPException(status_code=503, detail="WebDAV 未配置")
+    if not os.path.isdir(_PEOPLE_DIR):
+        return {"uploaded": 0, "failed": 0}
+    stats = {"uploaded": 0, "failed": 0}
+    for root, _dirs, files in os.walk(_PEOPLE_DIR):
+        rel = os.path.relpath(root, _PEOPLE_DIR).replace(os.sep, "/")
+        if rel == ".":
+            continue
+        for fname in files:
+            if not fname.lower().startswith("folder"):
+                continue
+            dav_rel = f"people/{rel}/{fname}"      # ★ 保留原名/格式：folder.png 仍是 folder.png
+            mime = _EXT_MIME.get(os.path.splitext(fname)[1].lower(), "image/jpeg")
+            try:
+                with open(os.path.join(root, fname), "rb") as f:
+                    await webdav.ensure_collection(dav_rel)
+                    ok = await webdav.aput(dav_rel, f, mime)
+                stats["uploaded" if ok else "failed"] += 1
+            except WebDAVError as e:
+                stats["failed"] += 1
+                logger.warning("   ⚠ [Migrate] %s: %s", os.path.join(root, fname), e)
+    logger.info("   📦 [Migrate] people → WebDAV 完成: %s", stats)
+    return stats

@@ -3,7 +3,7 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 
-from services.webdav_image_service import serve_media_image, serve_people_image
+from services.webdav_image_service import migrate_local_people_to_webdav, serve_media_image, serve_people_image
 
 router = APIRouter()
 
@@ -26,3 +26,9 @@ async def get_media_image(
 async def get_people_image(path: str):
     """按 DB local_image_path 取头像（如 '张/张译-tmdb-12345/folder.png'）。"""
     return await serve_people_image(path)
+
+
+@router.post("/webdav-image/migrate-people")
+async def migrate_people():
+    """一次性/增量把本地 people/ 头像同步到 WebDAV（幂等）。"""
+    return await migrate_local_people_to_webdav()
