@@ -1,12 +1,10 @@
-import json
 import os
 
 import yaml   # 配置文件 YAML 格式（原生支持 # 注释）
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # 定位到 backend 目录
 DATA_DIR = os.path.join(BASE_DIR, 'data') # backend/data
-CONFIG_FILE = os.path.join(DATA_DIR, 'config.yaml')       # 主配置（YAML，支持注释）
-CONFIG_FILE_JSON = os.path.join(DATA_DIR, 'config.json')  # 旧版 JSON 兼容（存在则读，保存后迁移）
+CONFIG_FILE = os.path.join(DATA_DIR, 'config.yaml')   # 主配置（YAML，支持注释）
 # 确保 data 目录存在
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
@@ -129,10 +127,6 @@ def load_config():
         # YAML 主格式：原生支持 # 注释
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f) or {}
-    elif os.path.exists(CONFIG_FILE_JSON):
-        # 旧版 config.json 兼容：存在则读取，一旦保存即迁移为 YAML
-        with open(CONFIG_FILE_JSON, 'r', encoding='utf-8') as f:
-            data = json.load(f)
     else:
         return DEFAULT_CONFIG
     # 只做简单的字段合并，不再做数据格式转换
