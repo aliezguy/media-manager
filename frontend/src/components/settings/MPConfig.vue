@@ -253,7 +253,7 @@ const removeKeyword = (tag: string) => {
         </div>
         <div class="min-w-0 flex-1">
           <h2 class="text-[15px] font-bold tracking-wide text-white">数据源（TMDB / 豆瓣）</h2>
-          <p class="mt-1 text-xs leading-relaxed text-slate-500">自动分类 / 演员中文化的外部数据接口</p>
+          <p class="mt-1 text-xs leading-relaxed text-slate-500">自动分类 / 媒体信息汉化的外部数据接口</p>
         </div>
       </header>
 
@@ -270,7 +270,7 @@ const removeKeyword = (tag: string) => {
               <el-switch v-model="config.douban_enabled" />
               <span class="text-xs text-slate-400">{{ config.douban_enabled ? '已启用' : '已停用' }}</span>
             </div>
-            <p class="field-tip">豆瓣封控严重时可临时关闭，演员中文化走 TMDB/本地大模型</p>
+            <p class="field-tip">豆瓣封控严重时可临时关闭，媒体信息汉化走 TMDB/本地大模型</p>
           </div>
           <div class="md:col-span-2">
             <label class="field-label"><KeyRound :size="13" />豆瓣 Cookie</label>

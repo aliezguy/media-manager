@@ -199,7 +199,7 @@ let _auditTimer: ReturnType<typeof setInterval> | null = null
 
 // ★ 统一汉化进度对话框（同步选中项 + 全量汉化 + 补齐分集简介共用）
 const sinicizeDialogVisible = ref(false)
-const sinicizeDialogTitle = ref('演员中文化')
+const sinicizeDialogTitle = ref('媒体信息汉化')
 const sinicizeTaskId = ref('')
 const sinicizeTaskPercent = ref(0)
 const sinicizeTaskMessage = ref('')

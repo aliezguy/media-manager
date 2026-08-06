@@ -49,13 +49,14 @@ export const menuGroups: MenuGroup[] = [
       { index: 'scheduler', label: '定时扫描', icon: CalendarClock, component: ScheduledTasks },
       { index: 'qb', label: '下载管理', icon: Download, component: QbManager },
       { index: 'cleanup', label: '种子清理', icon: Brush, component: TorrentCleanup },
+      { index: 'history', label: '追更洗版日志', icon: History, component: WashHistory },
     ],
   },
   {
     title: '媒体与演员',
     items: [
       { index: 'manager', label: '标签管理', icon: Tags, component: TagManager },
-      { index: 'actor', label: '演员中文化', icon: Users, component: ActorLocalizationStudio },
+      { index: 'actor', label: '媒体信息汉化', icon: Users, component: ActorLocalizationStudio },
       { index: 'actorLib', label: '演员库', icon: Library, component: ActorLibrary },
     ],
   },
@@ -63,7 +64,6 @@ export const menuGroups: MenuGroup[] = [
     title: '系统设置',
     items: [
       { index: 'config', label: '基础配置', icon: Settings, component: BasicConfig },
-      { index: 'history', label: '记录', icon: History, component: WashHistory },
     ],
   },
 ]
