@@ -197,8 +197,9 @@ const auditTaskMessage = ref('')
 const auditTaskDone = ref(false)
 let _auditTimer: ReturnType<typeof setInterval> | null = null
 
-// ★ 统一汉化进度对话框（同步选中项 + 全量汉化共用）
+// ★ 统一汉化进度对话框（同步选中项 + 全量汉化 + 补齐分集简介共用）
 const sinicizeDialogVisible = ref(false)
+const sinicizeDialogTitle = ref('演员中文化')
 const sinicizeTaskId = ref('')
 const sinicizeTaskPercent = ref(0)
 const sinicizeTaskMessage = ref('')
@@ -242,6 +243,7 @@ const isAllChecked = computed({
 
 const checkedIds = computed(() => items.value.filter(i => i.checked).map(i => i.id))
 const pendingCheckedIds = computed(() => items.value.filter(i => i.checked && i.status !== 'synced' && i.status !== 'locked').map(i => i.id))
+const checkedSeriesIds = computed(() => items.value.filter(i => i.checked && i.type === 'Series').map(i => i.id))
 
 const connectEmby = async () => {
   try {
@@ -354,6 +356,64 @@ const handleFullSync = async () => {
     sinicizeTaskId.value = res.data.task_id
     sinicizeTaskMessage.value = res.data.message
     startSinicizePolling(res.data.task_id)
+  } catch (e) {
+    sinicizeTaskMessage.value = '提交任务失败'
+    sinicizeTaskDone.value = true
+    ElMessage.error('提交失败: ' + getErrorMsg(e))
+  }
+}
+
+// ★ 批量补齐分集简介（写回 Emby + 落库审计，不动演员）
+const handleRepairEpisodeOverviews = async () => {
+  // 作用域判定：勾选里有 Series → 指定剧；一个 Series 都没勾 → 全库
+  let seriesIds = checkedSeriesIds.value
+  let scopeMsg: string
+
+  if (checkedIds.value.length > 0 && seriesIds.length === 0) {
+    // 勾选了但全不是 Series（Movie / Episode）→ 提示并回退全库
+    ElMessage.warning('勾选的项中没有「剧集」(Series)，将改为全库补齐分集简介')
+    seriesIds = []
+    scopeMsg = '全库扫描所有有分集记录的剧集，补齐非中文分集简介'
+  } else if (seriesIds.length > 0) {
+    scopeMsg = `补齐 ${seriesIds.length} 部选中剧集的分集简介`
+  } else {
+    scopeMsg = '全库扫描所有有分集记录的剧集，补齐非中文分集简介'
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      `本次将执行：${scopeMsg}\n\n` +
+      '该操作只翻译分集简介并写回 Emby（不动演员/角色数据），已中文的简介会自动跳过。是否继续？',
+      '补齐分集简介',
+      { confirmButtonText: '开始补齐', cancelButtonText: '取消', type: 'warning' }
+    )
+  } catch { return }
+
+  // ★ 复用统一汉化进度对话框 + 轮询
+  sinicizeTaskPercent.value = 0
+  sinicizeTaskMessage.value = '正在提交分集简介补齐任务...'
+  sinicizeTaskDone.value = false
+  sinicizeDialogTitle.value = '补齐分集简介'
+  sinicizeDialogVisible.value = true
+
+  try {
+    const res = await axios.post(API_URL + '/api/sync/repair_episode_overviews', { item_ids: seriesIds })
+    const taskId: string = res.data.task_id || ''
+    if (!taskId) {
+      // 后端判定无需修复 → 直接提示并短暂展示后关闭
+      stopSinicizePolling()
+      sinicizeTaskMessage.value = res.data.message || '没有需要补齐的分集简介'
+      sinicizeTaskDone.value = true
+      sinicizeTaskPercent.value = 100
+      ElMessage.info(sinicizeTaskMessage.value)
+      setTimeout(() => {
+        if (sinicizeDialogVisible.value) sinicizeDialogVisible.value = false
+      }, 1500)
+      return
+    }
+    sinicizeTaskId.value = taskId
+    sinicizeTaskMessage.value = res.data.message
+    startSinicizePolling(taskId)
   } catch (e) {
     sinicizeTaskMessage.value = '提交任务失败'
     sinicizeTaskDone.value = true
@@ -759,6 +819,13 @@ onUnmounted(() => {
           <el-button
             size="small"
             class="btn-ghost"
+            :icon="Tickets"
+            :disabled="systemStatus.is_running"
+            @click="handleRepairEpisodeOverviews"
+          >补齐分集简介</el-button>
+          <el-button
+            size="small"
+            class="btn-ghost"
             :icon="Compass"
             :loading="auditLoading"
             :disabled="systemStatus.is_running || !selectedLibrary"
@@ -1039,10 +1106,10 @@ onUnmounted(() => {
       </template>
     </el-dialog>
 
-    <!-- ★ 统一汉化进度对话框（同步选中项 + 全量汉化共用） -->
+    <!-- ★ 统一汉化进度对话框（同步选中项 + 全量汉化 + 补齐分集简介共用） -->
     <el-dialog
       v-model="sinicizeDialogVisible"
-      title="演员中文化"
+      :title="sinicizeDialogTitle"
       width="500px"
       :close-on-click-modal="false"
       :close-on-press-escape="false"
