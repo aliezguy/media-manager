@@ -26,6 +26,7 @@ from services.db_crud import (
 )
 from services.actor_profile_service import resolve_actor_profile, ensure_profiles_for_people
 from services.translation_utils import is_valid_chinese_translation, apply_overview_with_guard
+from services.overview_translator import needs_overview_translation
 from utils.task_manager import task_manager
 
 router = APIRouter()
@@ -53,6 +54,11 @@ class SinicizeAllRequest(BaseModel):
 class ForceTranslateBatchRequest(BaseModel):
     """强制汉化请求 — 无视当前状态，强制将选中项重置为 pending 并重新汉化。"""
     item_ids: list[str]
+
+
+class RepairEpisodeOverviewsRequest(BaseModel):
+    """补齐分集简介请求 — item_ids 传了=只修指定剧；不传（空数组）= 全库扫描。"""
+    item_ids: list[str] = []
 
 
 @router.post("/sync/full")
@@ -2614,4 +2620,265 @@ def force_translate_batch(req: ForceTranslateBatchRequest, background_tasks: Bac
     return {
         "task_id": task_id,
         "message": f"强制汉化任务已启动，共 {len(req.item_ids)} 项（已强制重置状态）",
+    }
+
+
+# ==========================================
+# ★ 批量补齐分集简介 + 写回 Emby
+#   POST /api/sync/repair_episode_overviews
+# ==========================================
+
+def _resolve_target_series(db, item_ids: list[str]) -> list[str]:
+    """解析待修复的 Series 列表。
+
+    - 显式 item_ids：去空去重保序直接返回；
+    - 空（全库模式）：扫描 media_metadata 中 Episode 行的 distinct parent_id
+      （真实翻译判定交给 Emby 新鲜数据上的 needs_overview_translation）。
+    """
+    seen = set()
+    out = []
+    for i in item_ids:
+        i = (i or "").strip()
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    if out:
+        return out
+
+    rows = db.query(MediaMetadata.parent_id).filter(
+        MediaMetadata.media_type == "Episode",
+        MediaMetadata.parent_id.isnot(None),
+    ).all()
+    for r in rows:
+        pid = (r.parent_id or "").strip()
+        if pid and pid not in seen:
+            seen.add(pid)
+            out.append(pid)
+    return out
+
+
+def _patch_episode_overview_db(db, ep_id: str, series_id: str, ep: dict, source: str) -> None:
+    """落库分集简介审计：UPSERT MediaMetadata，写入中文 overview + 来源 + 时间戳。
+
+    ★ 不走 save_media_to_db（它会 UPSERT MediaSyncStatus 并把 matched/total 清零，
+      毁掉已汉化分集的演员计数）。仅补丁本表，模拟 scan_and_translate 的直接赋值。
+    """
+    rec = db.query(MediaMetadata).filter(
+        MediaMetadata.emby_item_id == ep_id
+    ).first()
+    if rec is None:
+        rec = MediaMetadata(emby_item_id=ep_id)
+        db.add(rec)
+    rec.media_type = "Episode"
+    rec.parent_id = series_id
+    rec.title = ep.get("Name") or ""
+    rec.overview = ep.get("Overview") or ""
+    rec.overview_source = source
+    rec.overview_updated_at = datetime.now()
+
+
+def _repair_series_episode_overviews(sinizer, db, series_id: str) -> dict:
+    """对单个 Series 补齐分集简介：Emby 拉全部分集 → 逐集翻译非中文简介 →
+    写回 Emby（People 原样回传，不动演员）→ 落库审计。逐集 try/except 隔离。
+
+    Returns:
+        {"total", "translated", "skipped", "failed"}
+    """
+    episodes = sinizer._fetch_episodes(series_id)
+    stats = {"total": len(episodes), "translated": 0, "skipped": 0, "failed": 0}
+    for ep in episodes:
+        ep_id = ep.get("Id")
+        if not ep_id:
+            stats["skipped"] += 1
+            continue
+        try:
+            # ★ 先按原文判定是否需要翻译（_translate_episode_overview 成功会就地改 Overview）
+            needs = needs_overview_translation((ep.get("Overview") or "").strip())
+            source = sinizer._translate_episode_overview(ep)
+            if not needs:
+                stats["skipped"] += 1
+                continue
+            if not source:
+                # 需要翻译但全引擎失败/未过中文校验 → 保留原文
+                stats["failed"] += 1
+                logger.warning(
+                    "   ⚠ [RepairEpOverview] %s 分集简介翻译失败，保留原文", ep_id,
+                )
+                continue
+            # ★ 写回 Emby：Overview 已就地更新为中文；People 原样回传，不动演员
+            if not sinizer._write_back_episode(ep_id, ep, ep.get("People") or []):
+                stats["failed"] += 1
+                logger.warning(
+                    "   ⚠ [RepairEpOverview] %s 写回 Emby 失败", ep_id,
+                )
+                continue
+            # ★ 仅写回成功才落库（DB 与 Emby 保持一致）
+            _patch_episode_overview_db(db, ep_id, series_id, ep, source)
+            db.commit()
+            stats["translated"] += 1
+        except Exception:
+            db.rollback()
+            stats["failed"] += 1
+            logger.error(
+                "   ❌ [RepairEpOverview] %s 异常:\n%s", ep_id, traceback.format_exc(),
+            )
+    return stats
+
+
+def _repair_episode_overviews_task(task_id: str, series_ids: list[str]):
+    """后台任务：逐剧补齐分集简介（写回 Emby + 落库审计），进度按剧粒度上报。
+
+    ★ 防弹级 try/except/finally 防线（照抄 _batch_sinicize_task）：无论任何原因
+    崩溃，保证任务被终结；单剧异常隔离，不阻断后续。
+    """
+    _repair_success = False
+    _repair_final_msg = "❌ 分集简介补齐失败，请查看服务端日志"
+    series_ok = 0
+    series_failed = 0
+    ep_translated = 0
+    ep_failed = 0
+
+    db = None
+    try:
+        db = SessionLocal()
+        cfg = load_config()
+        # ★ 总开关防御性复检：简介翻译全局关闭时任务不执行
+        if not cfg.get("overview_translation_enabled", True):
+            _repair_final_msg = (
+                "⚠️ 简介翻译总开关已关闭（overview_translation_enabled=False），任务取消"
+            )
+            try:
+                task_manager.update_progress(
+                    task_id, status="error", message=_repair_final_msg,
+                )
+            except Exception:
+                pass
+            return
+
+        sinizer = DoubanSinizer()
+        # ★ 显式修复是独立动作：不受 sinicize_translate_episode_overviews 限制
+        sinizer.translate_episode_overviews = True
+
+        for idx, series_id in enumerate(series_ids):
+            current = idx + 1
+            task_manager.update_progress(
+                task_id, current=idx,
+                message=f"正在补齐 {current}/{len(series_ids)}...",
+            )
+            try:
+                stats = _repair_series_episode_overviews(sinizer, db, series_id)
+                ep_translated += stats["translated"]
+                ep_failed += stats["failed"]
+                series_ok += 1
+                logger.info(
+                    "   ✅ [RepairEpOverview] %s 完成: 翻译 %d 集 / 跳过 %d / 失败 %d",
+                    series_id, stats["translated"], stats["skipped"], stats["failed"],
+                )
+            except Exception:
+                series_failed += 1
+                logger.error(
+                    "   ❌ [RepairEpOverview] %s 系列异常:\n%s",
+                    series_id, traceback.format_exc(),
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            task_manager.update_progress(
+                task_id, current=current,
+                message=f"已完成 {current}/{len(series_ids)}（翻译 {ep_translated} 集 | 失败 {ep_failed} 集）",
+            )
+
+        _repair_success = True
+        _repair_final_msg = (
+            f"✅ 分集简介补齐完成: {len(series_ids)} 部剧 | "
+            f"成功 {series_ok} | 失败 {series_failed} | 翻译 {ep_translated} 集 | 失败 {ep_failed} 集"
+        )
+
+    except Exception as e:
+        logger.error(
+            "❌ [RepairEpOverview] 任务崩溃 (task=%s):\n%s",
+            task_id, traceback.format_exc(),
+        )
+        _repair_final_msg = f"❌ 任务崩溃: {str(e)[:200]}"
+        try:
+            task_manager.update_progress(
+                task_id, status="error", message=_repair_final_msg,
+            )
+        except Exception:
+            pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+        try:
+            task_manager.complete_task(
+                task_id, _repair_final_msg, success=_repair_success,
+            )
+        except Exception:
+            try:
+                task_manager.complete_task(
+                    task_id, "❌ 分集简介补齐异常终止", success=False,
+                )
+            except Exception:
+                logger.error(
+                    "❌ [RepairEpOverview] complete_task 重复失败，任务 %s 可能悬挂",
+                    task_id,
+                )
+
+
+@router.post("/sync/repair_episode_overviews")
+def repair_episode_overviews(
+    req: RepairEpisodeOverviewsRequest, background_tasks: BackgroundTasks,
+):
+    """批量补齐分集简介 + 写回 Emby（后台异步，立即返回 task_id）。
+
+    item_ids 传了 = 只修指定剧；不传（空数组）= 全库扫描有分集记录的 Series。
+
+    请求体:
+        {"item_ids": ["id1", "id2"]}   或   {}（全库）
+
+    返回:
+        200: {"task_id": "abc123", "message": "...", "count": 2}
+        400: 简介翻译总开关已关闭
+    """
+    cfg = load_config()
+    if not cfg.get("overview_translation_enabled", True):
+        raise HTTPException(
+            status_code=400,
+            detail="简介翻译总开关已关闭（overview_translation_enabled=False），无法补齐分集简介",
+        )
+
+    db = SessionLocal()
+    try:
+        targets = _resolve_target_series(db, req.item_ids)
+    finally:
+        db.close()
+
+    if not targets:
+        return {"task_id": "", "message": "没有需要补齐分集简介的剧集", "count": 0}
+
+    task_id = task_manager.create_task(
+        total=len(targets),
+        message=f"分集简介补齐任务已启动，共 {len(targets)} 部剧",
+        metadata={
+            "mode": "repair_episode_overviews",
+            "item_count": len(targets),
+        },
+    )
+    background_tasks.add_task(
+        _repair_episode_overviews_task,
+        task_id=task_id,
+        series_ids=targets,
+    )
+    logger.info(
+        "🚀 [RepairEpOverview] 触发批量补齐分集简介: task=%s series=%d",
+        task_id, len(targets),
+    )
+    return {
+        "task_id": task_id,
+        "message": f"分集简介补齐任务已启动，共 {len(targets)} 部剧",
+        "count": len(targets),
     }
