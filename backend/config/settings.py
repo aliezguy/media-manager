@@ -128,6 +128,11 @@ DEFAULT_CONFIG = {
     "webdav_root_path": "",    # WebDAV 服务内的根目录，如 /dav（可空）
     "webdav_media_root": "library",     # tv/movie 的上级目录（WebDAV 内相对路径，可自定义）
     "webdav_people_root": "library",    # people 的上级目录（WebDAV 内相对路径，可自定义）
+
+    # ★ 弹幕服务（MisakaDanmaku 外部控制 API）— 媒体弹幕管理页面代理
+    #   完整 API 文档见 docs/danmu-api.md
+    "danmu_base_url": "https://danmu.2503.seeyo.top:13360",
+    "danmu_api_key": "",
 }
 
 def load_config():

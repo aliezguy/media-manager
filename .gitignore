@@ -21,11 +21,13 @@ backend/data/
 data/
 people
 actor_images
+docs
 
 # 忽略系统文件
 .DS_Storebackend/logs/
 .DS_Store
 .idea
+.claude
 日志.xml
 docker_api_specs.md
 feature_log.md
@@ -49,3 +51,4 @@ SESSION_HANDOFF.md
 _references/
 export_blueprints/
 people.zip
+.claude/settings.json

@@ -7,7 +7,7 @@
 import type { Component } from 'vue'
 import {
   LayoutDashboard, CalendarClock, Download, Brush, Tags, Users,
-  Library, Settings, History,
+  Library, Settings, History, MessageSquare,
 } from 'lucide-vue-next'
 
 // 页面组件
@@ -20,6 +20,7 @@ import TaskDashboard from '../components/TaskDashboard.vue'
 import ScheduledTasks from '../components/ScheduledTasks.vue'
 import ActorLocalizationStudio from '../components/ActorLocalizationStudio.vue'
 import ActorLibrary from '../components/ActorLibrary.vue'
+import DanmuManager from '../components/DanmuManager.vue'
 
 export interface MenuItem {
   /** 唯一索引，App.vue 组件切换 / 侧边栏选中态 / Tab 激活态共用 */
@@ -58,6 +59,7 @@ export const menuGroups: MenuGroup[] = [
       { index: 'manager', label: '标签管理', icon: Tags, component: TagManager },
       { index: 'actor', label: '媒体信息汉化', icon: Users, component: ActorLocalizationStudio },
       { index: 'actorLib', label: '演员库', icon: Library, component: ActorLibrary },
+      { index: 'danmu', label: '媒体弹幕管理', icon: MessageSquare, component: DanmuManager },
     ],
   },
   {

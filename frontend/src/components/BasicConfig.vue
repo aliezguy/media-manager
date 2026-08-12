@@ -2,7 +2,7 @@
 import { ref, shallowRef } from 'vue'
 import type { Component } from 'vue'
 import {
-  Server, Cloud, Settings, Download, FolderTree, CloudUpload, Database, Languages
+  Server, Cloud, Settings, Download, FolderTree, CloudUpload, Database, Languages, MessageSquare
 } from 'lucide-vue-next'
 
 import EmbyConfig from './settings/EmbyConfig.vue'
@@ -13,6 +13,7 @@ import CategoryConfig from './settings/CategoryConfig.vue'
 import WebDAVConfig from './settings/WebDAVConfig.vue'
 import DatabaseConfig from './settings/DatabaseConfig.vue'
 import LocalizationConfig from './settings/LocalizationConfig.vue'
+import DanmuConfig from './settings/DanmuConfig.vue'
 
 // ==================== Tab 定义（水平页签，单一数据源） ====================
 interface ConfigTab {
@@ -30,7 +31,8 @@ const tabs: ConfigTab[] = [
   { key: 'category', label: '分类规则', icon: FolderTree, component: CategoryConfig },
   { key: 'webdav', label: 'WebDAV 图片缓存', icon: CloudUpload, component: WebDAVConfig },
   { key: 'database', label: '数据库', icon: Database, component: DatabaseConfig },
-  { key: 'localization', label: 'AI·汉化', icon: Languages, component: LocalizationConfig }
+  { key: 'localization', label: 'AI·汉化', icon: Languages, component: LocalizationConfig },
+  { key: 'danmu', label: '弹幕服务', icon: MessageSquare, component: DanmuConfig }
 ]
 
 const activeKey = ref(tabs[0].key)
