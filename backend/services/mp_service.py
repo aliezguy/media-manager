@@ -203,43 +203,156 @@ def save_history(name, season, tmdb_id, status, msg, details, wash_type="complet
     except Exception as e:
         logger.error(f"❌ 写入数据库失败: {e}")
 
-def add_wash_subscription(payload):
-    """
-    🔥 纯净API调用：只负责 POST 新增订阅，不负责写历史
-    :return: Boolean (成功/失败)
-    """
-    cfg = load_config()
-    host = cfg.get("mp_host", "").rstrip('/')
-    token = get_mp_token()
-    if not host or not token: return False
-
+def _as_int(value: Any) -> int | None:
     try:
-        # 自动注入 username 标记
-        if "username" not in payload:
-            payload["username"] = "AI自动洗版"
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
-        logger.info(f"      🚀 [API新增] Payload: {json.dumps(payload, ensure_ascii=False)}")
-        
-        url = f"{host}/api/v1/subscribe/"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        
-        # 判断结果
-        if resp.status_code == 200:
-            res_json = resp.json()
-            # 兼容不同版本 MP 的成功标识
-            if isinstance(res_json, dict):
-                if res_json.get("success") is True or res_json.get("code") == 0:
-                    return True
-            # 如果直接返回列表或空字典也可能表示成功（视版本而定），但通常有 success 字段
-            return False
+
+def _subscription_candidates(value: Any):
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, dict):
+                yield item
+        return
+    if not isinstance(value, dict):
+        return
+    for key in ("data", "items", "value"):
+        nested = value.get(key)
+        if isinstance(nested, (dict, list)):
+            yield from _subscription_candidates(nested)
+            return
+    yield value
+
+
+def _is_matching_wash_subscription(item: dict, tmdb_id: Any, season: Any) -> bool:
+    return (
+        _as_int(item.get("tmdbid")) == _as_int(tmdb_id)
+        and _as_int(item.get("season")) == _as_int(season)
+        and _as_int(item.get("best_version")) == 1
+        and _as_int(item.get("best_version_full")) == 1
+    )
+
+
+def _lookup_wash_subscription(
+    host: str,
+    token: str,
+    tmdb_id: Any,
+    season: Any,
+) -> tuple[dict | None, str | None]:
+    normalized_season = _as_int(season)
+    if _as_int(tmdb_id) is None or normalized_season is None:
+        return None, "回查的 tmdbid 或 season 无效"
+
+    headers = {"Authorization": f"Bearer {token}"}
+    attempts = (
+        (f"{host}/api/v1/subscribe/media/tmdb:{tmdb_id}", {"season": normalized_season}),
+        (f"{host}/api/v1/subscribe/", None),
+    )
+    errors = []
+    logger.info(f"      🔎 [洗版回查] TMDB {tmdb_id} | S{normalized_season}")
+
+    for url, params in attempts:
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+            continue
+        if not 200 <= resp.status_code < 300:
+            errors.append(f"GET {resp.status_code}: {_sanitize_response_body(resp.text)}")
+            continue
+        try:
+            response_payload = resp.json()
+        except Exception as exc:
+            errors.append(f"GET JSON {type(exc).__name__}: {exc}")
+            continue
+        for item in _subscription_candidates(response_payload):
+            if _is_matching_wash_subscription(item, tmdb_id, normalized_season):
+                logger.info(f"      ✅ [洗版回查] 已确认订阅 ID={item.get('id')}")
+                return item, None
+
+    error = "; ".join(errors) if errors else "未找到匹配的洗版订阅"
+    safe_error = _sanitize_response_body(error)
+    logger.warning(f"      ⚠️ [洗版回查] {safe_error}")
+    return None, safe_error
+
+
+def add_wash_subscription(payload: dict) -> WashSubscriptionResult:
+    """新增 MoviePilot 洗版订阅；结果不明确时按 TMDB 与 Season 回查。"""
+    cfg = load_config()
+    host = cfg.get("mp_host", "").rstrip("/")
+    token = get_mp_token()
+    if not host or not token:
+        return WashSubscriptionResult(success=False, error="MoviePilot Host 或 Token 未配置")
+
+    payload.setdefault("username", "AI自动洗版")
+    logger.info(f"      🚀 [API新增] Payload: {json.dumps(payload, ensure_ascii=False)}")
+
+    http_status = None
+    response_body = ""
+    post_error = None
+    try:
+        resp = requests.post(
+            f"{host}/api/v1/subscribe/",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        http_status = resp.status_code
+        response_body = _sanitize_response_body(resp.text)
+        logger.info(f"      📥 [洗版POST] HTTP {http_status} | Body: {response_body}")
+        try:
+            response_json = resp.json()
+        except Exception as exc:
+            post_error = f"响应 JSON 解析失败: {type(exc).__name__}: {exc}"
         else:
-            logger.error(f"      ❌ [API失败] HTTP {resp.status_code} - {resp.text}")
-            return False
-            
-    except Exception as e:
-        logger.error(f"      ❌ [API异常] {e}")
-    return False
+            if 200 <= http_status < 300 and isinstance(response_json, dict):
+                response_code = response_json.get("code")
+                code_is_zero = type(response_code) is int and response_code == 0
+                if response_json.get("success") is True or code_is_zero:
+                    return WashSubscriptionResult(
+                        success=True,
+                        http_status=http_status,
+                        response_body=response_body,
+                    )
+            post_error = f"POST 未明确成功: HTTP {http_status}"
+    except Exception as exc:
+        post_error = f"{type(exc).__name__}: {exc}"
+        logger.error(f"      ❌ [洗版POST异常] {_sanitize_response_body(post_error)}")
+
+    tmdb_id = payload.get("tmdbid")
+    season = payload.get("season")
+    matched = None
+    lookup_error = None
+    if tmdb_id is not None and season is not None:
+        matched, lookup_error = _lookup_wash_subscription(
+            host=host,
+            token=token,
+            tmdb_id=tmdb_id,
+            season=season,
+        )
+    else:
+        lookup_error = "回查缺少 tmdbid 或 season"
+
+    safe_post_error = _sanitize_response_body(post_error or "") or None
+    if matched:
+        return WashSubscriptionResult(
+            success=True,
+            http_status=http_status,
+            response_body=response_body,
+            error=safe_post_error,
+            verified_by_lookup=True,
+            subscription_id=_as_int(matched.get("id")),
+        )
+
+    combined_error = "; ".join(filter(None, (safe_post_error, lookup_error))) or None
+    return WashSubscriptionResult(
+        success=False,
+        http_status=http_status,
+        response_body=response_body,
+        error=_sanitize_response_body(combined_error or "") or None,
+    )
 
 # ===========================
 # 2. 核心通用逻辑
