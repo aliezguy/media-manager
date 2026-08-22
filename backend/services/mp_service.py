@@ -3,6 +3,9 @@ import logging
 import traceback
 import json
 import asyncio
+import re
+from dataclasses import dataclass
+from typing import Any
 from config.settings import load_config
 from services.tmdb_service import get_tmdb_info
 from services.category_service import determine_category
@@ -119,6 +122,60 @@ def get_subscription(sub_id):
 # ===========================
 # 🔥 核心：历史记录 & 纯净API
 # ===========================
+
+_RESPONSE_BODY_LIMIT = 4096
+_TRUNCATION_MARKER = "...[TRUNCATED]"
+_SENSITIVE_RESPONSE_KEYS = {
+    "token", "access_token", "password", "cookie",
+    "api_key", "apikey", "authorization",
+}
+
+
+@dataclass(frozen=True)
+class WashSubscriptionResult:
+    success: bool
+    http_status: int | None = None
+    response_body: str = ""
+    error: str | None = None
+    verified_by_lookup: bool = False
+    subscription_id: int | None = None
+
+
+def _redact_json_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if str(key).lower() in _SENSITIVE_RESPONSE_KEYS
+            else _redact_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    return value
+
+
+def _redact_plain_text(value: str) -> str:
+    key_pattern = "|".join(sorted(_SENSITIVE_RESPONSE_KEYS, key=len, reverse=True))
+    return re.sub(
+        rf"(?i)\b({key_pattern})\b(\s*[:=]\s*)([^\s,;&]+)",
+        r"\1\2[REDACTED]",
+        value,
+    )
+
+
+def _sanitize_response_body(body: str, limit: int = _RESPONSE_BODY_LIMIT) -> str:
+    raw = "" if body is None else str(body)
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        safe = _redact_plain_text(raw)
+    else:
+        safe = json.dumps(_redact_json_value(parsed), ensure_ascii=False, default=str)
+
+    if len(safe) <= limit:
+        return safe
+    if limit <= len(_TRUNCATION_MARKER):
+        return _TRUNCATION_MARKER[:limit]
+    return safe[:limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 def save_history(name, season, tmdb_id, status, msg, details, wash_type="complete"):
     """
@@ -610,4 +667,3 @@ def recognize_torrent_with_mp(torrent_name: str) -> dict | None:
     except Exception as e:
         logger.warning("MP recognize failed for '%s': %s", torrent_name[:60], e)
         return None
-
