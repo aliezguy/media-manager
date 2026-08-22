@@ -30,30 +30,44 @@
 
 - [ ] **Step 1: Write the failing file-persistence test**
 
-Add `import logging` to `backend/tests/test_mp_wash_subscription.py`, then add this test near the existing diagnostics tests:
+Add `import subprocess` and `import textwrap` to `backend/tests/test_mp_wash_subscription.py`, then add this test near the existing diagnostics tests. The subprocess loads the real Uvicorn logging configuration before importing MoviePilot, matching application startup order without mutating pytest's global logging state:
 
 ```python
-def test_moviepilot_logger_propagates_to_root_file_handler(tmp_path):
-    assert mp.logger.name == mp.__name__
-    assert mp.logger.propagate is True
-
+def test_moviepilot_logs_reach_root_file_handler_under_uvicorn(tmp_path):
     log_path = tmp_path / "app.log"
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    root_logger = logging.getLogger()
-    old_root_level = root_logger.level
-    old_mp_level = mp.logger.level
-    try:
-        root_logger.addHandler(handler)
+    backend_dir = os.path.dirname(os.path.dirname(mp.__file__))
+    script = textwrap.dedent(
+        """
+        import logging
+        import logging.config
+        import sys
+
+        from uvicorn.config import LOGGING_CONFIG
+
+        logging.config.dictConfig(LOGGING_CONFIG)
+        root_logger = logging.getLogger()
         root_logger.setLevel(logging.INFO)
-        mp.logger.setLevel(logging.INFO)
-        mp.logger.info("moviepilot-file-log-probe")
+        handler = logging.FileHandler(sys.argv[1], encoding="utf-8")
+        root_logger.addHandler(handler)
+
+        from services import mp_service
+
+        mp_service.logger.info("moviepilot-file-log-probe")
         handler.flush()
-    finally:
         root_logger.removeHandler(handler)
         handler.close()
-        root_logger.setLevel(old_root_level)
-        mp.logger.setLevel(old_mp_level)
+        """
+    )
 
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(log_path)],
+        cwd=backend_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
     assert "moviepilot-file-log-probe" in log_path.read_text(encoding="utf-8")
 ```
 
@@ -63,10 +77,10 @@ Run:
 
 ```bash
 backend/venv/bin/python -m pytest \
-  backend/tests/test_mp_wash_subscription.py::test_moviepilot_logger_propagates_to_root_file_handler -v
+  backend/tests/test_mp_wash_subscription.py::test_moviepilot_logs_reach_root_file_handler_under_uvicorn -v
 ```
 
-Expected: FAIL at `assert mp.logger.name == mp.__name__`, showing the current logger is named `uvicorn` rather than `services.mp_service`.
+Expected: FAIL because the temporary log file is empty. The current MoviePilot logger is Uvicorn-owned, has `propagate=False`, and therefore does not reach the root file handler.
 
 - [ ] **Step 3: Make the minimal production change**
 
@@ -90,7 +104,7 @@ Run:
 
 ```bash
 backend/venv/bin/python -m pytest \
-  backend/tests/test_mp_wash_subscription.py::test_moviepilot_logger_propagates_to_root_file_handler -v
+  backend/tests/test_mp_wash_subscription.py::test_moviepilot_logs_reach_root_file_handler_under_uvicorn -v
 ```
 
 Expected: PASS and the temporary `app.log` contains `moviepilot-file-log-probe`.
