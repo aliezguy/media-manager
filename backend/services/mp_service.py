@@ -13,7 +13,7 @@ from services.category_service import determine_category
 from database import SessionLocal
 from models import WashHistory
 
-logger = logging.getLogger("uvicorn")
+logger = logging.getLogger(__name__)
 
 # ===========================
 # 1. 基础 MP API 交互

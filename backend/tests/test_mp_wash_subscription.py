@@ -1,7 +1,9 @@
 """MoviePilot 洗版 POST 结果记录与回查确认测试。"""
 import asyncio
 import os
+import subprocess
 import sys
+import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +21,44 @@ class FakeResponse:
         if self._json_error:
             raise self._json_error
         return self._json_data
+
+
+def test_moviepilot_logs_reach_root_file_handler_under_uvicorn(tmp_path):
+    log_path = tmp_path / "app.log"
+    backend_dir = os.path.dirname(os.path.dirname(mp.__file__))
+    script = textwrap.dedent(
+        """
+        import logging
+        import logging.config
+        import sys
+
+        from uvicorn.config import LOGGING_CONFIG
+
+        logging.config.dictConfig(LOGGING_CONFIG)
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        handler = logging.FileHandler(sys.argv[1], encoding="utf-8")
+        root_logger.addHandler(handler)
+
+        from services import mp_service
+
+        mp_service.logger.info("moviepilot-file-log-probe")
+        handler.flush()
+        root_logger.removeHandler(handler)
+        handler.close()
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(log_path)],
+        cwd=backend_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "moviepilot-file-log-probe" in log_path.read_text(encoding="utf-8")
 
 
 def test_sanitize_response_body_redacts_nested_json_secrets():
