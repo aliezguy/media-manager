@@ -225,3 +225,101 @@ def test_post_exception_can_be_confirmed_by_lookup(monkeypatch):
     assert result.http_status is None
     assert result.verified_by_lookup is True
     assert "Timeout" in result.error
+
+
+def _configure_wash_process(monkeypatch):
+    scheme = {
+        "name": "综艺",
+        "active": True,
+        "keywords": ["综艺"],
+        "filter_groups": ["综艺洗版"],
+        "downloader": "qb完结",
+        "quality": "WEB-DL",
+        "sites": [1, 16],
+    }
+    monkeypatch.setattr(mp, "load_config", lambda: {"wash_schemes": [scheme]})
+    monkeypatch.setattr(mp, "_find_best_scheme", lambda *args, **kwargs: scheme)
+
+
+def test_run_wash_process_saves_lookup_confirmed_http_diagnostics(monkeypatch):
+    _configure_wash_process(monkeypatch)
+    result = mp.WashSubscriptionResult(
+        success=True,
+        http_status=200,
+        response_body='{"id": 485}',
+        error="POST 未明确成功: HTTP 200",
+        verified_by_lookup=True,
+        subscription_id=485,
+    )
+    monkeypatch.setattr(mp, "add_wash_subscription", lambda payload: result)
+    saved = {}
+    monkeypatch.setattr(
+        mp,
+        "save_history",
+        lambda name, season, tmdb_id, status, msg, details, wash_type="complete": saved.update(
+            name=name,
+            season=season,
+            tmdb_id=tmdb_id,
+            status=status,
+            message=msg,
+            details=details,
+            wash_type=wash_type,
+        ),
+    )
+
+    asyncio.run(mp.run_wash_process({
+        "name": "地球超新鲜",
+        "tmdbid": 296202,
+        "season": 2,
+        "type": "电视剧",
+        "year": 2025,
+        "category": "综艺",
+    }))
+
+    assert saved["status"] == "success"
+    assert saved["message"] == "洗版订阅已创建（回查确认）"
+    assert saved["wash_type"] == "complete"
+    assert saved["details"]["scheme"] == "综艺"
+    assert saved["details"]["http_status"] == 200
+    assert saved["details"]["response_body"] == '{"id": 485}'
+    assert saved["details"]["error"] == "POST 未明确成功: HTTP 200"
+    assert saved["details"]["verified_by_lookup"] is True
+    assert saved["details"]["subscription_id"] == 485
+
+
+def test_run_wash_process_saves_final_failure_diagnostics(monkeypatch):
+    _configure_wash_process(monkeypatch)
+    result = mp.WashSubscriptionResult(
+        success=False,
+        http_status=502,
+        response_body="bad gateway",
+        error="未找到匹配的洗版订阅",
+    )
+    monkeypatch.setattr(mp, "add_wash_subscription", lambda payload: result)
+    saved = {}
+    monkeypatch.setattr(
+        mp,
+        "save_history",
+        lambda name, season, tmdb_id, status, msg, details, wash_type="complete": saved.update(
+            status=status,
+            message=msg,
+            details=details,
+            wash_type=wash_type,
+        ),
+    )
+
+    asyncio.run(mp.run_wash_process({
+        "name": "地球超新鲜",
+        "tmdbid": 296202,
+        "season": 2,
+        "type": "电视剧",
+        "year": 2025,
+        "category": "综艺",
+    }))
+
+    assert saved["status"] == "failed"
+    assert saved["message"] == "洗版API请求失败"
+    assert saved["details"]["http_status"] == 502
+    assert saved["details"]["response_body"] == "bad gateway"
+    assert saved["details"]["error"] == "未找到匹配的洗版订阅"
+    assert saved["details"]["verified_by_lookup"] is False

@@ -621,12 +621,17 @@ async def run_wash_process(sub_info):
                 new_sub_payload["quality"] = qual
 
             # 4. 调用纯净 API
-            is_ok = add_wash_subscription(new_sub_payload)
-            
+            wash_result = add_wash_subscription(new_sub_payload)
+
             # 5. 🔥 在这里写历史：完结洗版 (wash_type="complete")
-            status_str = "success" if is_ok else "failed"
-            msg_str = "已触发洗版重订阅" if is_ok else "洗版API请求失败"
-            
+            status_str = "success" if wash_result.success else "failed"
+            if wash_result.success and wash_result.verified_by_lookup:
+                msg_str = "洗版订阅已创建（回查确认）"
+            elif wash_result.success:
+                msg_str = "已触发洗版重订阅"
+            else:
+                msg_str = "洗版API请求失败"
+
             # 🔥 记录历史 (增强 details)
             save_history(
                 name, season, tmdb_id, status_str, msg_str,
@@ -635,10 +640,15 @@ async def run_wash_process(sub_info):
                     "downloader": matched_scheme.get("downloader"),
                     "filter_groups": matched_scheme.get("filter_groups"),
                     "quality": matched_scheme.get("quality"),
-                    "sites": matched_scheme.get("sites"), # 新增站点
-                    "keywords": matched_scheme.get("keywords") # 新增匹配关键词
+                    "sites": matched_scheme.get("sites"),
+                    "keywords": matched_scheme.get("keywords"),
+                    "http_status": wash_result.http_status,
+                    "response_body": wash_result.response_body,
+                    "error": wash_result.error,
+                    "verified_by_lookup": wash_result.verified_by_lookup,
+                    "subscription_id": wash_result.subscription_id,
                 },
-                wash_type="complete"
+                wash_type="complete",
             )
             
         else:
