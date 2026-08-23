@@ -4,6 +4,7 @@ import traceback
 import json
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 from config.settings import load_config
@@ -19,22 +20,115 @@ logger = logging.getLogger(__name__)
 # 1. 基础 MP API 交互
 # ===========================
 
-def get_mp_token():
+@dataclass(frozen=True)
+class MPTokenResult:
+    token: str | None = None
+    error_code: str | None = None
+    http_status: int | None = None
+    response_body: str = ""
+
+
+def get_mp_token() -> MPTokenResult:
     cfg = load_config()
     host = cfg.get("mp_host", "").rstrip('/')
     username = cfg.get("mp_username")
     password = cfg.get("mp_password")
-    if not host or not username or not password: return None
-    try:
-        url = f"{host}/api/v1/login/access-token"
-        resp = requests.post(url, data={"username": username, "password": password}, timeout=5)
-        if resp.status_code == 200: return resp.json().get("access_token")
-    except: pass
-    return None
+    if not host or not username or not password:
+        return MPTokenResult(error_code="config_missing")
+
+    url = f"{host}/api/v1/login/access-token"
+    result = MPTokenResult(error_code="login_network_error")
+    for attempt in range(3):
+        retryable = False
+        try:
+            resp = requests.post(
+                url,
+                data={"username": username, "password": password},
+                timeout=5,
+            )
+            response_body = _sanitize_response_body(resp.text)
+            if resp.status_code == 200:
+                try:
+                    response_json = resp.json()
+                except (TypeError, ValueError):
+                    result = MPTokenResult(
+                        error_code="login_response_invalid",
+                        http_status=resp.status_code,
+                        response_body=response_body,
+                    )
+                    break
+                if not isinstance(response_json, dict):
+                    result = MPTokenResult(
+                        error_code="login_response_invalid",
+                        http_status=resp.status_code,
+                        response_body=response_body,
+                    )
+                    break
+                access_token = response_json.get("access_token")
+                if access_token:
+                    logger.info("✅ [MP登录] Token 获取成功 | HTTP %s", resp.status_code)
+                    return MPTokenResult(
+                        token=access_token,
+                        http_status=resp.status_code,
+                        response_body=response_body,
+                    )
+                result = MPTokenResult(
+                    error_code="token_missing",
+                    http_status=resp.status_code,
+                    response_body=response_body,
+                )
+                break
+
+            retryable = 500 <= resp.status_code < 600
+            result = MPTokenResult(
+                error_code="login_server_error" if retryable else "login_http_error",
+                http_status=resp.status_code,
+                response_body=response_body,
+            )
+        except requests.exceptions.Timeout as exc:
+            retryable = True
+            result = MPTokenResult(error_code="login_timeout", response_body=_sanitize_response_body(str(exc)))
+        except requests.exceptions.ConnectionError as exc:
+            retryable = True
+            result = MPTokenResult(error_code="login_network_error", response_body=_sanitize_response_body(str(exc)))
+        except requests.exceptions.RequestException as exc:
+            result = MPTokenResult(error_code="login_network_error", response_body=_sanitize_response_body(str(exc)))
+            break
+
+        if retryable and attempt < 2:
+            delay = 1 << attempt
+            logger.warning(
+                "⚠️ [MP登录] 临时失败，%ss 后重试 (%s/3) | error=%s HTTP=%s body=%s",
+                delay,
+                attempt + 2,
+                result.error_code,
+                result.http_status,
+                result.response_body,
+            )
+            time.sleep(delay)
+            continue
+        break
+
+    logger.error(
+        "❌ [MP登录] Token 获取失败 | error=%s HTTP=%s body=%s",
+        result.error_code,
+        result.http_status,
+        result.response_body,
+    )
+    return result
+
+
+def _coerce_mp_token_result(value: MPTokenResult | str | None) -> MPTokenResult:
+    """兼容旧测试/调用方注入字符串 Token，同时统一内部认证结果。"""
+    if isinstance(value, MPTokenResult):
+        return value
+    if isinstance(value, str) and value:
+        return MPTokenResult(token=value)
+    return MPTokenResult(error_code="token_missing")
 
 def probe_resource(endpoints, label):
     """智能探测资源"""
-    token = get_mp_token()
+    token = _coerce_mp_token_result(get_mp_token()).token
     cfg = load_config()
     host = cfg.get("mp_host", "").rstrip('/')
     if not token or not host: return []
@@ -87,7 +181,7 @@ def update_subscription(payload):
     """PUT 更新订阅"""
     cfg = load_config()
     host = cfg.get("mp_host", "").rstrip('/')
-    token = get_mp_token()
+    token = _coerce_mp_token_result(get_mp_token()).token
     if not host or not token: return False
     
     if not payload.get("id"):
@@ -106,7 +200,7 @@ def get_subscription(sub_id):
     """查询单个订阅详情"""
     cfg = load_config()
     host = cfg.get("mp_host", "").rstrip('/')
-    token = get_mp_token()
+    token = _coerce_mp_token_result(get_mp_token()).token
     if not host or not token or not sub_id: return None
 
     try:
@@ -137,6 +231,7 @@ class WashSubscriptionResult:
     http_status: int | None = None
     response_body: str = ""
     error: str | None = None
+    error_code: str | None = None
     verified_by_lookup: bool = False
     subscription_id: int | None = None
 
@@ -282,9 +377,17 @@ def add_wash_subscription(payload: dict) -> WashSubscriptionResult:
     """新增 MoviePilot 洗版订阅；结果不明确时按 TMDB 与 Season 回查。"""
     cfg = load_config()
     host = cfg.get("mp_host", "").rstrip("/")
-    token = get_mp_token()
+    auth_result = _coerce_mp_token_result(get_mp_token())
+    token = auth_result.token
     if not host or not token:
-        return WashSubscriptionResult(success=False, error="MoviePilot Host 或 Token 未配置")
+        error_code = "config_missing" if not host else (auth_result.error_code or "token_missing")
+        return WashSubscriptionResult(
+            success=False,
+            http_status=auth_result.http_status,
+            response_body=auth_result.response_body,
+            error=error_code,
+            error_code=error_code,
+        )
 
     payload.setdefault("username", "AI自动洗版")
     logger.info(f"      🚀 [API新增] Payload: {json.dumps(payload, ensure_ascii=False)}")
@@ -292,34 +395,55 @@ def add_wash_subscription(payload: dict) -> WashSubscriptionResult:
     http_status = None
     response_body = ""
     post_error = None
-    try:
-        resp = requests.post(
-            f"{host}/api/v1/subscribe/",
-            json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        http_status = resp.status_code
-        response_body = _sanitize_response_body(resp.text)
-        logger.info(f"      📥 [洗版POST] HTTP {http_status} | Body: {response_body}")
+    post_error_code = None
+    for post_attempt in range(2):
         try:
-            response_json = resp.json()
+            resp = requests.post(
+                f"{host}/api/v1/subscribe/",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                timeout=30,
+            )
+            http_status = resp.status_code
+            response_body = _sanitize_response_body(resp.text)
+            logger.info(f"      📥 [洗版POST] HTTP {http_status} | Body: {response_body}")
+
+            if http_status in (401, 403) and post_attempt == 0:
+                refreshed_auth = _coerce_mp_token_result(get_mp_token())
+                if refreshed_auth.token:
+                    token = refreshed_auth.token
+                    logger.warning("      ⚠️ [洗版POST] Token 已失效，重新登录后重试")
+                    continue
+                post_error = (
+                    f"POST HTTP {http_status}; 重新认证失败: "
+                    f"{refreshed_auth.error_code or 'token_missing'}"
+                )
+                post_error_code = refreshed_auth.error_code or "post_reauth_failed"
+                break
+
+            try:
+                response_json = resp.json()
+            except Exception as exc:
+                post_error = f"响应 JSON 解析失败: {type(exc).__name__}: {exc}"
+                post_error_code = "wash_post_failed"
+            else:
+                if 200 <= http_status < 300 and isinstance(response_json, dict):
+                    response_code = response_json.get("code")
+                    code_is_zero = type(response_code) is int and response_code == 0
+                    if response_json.get("success") is True or code_is_zero:
+                        return WashSubscriptionResult(
+                            success=True,
+                            http_status=http_status,
+                            response_body=response_body,
+                        )
+                post_error = f"POST 未明确成功: HTTP {http_status}"
+                post_error_code = "wash_post_failed"
+            break
         except Exception as exc:
-            post_error = f"响应 JSON 解析失败: {type(exc).__name__}: {exc}"
-        else:
-            if 200 <= http_status < 300 and isinstance(response_json, dict):
-                response_code = response_json.get("code")
-                code_is_zero = type(response_code) is int and response_code == 0
-                if response_json.get("success") is True or code_is_zero:
-                    return WashSubscriptionResult(
-                        success=True,
-                        http_status=http_status,
-                        response_body=response_body,
-                    )
-            post_error = f"POST 未明确成功: HTTP {http_status}"
-    except Exception as exc:
-        post_error = f"{type(exc).__name__}: {exc}"
-        logger.error(f"      ❌ [洗版POST异常] {_sanitize_response_body(post_error)}")
+            post_error = f"{type(exc).__name__}: {exc}"
+            post_error_code = "wash_post_exception"
+            logger.error(f"      ❌ [洗版POST异常] {_sanitize_response_body(post_error)}")
+            break
 
     tmdb_id = payload.get("tmdbid")
     season = payload.get("season")
@@ -342,6 +466,7 @@ def add_wash_subscription(payload: dict) -> WashSubscriptionResult:
             http_status=http_status,
             response_body=response_body,
             error=safe_post_error,
+            error_code=post_error_code,
             verified_by_lookup=True,
             subscription_id=_as_int(matched.get("id")),
         )
@@ -352,6 +477,7 @@ def add_wash_subscription(payload: dict) -> WashSubscriptionResult:
         http_status=http_status,
         response_body=response_body,
         error=_sanitize_response_body(combined_error or "") or None,
+        error_code=post_error_code,
     )
 
 # ===========================
@@ -629,6 +755,19 @@ async def run_wash_process(sub_info):
                 msg_str = "洗版订阅已创建（回查确认）"
             elif wash_result.success:
                 msg_str = "已触发洗版重订阅"
+            elif wash_result.error_code == "config_missing":
+                msg_str = "MoviePilot 配置缺失"
+            elif wash_result.error_code == "login_timeout":
+                msg_str = "MoviePilot 登录超时"
+            elif wash_result.error_code == "login_server_error":
+                msg_str = "MoviePilot 服务暂时异常"
+            elif wash_result.error_code in {
+                "login_network_error",
+                "login_http_error",
+                "login_response_invalid",
+                "token_missing",
+            }:
+                msg_str = "MoviePilot 登录失败"
             else:
                 msg_str = "洗版API请求失败"
 
@@ -645,6 +784,7 @@ async def run_wash_process(sub_info):
                     "http_status": wash_result.http_status,
                     "response_body": wash_result.response_body,
                     "error": wash_result.error,
+                    "error_code": wash_result.error_code,
                     "verified_by_lookup": wash_result.verified_by_lookup,
                     "subscription_id": wash_result.subscription_id,
                 },
@@ -689,7 +829,7 @@ def recognize_torrent_with_mp(torrent_name: str) -> dict | None:
         logger.debug("MP recognize skipped: mp_host not configured")
         return None
 
-    token = get_mp_token()
+    token = _coerce_mp_token_result(get_mp_token()).token
     if not token:
         logger.debug("MP recognize skipped: unable to obtain MP token")
         return None

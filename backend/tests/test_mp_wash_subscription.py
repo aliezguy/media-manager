@@ -3,6 +3,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 import textwrap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -81,11 +82,145 @@ def test_sanitize_response_body_caps_total_length():
     assert len(safe) == 4096
 
 
+def test_get_mp_token_reports_missing_configuration_without_login(monkeypatch):
+    monkeypatch.setattr(mp, "load_config", lambda: {"mp_host": "http://mp"})
+    calls = []
+    monkeypatch.setattr(mp.requests, "post", lambda *args, **kwargs: calls.append(args))
+
+    result = mp.get_mp_token()
+
+    assert result.token is None
+    assert result.error_code == "config_missing"
+    assert calls == []
+
+
+def test_get_mp_token_retries_transient_timeout_then_succeeds(monkeypatch):
+    monkeypatch.setattr(
+        mp,
+        "load_config",
+        lambda: {"mp_host": "http://mp", "mp_username": "u", "mp_password": "p"},
+    )
+    responses = iter([
+        mp.requests.exceptions.Timeout("temporary timeout"),
+        FakeResponse(200, {"access_token": "token"}, '{"access_token":"token"}'),
+    ])
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    sleeps = []
+    monkeypatch.setattr(mp.requests, "post", fake_post)
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    result = mp.get_mp_token()
+
+    assert result.token == "token"
+    assert result.error_code is None
+    assert len(calls) == 2
+    assert sleeps == [1]
+
+
+def test_get_mp_token_does_not_retry_unauthorized_login(monkeypatch):
+    monkeypatch.setattr(
+        mp,
+        "load_config",
+        lambda: {"mp_host": "http://mp", "mp_username": "u", "mp_password": "p"},
+    )
+    calls = []
+    monkeypatch.setattr(
+        mp.requests,
+        "post",
+        lambda *args, **kwargs: (calls.append((args, kwargs)) or FakeResponse(
+            401, {"detail": "invalid"}, '{"detail":"invalid"}'
+        )),
+    )
+
+    result = mp.get_mp_token()
+
+    assert result.token is None
+    assert result.error_code == "login_http_error"
+    assert result.http_status == 401
+    assert len(calls) == 1
+
+
+def test_get_mp_token_rejects_success_response_without_token(monkeypatch):
+    monkeypatch.setattr(
+        mp,
+        "load_config",
+        lambda: {"mp_host": "http://mp", "mp_username": "u", "mp_password": "p"},
+    )
+    monkeypatch.setattr(
+        mp.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(200, {"success": True}, '{"success":true}'),
+    )
+
+    result = mp.get_mp_token()
+
+    assert result.token is None
+    assert result.error_code == "token_missing"
+    assert result.http_status == 200
+
+
+def test_get_mp_token_rejects_non_object_login_response(monkeypatch):
+    monkeypatch.setattr(
+        mp,
+        "load_config",
+        lambda: {"mp_host": "http://mp", "mp_username": "u", "mp_password": "p"},
+    )
+    monkeypatch.setattr(
+        mp.requests,
+        "post",
+        lambda *args, **kwargs: FakeResponse(200, [], "[]"),
+    )
+
+    result = mp.get_mp_token()
+
+    assert result.token is None
+    assert result.error_code == "login_response_invalid"
+    assert result.http_status == 200
+
+
+def test_get_mp_token_retries_server_error_and_keeps_redacted_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        mp,
+        "load_config",
+        lambda: {"mp_host": "http://mp", "mp_username": "u", "mp_password": "p"},
+    )
+    calls = []
+    monkeypatch.setattr(
+        mp.requests,
+        "post",
+        lambda *args, **kwargs: (calls.append((args, kwargs)) or FakeResponse(
+            503,
+            {"access_token": "secret"},
+            '{"access_token":"secret"}',
+        )),
+    )
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    result = mp.get_mp_token()
+
+    assert result.token is None
+    assert result.error_code == "login_server_error"
+    assert result.http_status == 503
+    assert "secret" not in result.response_body
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
+
+
 def test_wash_subscription_result_has_safe_diagnostic_defaults():
     result = mp.WashSubscriptionResult(success=False)
     assert result.http_status is None
     assert result.response_body == ""
     assert result.error is None
+    assert result.error_code is None
     assert result.verified_by_lookup is False
     assert result.subscription_id is None
 
@@ -140,6 +275,86 @@ def test_add_wash_subscription_explicit_success_does_not_lookup(monkeypatch):
     assert result.response_body == '{"success": true}'
     assert result.verified_by_lookup is False
     assert get_calls == []
+
+
+def test_add_wash_subscription_keeps_auth_configuration_error_distinct(monkeypatch):
+    monkeypatch.setattr(mp, "load_config", lambda: {})
+    post_calls = []
+    monkeypatch.setattr(mp.requests, "post", lambda *args, **kwargs: post_calls.append(args))
+
+    result = mp.add_wash_subscription(_wash_payload())
+
+    assert result.success is False
+    assert result.error == "config_missing"
+    assert post_calls == []
+
+
+def test_add_wash_subscription_does_not_post_when_login_temporarily_fails(monkeypatch):
+    monkeypatch.setattr(mp, "load_config", lambda: {"mp_host": "http://mp"})
+    monkeypatch.setattr(
+        mp,
+        "get_mp_token",
+        lambda: mp.MPTokenResult(
+            error_code="login_timeout",
+            response_body="temporary timeout",
+        ),
+    )
+    post_calls = []
+    monkeypatch.setattr(mp.requests, "post", lambda *args, **kwargs: post_calls.append(args))
+
+    result = mp.add_wash_subscription(_wash_payload())
+
+    assert result.success is False
+    assert result.error == "login_timeout"
+    assert result.response_body == "temporary timeout"
+    assert post_calls == []
+
+
+def test_add_wash_subscription_refreshes_token_once_after_unauthorized(monkeypatch):
+    _configure_mp(monkeypatch)
+    tokens = iter([mp.MPTokenResult(token="old"), mp.MPTokenResult(token="new")])
+    monkeypatch.setattr(mp, "get_mp_token", lambda: next(tokens))
+    responses = iter([
+        FakeResponse(401, {"detail": "expired"}, '{"detail":"expired"}'),
+        FakeResponse(200, {"success": True}, '{"success":true}'),
+    ])
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr(mp.requests, "post", fake_post)
+
+    result = mp.add_wash_subscription(_wash_payload())
+
+    assert result.success is True
+    assert len(calls) == 2
+    assert calls[0][1]["headers"]["Authorization"] == "Bearer old"
+    assert calls[1][1]["headers"]["Authorization"] == "Bearer new"
+
+
+def test_add_wash_subscription_does_not_loop_after_second_unauthorized(monkeypatch):
+    _configure_mp(monkeypatch)
+    tokens = iter([mp.MPTokenResult(token="old"), mp.MPTokenResult(token="new")])
+    monkeypatch.setattr(mp, "get_mp_token", lambda: next(tokens))
+    responses = iter([
+        FakeResponse(401, {"detail": "expired"}, '{"detail":"expired"}'),
+        FakeResponse(401, {"detail": "expired"}, '{"detail":"expired"}'),
+    ])
+    calls = []
+    monkeypatch.setattr(
+        mp.requests,
+        "post",
+        lambda *args, **kwargs: (calls.append((args, kwargs)) or next(responses)),
+    )
+    monkeypatch.setattr(mp.requests, "get", lambda *args, **kwargs: FakeResponse(404, text="not found"))
+
+    result = mp.add_wash_subscription(_wash_payload())
+
+    assert result.success is False
+    assert len(calls) == 2
+    assert "HTTP 401" in (result.error or "")
 
 
 def test_add_wash_subscription_unknown_200_is_confirmed_by_lookup(monkeypatch):
@@ -363,3 +578,37 @@ def test_run_wash_process_saves_final_failure_diagnostics(monkeypatch):
     assert saved["details"]["response_body"] == "bad gateway"
     assert saved["details"]["error"] == "未找到匹配的洗版订阅"
     assert saved["details"]["verified_by_lookup"] is False
+
+
+def test_run_wash_process_saves_auth_error_code(monkeypatch):
+    _configure_wash_process(monkeypatch)
+    result = mp.WashSubscriptionResult(
+        success=False,
+        error="login_timeout",
+        error_code="login_timeout",
+        response_body="temporary timeout",
+    )
+    monkeypatch.setattr(mp, "add_wash_subscription", lambda payload: result)
+    saved = {}
+    monkeypatch.setattr(
+        mp,
+        "save_history",
+        lambda name, season, tmdb_id, status, msg, details, wash_type="complete": saved.update(
+            status=status,
+            message=msg,
+            details=details,
+            wash_type=wash_type,
+        ),
+    )
+
+    asyncio.run(mp.run_wash_process({
+        "name": "地球超新鲜",
+        "tmdbid": 296202,
+        "season": 2,
+        "type": "电视剧",
+        "year": 2025,
+        "category": "综艺",
+    }))
+
+    assert saved["message"] == "MoviePilot 登录超时"
+    assert saved["details"]["error_code"] == "login_timeout"
